@@ -84,6 +84,9 @@ def new_session(vault, task_id, action, role, context, *, operation=None):
                    "created_at": stamp(), "usage": {"input_tokens": 0, "output_tokens": 0, "evidence_bytes": 0},
                    "launches": [], "state": "prepared"}
         base = vault.state / "tasks" / task_id
+        proposal = base / "proposals" / role / session["uuid"]
+        proposal.mkdir(parents=True, exist_ok=False)
+        session["proposal"] = str(proposal)
         atomic(base / "contexts" / (sid + ".txt"), body)
         atomic(path, session)
         task["sessions"].append(operation)

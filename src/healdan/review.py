@@ -20,18 +20,25 @@ def freeze_review(vault, task_id, extractor, reviewer):
         path = vault.control / "reviews" / (task_id + ".json")
         existing = read_json(path)
         if existing:
-            return existing
+            old = existing["outputs"]
+            if old["extractor"]["operation"] == extractor and old["reviewer"]["operation"] == reviewer:
+                return existing
+            require(old["extractor"]["uuid"] != a["uuid"] and old["reviewer"]["uuid"] != b["uuid"],
+                    "Rework requires two new independent sessions", 5)
         base = vault.state / "tasks" / task_id
         outputs = {}
         for role, session in (("extractor", a), ("reviewer", b)):
-            output = safe_path(base / "proposals" / role, "extraction.json", exists=True).read_bytes()
+            output = safe_path(session["proposal"], "extraction.json", exists=True).read_bytes()
+            frozen_name = session["operation"] + ".json"
             outputs[role] = {"operation": session["operation"], "uuid": session["uuid"],
-                             "sha256": digest(output), "launches": session["launches"]}
-            atomic(base / "frozen" / (role + ".json"), output)
+                             "sha256": digest(output), "launches": session["launches"], "frozen": frozen_name,
+                             "proposal": session["proposal"]}
+            atomic(base / "frozen" / frozen_name, output)
         record = {"task": task_id, "frozen_at": stamp(), "outputs": outputs}
         atomic(path, record)
+        vault.receipt("blind-review", record)
         # Only now may the reviewer read the extractor's independent result.
-        atomic(base / "proposals/reviewer/comparison-input.json", (base / "frozen/extractor.json").read_bytes())
+        atomic(Path(b["proposal"]) / "comparison-input.json", (base / "frozen" / outputs["extractor"]["frozen"]).read_bytes())
         return record
 
 
@@ -40,14 +47,15 @@ def validate_review(vault, task_id, units):
     require(record, "Blind review has not been frozen", 5)
     base = vault.state / "tasks" / task_id
     for role in ("extractor", "reviewer"):
-        require(digest((base / "frozen" / (role + ".json")).read_bytes()) == record["outputs"][role]["sha256"],
+        require(digest(safe_path(base / "frozen", record["outputs"][role]["frozen"], exists=True).read_bytes()) == record["outputs"][role]["sha256"],
                 "Independent extraction changed after freezing")
-    comparison = read_json(base / "proposals/reviewer/comparison.json")
+    comparison = read_json(Path(record["outputs"]["reviewer"]["proposal"]) / "comparison.json")
     require(comparison and comparison.get("extractions") ==
             {r: record["outputs"][r]["sha256"] for r in ("extractor", "reviewer")},
             "Comparison is not bound to both frozen extractions", 5)
     require(set(comparison.get("units", {})) == set(units), "Review must cover every promotion unit", 5)
-    require(all(v == "conform" for v in comparison["units"].values()) and not comparison.get("defects"),
+    require(all(comparison["units"][i] == {"status": "conform", "sha256": sha} for i, sha in units.items())
+            and not comparison.get("defects"),
             "Independent review has unresolved defects", 5)
     return {"independent": record, "comparison": comparison}
 
@@ -63,9 +71,13 @@ def freeze_csp(units, state, seed=None):
 def csp_status(plan):
     streak, selected, pending, defect = plan["initial_streak"], [], [], False
     for index, unit in enumerate(plan["units"]):
-        draw = int.from_bytes(hmac.digest(bytes.fromhex(plan["seed"]),
-                              f"{index}:{unit}".encode("ascii"), "sha256")[:8], "big")
-        inspect = streak < 111 or draw < (1 << 64) // 10
+        counter = 0
+        while True:
+            draw = hmac.digest(bytes.fromhex(plan["seed"]), f"{index}:{unit}:{counter}".encode("ascii"), "sha256")[0]
+            if draw < 250:
+                break
+            counter += 1
+        inspect = streak < 111 or draw % 10 == 0
         if inspect:
             selected.append(unit)
             result = plan["inspections"].get(unit)

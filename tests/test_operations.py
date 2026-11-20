@@ -37,6 +37,10 @@ class Tasks(VaultTest):
         second = tasks.new_session(self.vault, task["id"], "review", "reviewer", "context")
         self.assertEqual((first["id"], first["uuid"]), (again["id"], again["uuid"]))
         self.assertNotEqual(first["id"], second["id"])
+        newer = tasks.new_session(self.vault, task["id"], "review rework", "reviewer", "context")
+        self.assertNotEqual(second["proposal"], newer["proposal"])
+        atomic(Path(second["proposal"]) / "comparison-input.json", b"previous knowledge")
+        self.assertFalse((Path(newer["proposal"]) / "comparison-input.json").exists())
         self.assertEqual(tasks.get_task(self.vault, task["id"])["created_at"], task["created_at"])
         with self.assertRaises(Blocked):
             tasks.new_session(self.vault, task["id"], "new action", "extractor", "context", operation=operation)
@@ -173,6 +177,20 @@ class Retention(VaultTest):
         result = retention.execute(self.vault, plan["id"], "2026-02-01T00:00:00Z")
         self.assertEqual(result["status"], "pending")
         self.assertTrue(target.exists())
+
+    def test_deletion_recovers_after_material_receipt_before_plan_receipt(self):
+        from unittest.mock import patch
+        record, target = self.material()
+        plan = retention.plan(self.vault, "2026-02-01T00:00:00Z")
+        original = custody.save_material
+        def interrupted(vault, material):
+            original(vault, material)
+            if material["copies"][0]["status"] == "deleted":
+                raise SystemExit("Injected crash after copy receipt")
+        with patch("healdan.retention.save_material", side_effect=interrupted), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], "2026-02-01T00:00:00Z")
+        self.assertFalse(target.exists())
+        self.assertEqual(retention.execute(self.vault, plan["id"], "2026-02-01T00:00:00Z")["status"], "complete")
 
     def test_hold_after_plan_blocks_and_release_preserves_deadline(self):
         record, target = self.material()

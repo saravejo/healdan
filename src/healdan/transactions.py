@@ -11,7 +11,7 @@ from .pages import generated_pages, validate_pages
 from .regression import require_suite
 from .review import csp_status, freeze_csp, inspect, validate_review
 from .signing import human_sign, trusted_signers, verify
-from .tasks import get_task, require_active
+from .tasks import get_task, get_session, require_active
 
 EXACT = {"wiki/claims.jsonl", "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
          "wiki/control/page-policy.json", "wiki/control/query-cases.jsonl", "wiki/control/aliases.jsonl",
@@ -105,6 +105,9 @@ def prepare(vault, task_id, *, cutoff=None):
         require(task["base"] == vault.head(), "Task base changed; reconcile before preparing", 5)
         before = vault.fingerprint()
         root = vault.state / "tasks" / task_id / "proposals/editor"
+        editors = [get_session(vault, op) for op in task["sessions"] if get_session(vault, op)["role"] == "editor"]
+        if editors:
+            root = Path(editors[-1]["proposal"])
         files = {}
         for path in sorted(root.rglob("*")):
             if path.is_file() or path.is_symlink():
@@ -155,7 +158,9 @@ def inspect_package(vault, identifier, results):
         path = package_path(vault, identifier)
         record = read_json(path)
         require(record and not record["approval"], "Unknown or already signed package", 2)
-        inspect(record["csp"], results)
+        status = inspect(record["csp"], results)
+        if status["defect"]:
+            atomic(vault.control / "csp.json", {"streak": 0, "defect_package": identifier})
         atomic(path, record)
         return csp_status(record["csp"])
 

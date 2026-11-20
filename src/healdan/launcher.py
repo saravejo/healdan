@@ -49,13 +49,14 @@ def clean_env(temporary, profile=None):
 def probe(vault):
     version = runtime_version(vault)
     vault.state.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="probe-", dir=vault.state) as temp:
+    with tempfile.TemporaryDirectory(prefix="probe-", dir=vault.state) as temp, \
+            tempfile.TemporaryDirectory(prefix="hs-", dir="/tmp") as socket_directory:
         root = Path(temp)
         allowed = root / "allowed"
         allowed.mkdir()
         secret = root / "protected"
         secret.write_text("probe sentinel", encoding="utf-8")
-        socket_path = root / "signing.sock"
+        socket_path = Path(socket_directory) / "s"
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(str(socket_path))
         sock.listen(1)
@@ -89,7 +90,7 @@ print(json.dumps(result))
             result = run([executable("srt"), "--settings", config_path, "--", sys.executable, "-c", script,
                           json.dumps([str(p) for p in targets]), allowed, socket_path],
                          cwd=allowed, env=clean_env(allowed), check=False)
-            require(result.returncode == 0, "Sandbox probe failed to execute", 5)
+            require(result.returncode == 0, "Sandbox probe failed to execute: " + result.stderr.decode("utf-8", errors="replace")[-2000:], 5)
             checks = decode(result.stdout)
             require(all(checks.values()) and secret.read_text() == "probe sentinel", "OS isolation probe detected escape", 5)
         finally:
@@ -127,7 +128,7 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
         require(session["state"] != "running", "Session already running or needs process reconciliation", 5)
         require(bool(session["launches"]) == resume, "Use resume for an existing session; new launches need a new S-", 2)
         base = vault.state / "tasks" / session["task"]
-        proposal = base / "proposals" / session["role"]
+        proposal = Path(session["proposal"])
         temporary = base / "temporary" / session["role"] / session["uuid"]
         native = Path(session["recovery_profile"]) if recovery_material else profile(vault, operation)
         require(native.resolve().is_relative_to(vault.state), "Native recovery profile must stay in controller state")

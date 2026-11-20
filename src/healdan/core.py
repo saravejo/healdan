@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import shutil
 import subprocess
@@ -117,7 +118,10 @@ def safe_path(root, relative, *, exists=False):
     candidate = root / path
     current = candidate
     while True:
-        require(not current.is_symlink(), "Symlink path is forbidden")
+        system_alias = (platform.system() == "Darwin" and str(current) in {"/var", "/tmp", "/etc"} and
+                        current.is_symlink() and current.resolve() == Path("/private") / current.name and
+                        current.lstat().st_uid == 0)
+        require(not current.is_symlink() or system_alias, "Symlink path is forbidden")
         if current == current.parent:
             break
         current = current.parent

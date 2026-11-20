@@ -27,12 +27,12 @@ class Transactions(VaultTest):
             session["state"] = "completed"
             session["launches"] = [{"synthetic_controller_fixture": True}]
             atomic(self.vault.control / "sessions" / (session["operation"] + ".json"), session)
-            atomic(base / "proposals" / role / "extraction.json", {"units": [claim]})
+            atomic(Path(session["proposal"]) / "extraction.json", {"units": [claim]})
             sessions.append(session["operation"])
         frozen = review.freeze_review(self.vault, task["id"], *sessions)
-        atomic(base / "proposals/reviewer/comparison.json", {
+        atomic(Path(tasks.get_session(self.vault, sessions[1])["proposal"]) / "comparison.json", {
             "extractions": {role: frozen["outputs"][role]["sha256"] for role in ("extractor", "reviewer")},
-            "units": {"C-0001": "conform"}, "defects": []})
+            "units": {"C-0001": {"status": "conform", "sha256": digest(claim)}}, "defects": []})
         proposal = base / "proposals/editor"
         atomic(proposal / "wiki/claims.jsonl", jsonl([claim]))
         atomic(proposal / "wiki/control/query-cases.jsonl", jsonl([self.case()]))
@@ -104,6 +104,22 @@ class Transactions(VaultTest):
         atomic(path, jsonl([case]))
         with self.assertRaises(Blocked):
             transactions.prepare(self.vault, task["id"])
+
+    def test_review_cannot_approve_changed_claim_under_same_id(self):
+        task, package = self.prepare_fixture()
+        claim = self.claim(statement="A changed assertion with the same typed value")
+        path = self.state / "tasks" / task["id"] / "proposals/editor/wiki/claims.jsonl"
+        atomic(path, jsonl([claim]))
+        with self.assertRaises(Blocked):
+            transactions.prepare(self.vault, task["id"])
+
+    def test_csp_defect_resets_next_package_inspection_regime(self):
+        atomic(self.vault.control / "csp.json", {"streak": 110})
+        task, package = self.prepare_fixture()
+        transactions.inspect_package(self.vault, package["id"], {"C-0001": "defect"})
+        self.assertEqual(read_json(self.vault.control / "csp.json")["streak"], 0)
+        with self.assertRaises(Blocked):
+            transactions.approve(self.vault, package["id"])
 
     def test_source_and_signed_decision_bytes_must_survive_migration(self):
         claim = self.claim()

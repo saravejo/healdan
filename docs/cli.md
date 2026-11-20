@@ -46,11 +46,12 @@ common Git directory. All commands return JSON. `--help` lists exact arguments.
 | `migration inventory`, `migration purge-check` | Read-only legacy/width inventory and purge prerequisites |
 | `migration sign-alias INPUT.json --output SIGNED.json` | Same-identity alias with a human signed decision |
 
-Task agents receive only their role's proposal directory, source snapshot,
+Task agents receive only their session's proposal directory, source snapshot,
 measured context, and temporary/native directory. Authenticate each required
 profile with `CLAUDE_CONFIG_DIR='printed path' claude auth login` before launch.
 `extraction.json` holds each independent extraction; `comparison.json` maps
-every proposed claim ID to `conform` and binds both frozen extraction hashes.
+every proposed claim ID to an object with status `conform` and the exact claim's
+SHA-256, and binds both frozen extraction hashes.
 The editor proposal mirrors authorized `wiki/` and `resources/sources/` paths.
 The controller writes generated pages into the frozen candidate before signing.
 

@@ -60,14 +60,18 @@ def execute(vault, identifier, now=None):
     with vault.locked():
         path = safe_path(vault.control / "deletions", identifier + ".json", exists=True)
         record = read_json(path)
+        frozen = {"id": record["id"], "created_at": record["created_at"], "status": "planned",
+                  "entries": [{"material": e["material"], "copy_index": e["copy_index"], "copy": e["copy"], "status": "planned"}
+                              for e in record["entries"]]}
+        require(digest(frozen) == record["digest"], "Deletion plan changed after persistence")
         for entry in record["entries"]:
             if entry["status"] == "deleted":
                 continue
             try:
                 material = materials(vault)[entry["material"]]
                 copy = material["copies"][entry["copy_index"]]
-                require({k: v for k, v in copy.items() if k != "status"} ==
-                        {k: v for k, v in entry["copy"].items() if k != "status"}, "Copy inventory changed", 5)
+                require({k: v for k, v in copy.items() if k not in {"status", "deleted_at"}} ==
+                        {k: v for k, v in entry["copy"].items() if k not in {"status", "deleted_at"}}, "Copy inventory changed", 5)
                 target = guard(vault, material, copy, now)
                 if target.exists():
                     require(digest(target.read_bytes()) == copy["sha256"], "Copy hash changed; deletion stopped", 5)

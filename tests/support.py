@@ -16,7 +16,7 @@ from healdan.signing import envelope
 class VaultTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="healdan test ")
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.root = self.base / "vault with spaces"
         self.state = self.base / "external state"
         initialize(self.root, self.state)
