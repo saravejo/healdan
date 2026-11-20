@@ -114,7 +114,7 @@ def safe_path(root, relative, *, exists=False):
     path = Path(relative)
     require(not path.is_absolute() and ".." not in path.parts and path.parts,
             "Path must be relative and confined", 2)
-    require(not any(":" in part or "\\" in part for part in path.parts), "Unsafe path", 2)
+    require(not any(":" in part or "\\" in part or any(ord(c) < 32 for c in part) for part in path.parts), "Unsafe path", 2)
     candidate = root / path
     current = candidate
     while True:
@@ -155,7 +155,7 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
 
 
 def git(root, *args, check=True):
-    return run([executable("git"), "-C", root, *args], check=check).stdout.decode("utf-8").strip()
+    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], check=check).stdout.decode("utf-8").strip()
 
 
 @contextlib.contextmanager

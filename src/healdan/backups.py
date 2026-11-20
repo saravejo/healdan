@@ -59,7 +59,8 @@ def create(vault, kind, expires_at, member_ids=(), *, now=None):
                 "A backup destination is offline", 5)
         files = {}
         names = set(vault.inputs())
-        names.update(p for p in git(vault.root, "ls-files").splitlines() if p)
+        tracked = run([executable("git"), "-C", vault.root, "ls-files", "-z"]).stdout.decode("utf-8")
+        names.update(p for p in tracked.split("\0") if p)
         for name in sorted(names):
             data = safe_path(vault.root, name, exists=True).read_bytes()
             files[name] = {"sha256": digest(data), "size": len(data), "body": base64.b64encode(data).decode("ascii")}

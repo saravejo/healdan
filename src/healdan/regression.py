@@ -1,6 +1,7 @@
 """Individually signed expectations evaluated against the actual resolver."""
 from .core import Blocked, digest, require, stamp
 from .knowledge import query, typed
+from .ids import identity
 from .signing import human_sign, trusted_signers, verify
 
 FIELDS = {"id", "question", "filters", "cutoff", "temporal_policy", "expected_ids", "expected_value",
@@ -10,6 +11,10 @@ FIELDS = {"id", "question", "filters", "cutoff", "temporal_policy", "expected_id
 def payload(case):
     require(set(case) - {"approval", "history"} == FIELDS, "Case fields are incomplete or unknown")
     result = {k: case[k] for k in FIELDS}
+    require(identity(case["id"])[0] == "Q", "Regression case requires a Q- identity")
+    for name in ("expected_ids", "expected_conflicts"):
+        require(isinstance(case[name], list) and all(identity(i)[0] == "C" for i in case[name]), "Expected identities must be C-")
+        require(len({identity(i) for i in case[name]}) == len(case[name]), "Duplicate expected identity")
     require(case["question"] and case["reason"] and case["decision"].get("owner") and
             case["decision"].get("at"), "Case requires a specific human decision")
     stamp(case["decision"]["at"])

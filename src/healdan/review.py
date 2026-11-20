@@ -5,13 +5,14 @@ from pathlib import Path
 
 from .core import atomic, digest, read_json, require, safe_path, stamp
 from .ids import identity
-from .tasks import get_session, get_task, require_active
+from .tasks import get_session, get_task, require_active, validate_evidence
 
 
 def freeze_review(vault, task_id, extractor, reviewer):
     with vault.locked():
         task = get_task(vault, task_id)
         require_active(task)
+        validate_evidence(vault, task)
         a, b = get_session(vault, extractor), get_session(vault, reviewer)
         require(a["task"] == b["task"] == task_id and a["role"] == "extractor" and b["role"] == "reviewer",
                 "Review roles/task do not match")
@@ -34,7 +35,7 @@ def freeze_review(vault, task_id, extractor, reviewer):
                              "sha256": digest(output), "launches": session["launches"], "frozen": frozen_name,
                              "proposal": session["proposal"]}
             atomic(base / "frozen" / frozen_name, output)
-        record = {"task": task_id, "frozen_at": stamp(), "outputs": outputs}
+        record = {"task": task_id, "frozen_at": stamp(), "outputs": outputs, "source_digest": digest(task["source_manifest"])}
         atomic(path, record)
         vault.receipt("blind-review", record)
         # Only now may the reviewer read the extractor's independent result.
@@ -43,8 +44,11 @@ def freeze_review(vault, task_id, extractor, reviewer):
 
 
 def validate_review(vault, task_id, units):
+    task = get_task(vault, task_id)
+    validate_evidence(vault, task)
     record = read_json(vault.control / "reviews" / (task_id + ".json"))
     require(record, "Blind review has not been frozen", 5)
+    require(record["source_digest"] == digest(task["source_manifest"]), "Blind review source snapshot mismatch")
     base = vault.state / "tasks" / task_id
     for role in ("extractor", "reviewer"):
         require(digest(safe_path(base / "frozen", record["outputs"][role]["frozen"], exists=True).read_bytes()) == record["outputs"][role]["sha256"],

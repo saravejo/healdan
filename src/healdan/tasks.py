@@ -5,7 +5,7 @@ import os
 import shutil
 from uuid import uuid4
 
-from .core import atomic, digest, git, read_json, require, safe_path, stamp, utc
+from .core import atomic, digest, git, jsonl, read_json, require, safe_path, stamp, utc
 from .ids import reserve
 
 
@@ -53,14 +53,29 @@ def create(vault, title, now=None):
             (base / "temporary" / role).mkdir(parents=True)
         evidence = base / "evidence"
         evidence.mkdir()
-        for source in vault.rows("resources/sources/index.jsonl"):
+        sources = vault.rows("resources/sources/index.jsonl")
+        for source in sources:
             original = safe_path(vault.root, source["path"], exists=True)
+            require(digest(original.read_bytes()) == source["sha256"], "Source changed before task snapshot")
             target = safe_path(evidence, source["path"])
             atomic(target, original.read_bytes())
+        atomic(evidence / "resources/sources/index.jsonl", jsonl(sources))
+        record["source_manifest"] = sources
         record["state"] = "active"
         atomic(task_path(vault, identifier), record)
         vault.receipt("task-created", record)
         return record
+
+
+def validate_evidence(vault, task):
+    require(vault.rows("resources/sources/index.jsonl") == task["source_manifest"], "Task source inventory changed", 5)
+    evidence = vault.state / "tasks" / task["id"] / "evidence"
+    require((evidence / "resources/sources/index.jsonl").read_bytes() == jsonl(task["source_manifest"]),
+            "Task source snapshot manifest changed")
+    for source in task["source_manifest"]:
+        require(digest(safe_path(evidence, source["path"], exists=True).read_bytes()) == source["sha256"] and
+                digest(safe_path(vault.root, source["path"], exists=True).read_bytes()) == source["sha256"],
+                "Task source snapshot no longer matches preserved evidence", 5)
 
 
 def new_session(vault, task_id, action, role, context, *, operation=None):

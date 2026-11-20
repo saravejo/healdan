@@ -41,6 +41,10 @@ class Knowledge:
         for row in source_rows:
             require(identity(row["id"])[0] == "F", "Source needs an F- ID")
             require(row.get("provenance") and row.get("classification"), "Missing source provenance/class")
+            require(row["classification"] != "secret", "Secrets cannot be promoted as canonical sources")
+            if row["classification"] != "common":
+                from .custody import validate_purpose
+                validate_purpose(row)
             utc(row["captured_at"])
             require(row["path"].startswith("resources/sources/"), "Source path outside source tree")
             body = safe_path(vault.root, row["path"], exists=True).read_bytes()
@@ -76,8 +80,12 @@ class Knowledge:
                 require(utc(row["valid_from"]) < utc(row["valid_to"]), "Empty validity interval")
             require(isinstance(row.get("sources"), list) and row["sources"], "Claim lacks source locators")
             for locator in row["sources"]:
-                require(locator.get("id") in self.sources, "Unknown source locator")
-                body = self.sources[locator["id"]][1]
+                source_id = locator.get("id")
+                if source_id not in self.sources:
+                    from .ids import aliases
+                    source_id = aliases(vault).get(source_id)
+                require(source_id in self.sources, "Unknown source locator")
+                body = self.sources[source_id][1]
                 start, end = locator.get("start"), locator.get("end")
                 require(type(start) is int and type(end) is int and 0 <= start < end <= len(body),
                         "Invalid byte locator")

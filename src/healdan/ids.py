@@ -46,6 +46,15 @@ def published(vault):
             for line in content.splitlines():
                 if line.strip():
                     historic.add(decode(line)["id"])
+    spellings = {}
+    approved_aliases = aliases(vault)
+    for value in sorted(historic):
+        key = identity(value)
+        if key in spellings and spellings[key] != value:
+            other = spellings[key]
+            if approved_aliases.get(value) != other and approved_aliases.get(other) != value:
+                current["collisions"].append([other, value])
+        spellings[key] = value
     return current, historic
 
 

@@ -14,7 +14,7 @@ import time
 from uuid import uuid4
 
 from .core import atomic, decode, digest, executable, read_json, require, run, safe_path, stamp, utc
-from .tasks import get_session, get_task, require_active, task_path
+from .tasks import get_session, get_task, require_active, task_path, validate_evidence
 
 
 def runtime_version(vault):
@@ -28,18 +28,24 @@ def runtime_version(vault):
 
 def settings(vault, writable, readable, *, network=False):
     # An explicit outer sandbox covers the native tools and every child process.
+    private = [vault.config.get(k) for k in ("signing_key", "age_identity", "backup_signing_key") if vault.config.get(k)]
+    private += vault.config.get("storage_roots", []) + vault.config.get("backup_destinations", [])
+    def literal(path):
+        return {"path": str(Path(path).resolve()), "literal": True}
+    shared_temp = ["/tmp/claude", "/private/tmp/claude", Path.home() / ".npm/_logs", Path.home() / ".claude/debug"]
     return {"network": {"allowedDomains": ["api.anthropic.com", "claude.ai", "platform.claude.com"] if network else [],
                         "deniedDomains": [], "allowUnixSockets": [], "allowLocalBinding": False},
-            "filesystem": {"denyRead": [str(Path.home()), str(vault.root), str(vault.state), str(vault.common)],
-                           "allowRead": [str(Path(p).resolve()) for p in readable],
-                           "allowWrite": [str(Path(p).resolve()) for p in writable],
-                           "denyWrite": [str(vault.root), str(vault.common), str(Path(__file__).parent),
-                                         str(vault.config_path)]}}
+            "filesystem": {"denyRead": [literal(p) for p in [Path.home(), vault.root, vault.state, vault.common,
+                                            "/tmp", "/private/tmp", "/var/folders", "/private/var/folders", *private]],
+                           "allowRead": [literal(p) for p in readable],
+                           "allowWrite": [literal(p) for p in writable],
+                           "denyWrite": [literal(p) for p in [vault.root, vault.common, Path(__file__).parent,
+                                                              vault.config_path, *shared_temp, *private]]}}
 
 
 def clean_env(temporary, profile=None):
     env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "LC_ALL", "TERM", "SYSTEMROOT"}}
-    env.update(HOME=str(Path.home()), TMPDIR=str(temporary), PYTHONDONTWRITEBYTECODE="1",
+    env.update(HOME=str(Path.home()), TMPDIR=str(temporary), CLAUDE_CODE_TMPDIR=str(temporary), PYTHONDONTWRITEBYTECODE="1",
                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_AUTOUPDATER="1")
     if profile:
         env["CLAUDE_CONFIG_DIR"] = str(profile)
@@ -62,7 +68,7 @@ def probe(vault):
         sock.listen(1)
         sentinel = "denial-probe-" + str(uuid4())
         targets = [secret, vault.root / sentinel, vault.common / sentinel,
-                   vault.state / sentinel, Path(__file__).parent / sentinel]
+                   vault.state / sentinel, Path(__file__).parent / sentinel, Path("/tmp/claude") / sentinel]
         config = settings(vault, [allowed], [allowed, Path(sys.executable).resolve().parent.parent])
         config_path = root / "sandbox.json"
         atomic(config_path, config)
@@ -70,6 +76,7 @@ def probe(vault):
 targets=json.loads(sys.argv[1]); allowed=pathlib.Path(sys.argv[2]); result={}
 for name in targets:
     try:
+        pathlib.Path(name).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(name).write_bytes(b'ESCAPE'); result[name]=False
     except OSError:
         result[name]=True
@@ -122,6 +129,7 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
         task = get_task(vault, session["task"])
         if not recovery_material:
             require_active(task)
+            validate_evidence(vault, task)
         else:
             require(resume and session.get("reconstruction", {}).get("material") == recovery_material,
                     "Recovery must resume the reconstructed original session", 5)
@@ -144,7 +152,8 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
                     Path(executable("claude")).resolve().parent, Path(executable("node")).resolve().parent]
         readable.append(native)
         config = settings(vault, [temporary, native] + ([] if recovery_material else [proposal]), readable, network=True)
-        config["filesystem"]["denyWrite"].extend([str(native / "settings.json"), str(native / ".credentials.json")])
+        config["filesystem"]["denyWrite"].extend([{"path": str(native / name), "literal": True}
+                                                   for name in ("settings.json", ".credentials.json")])
         settings_path = base / "sandbox" / (operation + ".json")
         atomic(settings_path, config)
         args = [executable("srt"), "--settings", settings_path, "--", executable("claude"),

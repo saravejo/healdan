@@ -11,7 +11,7 @@ from .pages import generated_pages, validate_pages
 from .regression import require_suite
 from .review import csp_status, freeze_csp, inspect, validate_review
 from .signing import human_sign, trusted_signers, verify
-from .tasks import get_task, get_session, require_active
+from .tasks import get_task, get_session, require_active, validate_evidence
 
 EXACT = {"wiki/claims.jsonl", "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
          "wiki/control/page-policy.json", "wiki/control/query-cases.jsonl", "wiki/control/aliases.jsonl",
@@ -102,6 +102,7 @@ def prepare(vault, task_id, *, cutoff=None):
         vault.no_transaction()
         task = get_task(vault, task_id)
         require_active(task)
+        validate_evidence(vault, task)
         require(task["base"] == vault.head(), "Task base changed; reconcile before preparing", 5)
         before = vault.fingerprint()
         root = vault.state / "tasks" / task_id / "proposals/editor"
@@ -118,6 +119,8 @@ def prepare(vault, task_id, *, cutoff=None):
         cutoff = stamp(cutoff)
         with Candidate(vault, files) as candidate:
             changes = proposed_digests(vault, candidate)
+            require(not changes or candidate.rows("resources/sources/index.jsonl") == task["source_manifest"],
+                    "Promoted claims must use the source snapshot seen by both independent sessions", 5)
             # Controller renders before signing; handwritten substitutes cannot pass validation.
             for name, body in generated_pages(candidate, proposed=changes.values()).items():
                 existing = safe_path(candidate.root, name)
@@ -141,6 +144,7 @@ def prepare(vault, task_id, *, cutoff=None):
         review = validate_review(vault, task_id, changes) if changes else None
         csp_state = read_json(vault.control / "csp.json", {"streak": 0})
         payload = {"task": task_id, "base": vault.head(), "fingerprint": before, "files": files,
+                   "input_hashes": vault.inputs(),
                    "claim_digests": changes, "cutoff": cutoff, "review": review, "regression": regression}
         identifier = digest(payload)
         path = package_path(vault, identifier)
@@ -174,6 +178,7 @@ def approve(vault, identifier):
         vault.no_transaction()
         record = read_json(package_path(vault, identifier))
         require(record, "Unknown package", 2)
+        require(record["id"] == digest(record["payload"]), "Frozen package content changed")
         require_active(get_task(vault, record["payload"]["task"]))
         require(vault.fingerprint() == record["payload"]["fingerprint"], "Approval base/content is stale", 5)
         status = csp_status(record["csp"])
@@ -181,7 +186,8 @@ def approve(vault, identifier):
         require(digest(read_json(vault.control / "csp.json", {"streak": 0})) == record["csp"]["state_digest"],
                 "CSP state changed; a new package is required", 5)
         with Candidate(vault, record["payload"]["files"]) as candidate:
-            validate_candidate(vault, candidate, record["payload"]["cutoff"])
+            changes, _ = validate_candidate(vault, candidate, record["payload"]["cutoff"])
+            require(changes == record["payload"]["claim_digests"], "Frozen claim digests changed")
         record["approval"] = human_sign(vault, approval_payload(record), "package")
         atomic(package_path(vault, identifier), record)
         return record["approval"]
@@ -198,6 +204,7 @@ def apply(vault, identifier=None, *, recover=False):
             vault.no_transaction()
         record = read_json(package_path(vault, identifier))
         require(record, "Unknown package", 2)
+        require(record["id"] == digest(record["payload"]), "Frozen package content changed")
         signed = verify(record["approval"], "package", trusted_signers(vault))
         require(signed == approval_payload(record), "Package changed after approval")
         if not recover:
@@ -219,6 +226,11 @@ def apply(vault, identifier=None, *, recover=False):
         require(vault.head() == journal["base"] or
                 f"Healdan-Package: {identifier}" in git(vault.root, "log", "-1", "--format=%B"),
                 "Git changed during recovery", 5)
+        current_inputs = vault.inputs()
+        untouched = set(current_inputs) | set(signed["input_hashes"])
+        for name in untouched - set(journal["files"]):
+            require(current_inputs.get(name) == signed["input_hashes"].get(name),
+                    "An unsigned input changed during integration: " + name, 5)
         for name, encoded in journal["files"].items():
             path = safe_path(vault.root, name)
             body = base64.b64decode(encoded, validate=True)
