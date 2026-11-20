@@ -29,7 +29,7 @@ def render_current(knowledge, ids, title, cutoff):
         citations = "; ".join(f"{s['id']} bytes {s['start']}:{s['end']} sha256:{s['sha256']}" for s in row["sources"])
         line = (f"<a id=\"{identifier}\"></a>\n- **{identifier}** [{row['state']}] "
                 f"{escape(row['statement'])}\n  Value: {escape(row['value'])}; "
-                f"polarity: {row['polarity']}; environment: {escape(row['environment'])}.\n"
+                f"polarity: {row['polarity']}; environment: {escape(row.get('environment'))}.\n"
                 f"  Sources: {citations}.\n  Validity: {escape(row.get('valid_from'))} to {escape(row.get('valid_to'))}.\n"
                 f"  Qualifiers: {escape(row.get('qualifiers', {}))}.\n")
         if not factual:
@@ -111,7 +111,7 @@ def split_preview(rows, renderer, caps=CAPS):
 
 def preview(vault, cutoff=None, *, proposed=()):
     before = vault.fingerprint()
-    knowledge = Knowledge(vault, proposed=proposed)
+    knowledge = Knowledge(vault, proposed=proposed, diagnostic=True)
     cutoff = stamp(cutoff)
     result = split_preview(list(knowledge.claims.values()),
                            lambda title, ids: render_current(knowledge, ids, title, cutoff))

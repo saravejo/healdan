@@ -29,7 +29,7 @@ def claim_key(claim):
 
 
 class Knowledge:
-    def __init__(self, vault, *, proposed=()):
+    def __init__(self, vault, *, proposed=(), diagnostic=False):
         self.vault = vault
         rows = vault.rows("wiki/claims.jsonl")
         require(not inventory(rows)["collisions"], "Claim identity collision")
@@ -64,8 +64,8 @@ class Knowledge:
         for row in rows:
             require(identity(row["id"])[0] == "C", "Claim needs a C- ID")
             require(row.get("state") in STATES, "Unknown claim state")
-            require(all(isinstance(row.get(k), str) and row[k].strip()
-                        for k in ("statement", "property", "environment")), "Missing claim fields")
+            required = ("statement",) if diagnostic else ("statement", "entity", "property", "environment")
+            require(all(isinstance(row.get(k), str) and row[k].strip() for k in required), "Missing claim fields")
             typed(row["value"])
             require(row.get("polarity") in {"positive", "negative"}, "Invalid polarity")
             if row.get("valid_from"):
@@ -169,3 +169,8 @@ def query(vault, filters, cutoff=None, *, proposed=(), max_records=None):
         return {"code": exc.code, "outcome": "invalid", "ids": [], "value": None,
                 "polarity": None, "conflicts": [], "cutoff": cutoff,
                 "commit": vault.head(), "research": "blocked", "diagnostics": [str(exc)]}
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        code = 1 if isinstance(exc, OSError) else 4
+        return {"code": code, "outcome": "invalid", "ids": [], "value": None,
+                "polarity": None, "conflicts": [], "cutoff": cutoff, "commit": vault.head(),
+                "research": "blocked", "diagnostics": ["Incomplete or unreadable input: " + str(exc)]}

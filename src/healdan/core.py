@@ -238,8 +238,13 @@ class Vault:
         return result
 
     def fingerprint(self):
+        signers = self.config.get("allowed_signers")
+        policy_files = {"config": digest(self.config_path.read_bytes()) if self.config_path.is_file() else None,
+                        "signers": digest(Path(signers).read_bytes()) if signers and Path(signers).is_file() else None}
+        controller = {p.name: digest(p.read_bytes()) for p in Path(__file__).parent.iterdir()
+                      if p.suffix in {".py", ".json"}}
         return digest({"head": self.head(), "files": self.inputs(), "policy": self.policy,
-                       "config": self.config})
+                       "config": self.config, "policy_files": policy_files, "controller": controller})
 
     def receipt(self, kind, payload):
         value = {"kind": kind, "at": stamp(), "payload": payload}

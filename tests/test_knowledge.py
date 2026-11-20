@@ -93,6 +93,12 @@ class Query(VaultTest):
 
 
 class Pages(VaultTest):
+    def test_real_preview_reports_missing_entity_without_factual_answer(self):
+        self.knowledge([self.claim(entity=None)])
+        result = preview(self.vault)
+        self.assertEqual(result["comparisons"][0]["pending"][0]["reason"], "Missing entity")
+        self.assertEqual(query(self.vault, {})["code"], 4)
+
     def test_complete_segment_utf8_preview_is_pure(self):
         claim = self.claim(statement="Medição " + "é" * 100)
         self.knowledge([claim])
