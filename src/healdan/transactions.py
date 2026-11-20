@@ -11,7 +11,7 @@ from .pages import generated_pages, validate_pages
 from .regression import require_suite
 from .review import csp_status, freeze_csp, inspect, validate_review
 from .signing import human_sign, trusted_signers, verify
-from .tasks import get_task, get_session, require_active, validate_evidence
+from .tasks import get_task, get_session, require_active, validate_evidence, task_path
 
 EXACT = {"wiki/claims.jsonl", "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
          "wiki/control/page-policy.json", "wiki/control/query-cases.jsonl", "wiki/control/aliases.jsonl",
@@ -104,6 +104,7 @@ def prepare(vault, task_id, *, cutoff=None):
         require_active(task)
         validate_evidence(vault, task)
         require(task["base"] == vault.head(), "Task base changed; reconcile before preparing", 5)
+        require(task["base_fingerprint"] == vault.fingerprint(), "Task canonical inputs changed; prepare a fresh task", 5)
         before = vault.fingerprint()
         root = vault.state / "tasks" / task_id / "proposals/editor"
         editors = [get_session(vault, op) for op in task["sessions"] if get_session(vault, op)["role"] == "editor"]
@@ -190,6 +191,10 @@ def approve(vault, identifier):
             require(changes == record["payload"]["claim_digests"], "Frozen claim digests changed")
         record["approval"] = human_sign(vault, approval_payload(record), "package")
         atomic(package_path(vault, identifier), record)
+        task = get_task(vault, record["payload"]["task"])
+        if task["state"] == "waiting":
+            task.update(answered_at=stamp(), state="active", response_package=identifier)
+            atomic(task_path(vault, task["id"]), task)
         return record["approval"]
 
 

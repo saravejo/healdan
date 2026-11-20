@@ -39,11 +39,13 @@ def create(vault, title, now=None):
         require(sum(t.get("capacity_held", True) for t in all_tasks(vault)) < vault.policy["active_writers"],
                 "Writing capacity is occupied", 5)
         require(vault.head(), "Create an initial local Git commit before opening a task", 5)
+        vault.clean_inputs()
         identifier = str(uuid4())
         base = vault.state / "tasks" / identifier
         worktree = base / "worktree"
         base.mkdir(parents=True, exist_ok=False)
         record = {"id": identifier, "title": title, "created_at": stamp(now), "base": vault.head(),
+                  "base_fingerprint": vault.fingerprint(),
                   "worktree": str(worktree), "state": "creating", "capacity_held": True,
                   "sessions": [], "reminders": [], "processes": []}
         atomic(task_path(vault, identifier), record)
@@ -126,6 +128,37 @@ def present(vault, task_id, question, delivery_receipt, now=None):
         return task
 
 
+def answer(vault, task_id, decision, now=None):
+    from .signing import human_sign
+    with vault.locked():
+        task = get_task(vault, task_id)
+        require(task.get("presented_at") and task["state"] == "waiting" and not task.get("closure_pending") and
+                utc(now) < utc(task["presented_at"]) + timedelta(days=7), "Late response requires an explicit reopening decision", 5)
+        require(decision.get("answer") and decision.get("owner") and decision.get("reason"), "Incomplete human response", 2)
+        signed = human_sign(vault, {"task": task_id, "decision": decision, "at": stamp(now)}, "decision")
+        task.update(answered_at=stamp(now), response=signed, state="active")
+        atomic(task_path(vault, task_id), task)
+        return task
+
+
+def reopen(vault, task_id, decision):
+    from .signing import human_sign
+    old = get_task(vault, task_id)
+    require(old["state"] in {"closed", "cancelled"} and not old["capacity_held"],
+            "Reconcile and preserve the previous task before reopening", 5)
+    require(decision.get("owner") and decision.get("reason"), "Reopening needs an explicit human decision", 2)
+    signed = human_sign(vault, {"previous_task": task_id, "decision": decision, "at": stamp()}, "decision")
+    fresh = create(vault, old["title"])
+    with vault.locked():
+        inherited = dict(old.get("prior_usage", {}))
+        for operation in old["sessions"]:
+            for key, amount in get_session(vault, operation)["usage"].items():
+                inherited[key] = inherited.get(key, 0) + amount
+        fresh.update(predecessor=task_id, reopening_decision=signed, prior_usage=inherited)
+        atomic(task_path(vault, fresh["id"]), fresh)
+    return fresh
+
+
 def reconcile_clock(vault, task, now=None):
     now = utc(now)
     updates = []
@@ -160,7 +193,7 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
         from .launcher import profile
         for session in sessions:
             if session["launches"] and not session.get("preservation"):
-                session["preservation"] = capture_tree(vault, profile(vault, session["operation"]), task=task_id,
+                session["preservation"] = capture_tree(vault, Path(session.get("active_profile") or profile(vault, session["operation"])), task=task_id,
                     classification="unknown", session=session["operation"], purpose=purpose)
                 atomic(vault.control / "sessions" / (session["operation"] + ".json"), session)
         # Includes dirty proposals, original source snapshot, contexts, worktree and native checkpoints.

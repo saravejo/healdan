@@ -8,7 +8,10 @@ retention and proven recovery. P4 (controlled execution) lets agents propose
 and the controller validate/apply. P5 (deterministic pages) shares the query
 resolver with topic rendering. These are explicit Healdan definitions.
 
-Create a task with `task create`; only one active writer is allowed by default.
+Preserve sources with `inbox ingest`, review them, and commit the source registry
+and originals locally before `task create`. A task requires clean, tracked
+canonical inputs, ensuring its base can be recovered from Git. Only one active
+writer is allowed by default.
 Its detached worktree records creation in UTC. At 12 hours status warns;
 at 24 hours new actions and integration stop. The launcher terminates its
 process group at that deadline. Reconciliation preserves proposals, sources,

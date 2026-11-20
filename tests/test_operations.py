@@ -66,6 +66,29 @@ class Tasks(VaultTest):
         self.assertTrue(tasks.get_task(self.vault, task["id"])["capacity_held"])
         self.assertTrue(Path(task["worktree"]).is_dir())
 
+    def test_signed_answer_stops_waiting_and_late_answer_is_rejected(self):
+        task = tasks.create(self.vault, "Waiting fixture")
+        start = utc()
+        tasks.present(self.vault, task["id"], "Choose an action", "presentation", start)
+        decision = {"answer": "Continue", "owner": "human", "reason": "Evidence checked"}
+        with self.assertRaises(Blocked):
+            tasks.answer(self.vault, task["id"], decision, start + timedelta(days=7))
+        answered = tasks.answer(self.vault, task["id"], decision, start + timedelta(days=1))
+        self.assertEqual(answered["created_at"], task["created_at"])
+        self.assertNotIn("closure_pending", tasks.reconcile_clock(self.vault, answered, start + timedelta(days=8)))
+
+    def test_explicit_reopening_preserves_session_consumption(self):
+        self.age()
+        task = tasks.create(self.vault, "Reopening fixture")
+        session = tasks.new_session(self.vault, task["id"], "read", "reader", "fixture")
+        session["usage"]["input_tokens"] = 40
+        atomic(self.vault.control / "sessions" / (session["operation"] + ".json"), session)
+        tasks.preserve_and_close(self.vault, task["id"])
+        fresh = tasks.reopen(self.vault, task["id"], {"owner": "human", "reason": "Late answer received"})
+        self.assertEqual(fresh["predecessor"], task["id"])
+        self.assertEqual(fresh["prior_usage"]["input_tokens"], 40)
+        self.assertNotEqual(fresh["id"], task["id"])
+
     def test_csp_freeze_numeric_sampling_and_defect_reset(self):
         units = {f"C-{n:04d}": str(n) for n in range(1, 131)}
         plan = freeze_csp(units, {"streak": 0}, "12" * 32)

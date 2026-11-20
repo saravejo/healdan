@@ -260,3 +260,9 @@ class Vault:
         pending = read_json(self.control / "transaction.json")
         require(not pending or pending["status"] == "complete",
                 "An integration needs recovery", 5)
+
+    def clean_inputs(self):
+        tracked = run([executable("git"), "-C", self.root, "ls-files", "-z"]).stdout.decode("utf-8").split("\0")
+        require(set(self.inputs()) <= set(tracked), "Commit preserved sources and canonical inputs before creating a task", 5)
+        changed = git(self.root, "diff", "HEAD", "--name-only", "--", "wiki", "resources/sources", "config", "templates", "control/approvals")
+        require(not changed, "Canonical task inputs have uncommitted changes", 5)

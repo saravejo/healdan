@@ -24,6 +24,7 @@ class RealAge(VaultTest):
         restored = self.state / "reconstructed"
         custody.restore_capture(self.vault, identifier, restored)
         self.assertEqual((restored / "session.jsonl").read_bytes(), (origin / "session.jsonl").read_bytes())
+        self.assertTrue(any(c["root"] == str(restored.resolve()) for c in custody.materials(self.vault)[identifier]["copies"]))
         self.assertNotIn("native_recovery", record)
 
     def test_real_backup_roundtrip_and_manifest_only_long_generation(self):

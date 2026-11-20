@@ -32,8 +32,8 @@ def guard(vault, record, copy, now):
         roots.append((vault.root / "inbox").resolve())
     roots.extend(Path(p).resolve() for p in vault.config.get("backup_destinations", []))
     root = Path(copy["root"])
-    controller_task = root.resolve().is_relative_to((vault.state / "tasks").resolve())
-    require(root.is_absolute() and (root.resolve() in roots or controller_task), "Copy root is not authorized", 5)
+    controller_copy = root.resolve().is_relative_to(vault.state.resolve()) and root.resolve() != vault.state.resolve()
+    require(root.is_absolute() and (root.resolve() in roots or controller_copy), "Copy root is not authorized", 5)
     require(root.is_dir() and not root.is_symlink(), "Copy destination is offline or unsafe", 5)
     return safe_path(root, copy["path"])
 

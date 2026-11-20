@@ -165,7 +165,13 @@ def restore_capture(vault, identifier, destination):
     plain = decrypt(vault, cipher)
     require(digest(plain) == record["plain_sha256"], "Plaintext archive digest mismatch")
     require(not Path(destination).resolve().is_relative_to(vault.root), "Native restore must be external")
-    result = restore_tree(decode(plain), destination)
+    archive = decode(plain)
+    result = restore_tree(archive, destination)
+    root = str(Path(destination).resolve())
+    for name, entry in archive["files"].items():
+        record["copies"].append({"root": root, "path": name, "sha256": entry["sha256"],
+                                 "kind": "native" if record.get("session") else "checkpoint", "status": "present"})
+    save_material(vault, record)
     if record.get("session"):
         from .tasks import get_session
         session = get_session(vault, record["session"])

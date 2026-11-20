@@ -209,6 +209,7 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
                    "recovery_material": recovery_material,
                    "cumulative_usage": dict(session["usage"]), "native_profile": str(native)}
         session["launches"].append(receipt)
+        session["active_profile"] = str(native)
         session["state"] = "completed" if success else "reconciliation_required"
         atomic(vault.control / "sessions" / (operation + ".json"), session)
         task["processes"] = [p for p in task["processes"] if p["launch"] != launch_id]

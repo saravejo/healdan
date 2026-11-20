@@ -1,7 +1,7 @@
 """Read-only legacy inventory and exceptional purge prerequisites."""
 import re
 
-from .core import REGISTRIES, digest, git, read_json, require
+from .core import REGISTRIES, digest, executable, git, read_json, require, run
 from .ids import inventory as id_inventory
 from .pages import validate_links
 from .tasks import all_tasks
@@ -14,13 +14,20 @@ def inventory(vault):
         files.append({"path": name, "sha256": sha256,
                       "signed_or_historical": any(part in name for part in ("approval", "decision", "lesson", "history"))})
     assumptions = []
-    for path in vault.root.rglob("*.py"):
-        if any(p.startswith(".") for p in path.relative_to(vault.root).parts):
+    line_counts = {"implementation": 0, "tests": 0, "configuration": 0}
+    names = run([executable("git"), "-C", vault.root, "ls-files", "-z"]).stdout.decode("utf-8").split("\0")
+    for name in names:
+        path = vault.root / name
+        if path.suffix not in {".py", ".json", ".toml", ".yml"} or not path.is_file():
+            continue
+        category = "tests" if name.startswith("tests/") else "implementation" if path.suffix == ".py" else "configuration"
+        line_counts[category] += len(path.read_bytes().splitlines())
+        if path.suffix != ".py":
             continue
         for line, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if any(token in text for token in ("{4}", ":04d", "%04d")):
                 assumptions.append({"path": path.relative_to(vault.root).as_posix(), "line": line})
-    return {**ids, "files": files, "width_assumptions": assumptions,
+    return {**ids, "files": files, "width_assumptions": assumptions, "physical_lines": line_counts,
             "historical_questions": {"available": 0, "expected_historical": 37, "status": "not_supplied"}}
 
 

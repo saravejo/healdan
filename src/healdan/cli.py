@@ -59,6 +59,10 @@ def parser():
     close.add_argument("--reason", default="completed")
     reconcile = task.add_parser("reconcile")
     reconcile.add_argument("id")
+    for operation in ("answer", "reopen"):
+        response = task.add_parser(operation)
+        response.add_argument("id")
+        response.add_argument("decision", type=Path)
     reserve = task.add_parser("reserve-id")
     reserve.add_argument("prefix")
     reserve.add_argument("--count", type=int, default=1)
@@ -166,7 +170,9 @@ def dispatch(args):
                 "lint_overdue": linting.stale(state.get("last_complete_lint_at")),
                 "last_complete_lint_at": state.get("last_complete_lint_at"),
                 "tasks": [{"id": t["id"], "state": t["state"], "worktree_age": tasks.age_status(t),
-                           "capacity_held": t["capacity_held"]} for t in tasks.all_tasks(vault)],
+                           "capacity_held": t["capacity_held"], "reminders": t.get("reminders", []),
+                           "waiting_since": t.get("presented_at"), "closure_pending": t.get("closure_pending", False)}
+                          for t in tasks.all_tasks(vault)],
                 "transaction": read_json(vault.control / "transaction.json", {}).get("status"),
                 "native_trials": maintenance.trial_status(vault)}
     if args.command == "query":
@@ -216,6 +222,10 @@ def dispatch(args):
             return tasks.preserve_and_close(vault, args.id, reason=args.reason)
         if args.action == "reconcile":
             return tasks.reconcile_expired(vault, args.id)
+        if args.action == "answer":
+            return tasks.answer(vault, args.id, read_json(args.decision))
+        if args.action == "reopen":
+            return tasks.reopen(vault, args.id, read_json(args.decision))
         if args.action == "reserve-id":
             return ids.reserve(vault, args.prefix, args.count, args.operation)
     if args.command == "session":
@@ -231,7 +241,7 @@ def dispatch(args):
         if args.action == "capture":
             session = tasks.get_session(vault, args.operation)
             with vault.locked():
-                return {"material": custody.capture_tree(vault, launcher.profile(vault, args.operation), task=session["task"],
+                return {"material": custody.capture_tree(vault, Path(session.get("active_profile") or launcher.profile(vault, args.operation)), task=session["task"],
                         session=args.operation, classification=args.classification,
                         purpose=read_json(args.purpose) if args.purpose else None)}
         if args.action == "restore":

@@ -13,6 +13,9 @@ Add the printed executable directory to PATH. Paths containing spaces work.
 Setup is repeatable and does not overwrite an existing configuration.
 It removes only remotes whose URL identifies `saravejo/healdan`.
 Setup does not rewrite history or remove other remotes.
+For a ZIP installation, configure Git identity, review the initialized files,
+and make the initial local commit before creating a task. Setup never commits
+unreviewed files from an existing folder automatically.
 
 Configure the external JSON file printed by setup, or use interactive setup.
 Provide Git name/email, a human signing identity and public/private SSH key,

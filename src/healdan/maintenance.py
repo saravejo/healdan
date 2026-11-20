@@ -47,17 +47,19 @@ def trial_status(vault):
 def daily(vault, now=None):
     from . import backups, retention
     from .tasks import all_tasks, reconcile_clock, reconcile_expired, preserve_and_close
+    notices = []
     for task in all_tasks(vault):
         if task.get("capacity_held"):
             with vault.locked():
                 updates = reconcile_clock(vault, task, now)
+                notices.extend({"task": task["id"], "notice": update} for update in updates)
             try:
                 if task.get("closure_pending"):
                     preserve_and_close(vault, task["id"], reason="human_timeout")
                 elif task.get("worktree_expired"):
                     reconcile_expired(vault, task["id"])
             except Blocked as exc:
-                return {"status": "pending", "task": task["id"], "reason": str(exc), "backup": None}
+                return {"status": "pending", "task": task["id"], "reason": str(exc), "backup": None, "notices": notices}
     with vault.locked():
         vault.no_transaction()
         for task in all_tasks(vault):
@@ -67,11 +69,11 @@ def daily(vault, now=None):
         deletion = pending[0] if pending else retention.plan(vault, now)
     result = retention.execute(vault, deletion["id"], now)
     if result["status"] != "complete":
-        return {"status": "pending", "retention": result["id"], "backup": None}
+        return {"status": "pending", "retention": result["id"], "backup": None, "notices": notices}
     lifetime = vault.config.get("backup_generation_days")
     require(type(lifetime) is int and lifetime > 0, "Approved backup generation lifetime is required", 5)
     backup = backups.create(vault, "long", utc(now) + timedelta(days=lifetime), now=now)
-    return {"status": "complete", "retention": result["id"], "backup": backup["id"]}
+    return {"status": "complete", "retention": result["id"], "backup": backup["id"], "notices": notices}
 
 
 def schedule(vault, *, activate=False):

@@ -18,6 +18,9 @@ common Git directory. All commands return JSON. `--help` lists exact arguments.
 | `task reserve-id C --operation UUID [--count N]` | Idempotent common-Git reservation |
 | `task present ID --question TEXT --receipt TEXT` | Record successful human presentation and start waiting clock |
 | `task close ID` | Verified encrypted preservation, worktree removal, reconciled closure |
+| `task reconcile ID` | Preserve and dismantle an expired worktree while keeping the task/waiting clock |
+| `task answer ID DECISION.json` | Sign a timely human response without resetting worktree age |
+| `task reopen ID DECISION.json` | Explicitly link a new task to a reconciled closed task and carry prior consumption |
 | `session create TASK --role ROLE --action-name ACTION --context FILE` | Measure context; allocate S-/UUID and external profile identity |
 | `session profile OPERATION` | Print isolated profile for the owner's native authentication |
 | `session probe` | Real macOS runtime denial tests |
