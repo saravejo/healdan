@@ -1,0 +1,15 @@
+{
+  "id": null,
+  "statement": null,
+  "entity": null,
+  "property": null,
+  "environment": null,
+  "primary_topic": null,
+  "state": null,
+  "value": {"type": null, "value": null, "unit": null},
+  "polarity": null,
+  "sources": [],
+  "valid_from": null,
+  "valid_to": null,
+  "qualifiers": {}
+}

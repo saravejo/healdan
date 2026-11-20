@@ -1,0 +1,8 @@
+include LICENSE README.md
+recursive-include src/healdan *.py *.json
+recursive-include tests *.py
+exclude wiki-1.4.md
+prune .local-tools
+prune .verification
+prune .git
+prune .claude

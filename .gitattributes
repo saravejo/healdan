@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.jsonl -merge
+*.sig -text
+wiki-1.4.md export-ignore
+tests/ export-ignore
+.github/ export-ignore
+.gitignore export-ignore

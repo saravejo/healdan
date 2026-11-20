@@ -1,0 +1,53 @@
+# Data model
+
+All distributed names, messages, fields, and configuration are English.
+JSON is UTF-8, finite, and rejects duplicate keys. JSONL starts empty.
+Timestamps must have an offset and are normalized to UTC.
+
+Identifiers use F/C/D/L/Q/M/S followed by ASCII digits. New fields require
+four digits or a larger integer without extra leading zeros. Identity and
+order are `(prefix, numeric_suffix)`; reservation starts at one, never zero.
+Diagnostic legacy reads retain original spelling. Ambiguous numeric collisions
+block affected reservations/migrations. Signed aliases identify the same
+numeric identity and do not create another record. Reservations live under
+the common Git directory, use a cross-process lock and operation UUID, include
+all published/reserved identifiers, and never reclaim an abandoned number.
+
+`resources/sources/index.jsonl` records F- ID, path, SHA-256, size, capture time,
+provenance, and classification. Paths stay below `resources/sources/`.
+Locators use byte offsets and a SHA-256 of the exact byte range; no inferred
+page offset is accepted. Original bytes are never rewritten by promotion.
+
+`wiki/claims.jsonl` contains C- ID, statement, entity, property, environment,
+primary_topic, state, typed value `{type,value,unit}`, polarity, sources,
+valid_from/valid_to, optional successor, and qualifiers. Allowed states:
+accepted, hypothesis, disputed, superseded, rejected. Hypotheses and disputes
+remain visible as pending and cannot support factual answers. Acceptance also
+requires a matching signed promotion receipt. Types distinguish booleans from
+integers. Successor chains must exist and be acyclic.
+
+`wiki/control/topic-map.jsonl` contains id, topics, and
+replace_primary_topic (default false). False means union; true replaces the
+principal membership without changing the claim. Selectors contain explicit
+IDs, a title, path, cutoff, and purpose `current_at_cutoff`.
+Decisions D- and lessons L- have their own registries and signed payloads;
+they are never converted into claims during navigation changes.
+
+Query accepts structured entity/property/environment/topic/term filters and a
+cutoff. It follows successors and searches counterevidence across topics.
+JSON returns IDs, typed value, polarity, conflicts, cutoff, commit, research
+state, and diagnostics. Exit codes: 0 answer; 1 technical failure; 2 invalid
+input; 3 conflict; 4 integrity failure; 5 incomplete/blocked research;
+20 abstention. A failure never counts as abstention.
+
+Cases in `wiki/control/query-cases.jsonl` contain id, question, filters,
+cutoff or temporal policy, expected IDs/value/polarity/outcome/conflicts,
+reason, and a human decision with an individual SSH signature. Signatures
+use separate namespaces for cases, packages, aliases, and trial evidence.
+Previous signed decisions remain in immutable receipt history.
+
+Tasks and sessions are controller state. A session has S-, UUID, task/action,
+role, profile, consumption and launch history. A new action uses a new S-;
+resume keeps the same linkage and cumulative usage. Custody manifests contain
+hashes and metadata, never conversation bodies. Controller commands accept
+JSON files for complex inputs; see `healdan <command> --help`.

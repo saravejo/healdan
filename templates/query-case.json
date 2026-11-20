@@ -1,0 +1,14 @@
+{
+  "id": null,
+  "question": null,
+  "filters": {},
+  "cutoff": null,
+  "temporal_policy": null,
+  "expected_ids": [],
+  "expected_value": null,
+  "expected_polarity": null,
+  "outcome": null,
+  "expected_conflicts": [],
+  "reason": null,
+  "decision": {"owner": null, "at": null}
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "active_writers": 1,
+  "context_bytes": {"reader": 8000, "extractor": 12000, "reviewer": 12000, "editor": 8000},
+  "preview_bytes": [6000, 12000, 20000],
+  "approved_page_bytes": null,
+  "worktree_warning_hours": 12,
+  "worktree_limit_hours": 24,
+  "human_wait_days": 7,
+  "csp": {"i": 111, "f": 0.1},
+  "cleanupPeriodDays": 30,
+  "srt_version": "0.0.83",
+  "schedules": {"lint": {"Weekday": 1, "Hour": 9, "Minute": 0}, "daily": {"Hour": 2, "Minute": 0}}
+}
