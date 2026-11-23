@@ -1,6 +1,5 @@
 import base64
 import copy
-import copy
 from pathlib import Path
 from unittest.mock import patch
 import unittest
@@ -10,6 +9,7 @@ from support import VaultTest
 from healdan import ids, review, tasks, transactions
 from healdan.core import Blocked, REQUIRED_REGISTRIES, atomic, digest, git, jsonl, read_json
 from healdan.knowledge import query
+from healdan.signing import verify
 
 
 class Transactions(VaultTest):
@@ -129,6 +129,100 @@ class Transactions(VaultTest):
         self.assertEqual(read_json(self.vault.control / "csp.json")["streak"], 0)
         with self.assertRaises(Blocked):
             transactions.approve(self.vault, package["id"])
+
+    def test_unknown_inspection_state_blocks_preparation_and_approval(self):
+        state_path = self.vault.control / "csp.json"
+        legacy_state = {"streak": 111, "package": "1" * 64}
+        atomic(state_path, legacy_state)
+        legacy_bytes = state_path.read_bytes()
+        with patch("healdan.review.secrets.token_hex", return_value="00" * 32):
+            task, frozen = self.prepare_fixture()
+        self.assertTrue(review.csp_status(frozen["csp"])["complete"])
+        self.assertEqual(frozen["csp"]["inspections"], {})
+        path = transactions.package_path(self.vault, frozen["id"])
+        original = path.read_bytes()
+        receipts = self.vault.control / "receipts"
+        before_receipts = set(receipts.glob("*.json"))
+        cutoff = frozen["payload"]["cutoff"]
+        inspection = self.base / "inspection.json"
+        atomic(inspection, {})
+
+        for unsupported in (dict(legacy_state, format="healdan-inspection-state-v99"),
+                            dict(legacy_state, authority="unknown metadata"),
+                            dict(legacy_state, rule="unknown-inspection-regime")):
+            with self.subTest(state=unsupported):
+                atomic(state_path, unsupported)
+                before = state_path.read_bytes()
+                for when in (cutoff, "2026-06-02T00:00:00Z"):
+                    code, result = self.cli("review", "package", task["id"], "--cutoff", when)
+                    self.assertEqual(code, 5, result)
+                    self.assertIn("separate human decision and a new sequence", result["error"])
+                self.assertEqual(list(path.parent.glob("*.json")), [path])
+
+                old = copy.deepcopy(frozen)
+                old["csp"]["state_digest"] = digest(unsupported)
+                atomic(path, old)
+                code, result = self.cli("review", "inspect", frozen["id"], inspection)
+                self.assertEqual(code, 5, result.get("error"))
+                code, result = self.cli("approve", frozen["id"])
+                self.assertEqual(code, 5, result)
+                self.assertIn("separate human decision and a new sequence", result["error"])
+                self.assertIsNone(read_json(path)["approval"])
+                self.assertEqual(set(receipts.glob("*.json")), before_receipts)
+                old["approval"] = self.signed(transactions.approval_payload(old), "package")
+                atomic(path, old)
+                code, result = self.cli("apply", frozen["id"])
+                self.assertEqual(code, 5, result)
+                self.assertFalse((self.vault.control / "transaction.json").exists())
+                self.assertEqual(self.vault.rows("control/approvals/packages.jsonl"), [])
+                code, preview = self.cli("migration", "preview")
+                self.assertEqual(code, 5, preview)
+                self.assertEqual(preview["inspection_sequence"]["status"], "pending")
+                self.assertEqual(state_path.read_bytes(), before)
+                atomic(path, original)
+
+        atomic(state_path, legacy_bytes)
+        code, approval = self.cli("approve", frozen["id"])
+        self.assertEqual(code, 0, approval)
+        self.assertEqual(verify(approval, "package", self.signers), transactions.approval_payload(frozen))
+        self.assertEqual(approval["payload"]["csp"]["initial_streak"], 111)
+        self.assertEqual(approval["payload"]["csp"]["inspections"], {})
+        self.assertEqual(state_path.read_bytes(), legacy_bytes)
+        code, applied = self.cli("apply", frozen["id"])
+        self.assertEqual(code, 0, applied)
+        self.assertEqual(self.vault.rows("control/approvals/packages.jsonl"), [approval])
+
+    def test_recovery_accepts_already_recorded_known_inspection_state(self):
+        task, _, package = self.prepare_identity_fixture()
+        transactions.approve(self.vault, package["id"])
+        state_path = self.vault.control / "csp.json"
+        journal = self.vault.control / "transaction.json"
+
+        def interrupt_before_completion(path, data):
+            if Path(path) == journal and data["status"] == "complete":
+                raise OSError("Injected disconnection after the inspection state was written")
+            return atomic(path, data)
+
+        with patch("healdan.transactions.atomic", side_effect=interrupt_before_completion), self.assertRaises(OSError):
+            transactions.apply(self.vault, package["id"])
+        head = self.vault.head()
+        self.assertNotEqual(head, task["base"])
+        expected = state_path.read_bytes()
+        original_journal = journal.read_bytes()
+        self.assertEqual(read_json(state_path)["package"], package["id"])
+        unsupported = dict(read_json(state_path), format="healdan-inspection-state-v99")
+        atomic(state_path, unsupported)
+        code, result = self.cli("apply", "--recover")
+        self.assertEqual(code, 5, result)
+        self.assertEqual(read_json(state_path), unsupported)
+        self.assertEqual(journal.read_bytes(), original_journal)
+        self.assertEqual(self.vault.head(), head)
+
+        atomic(state_path, expected)
+        code, recovered = self.cli("apply", "--recover")
+        self.assertEqual(code, 0, recovered)
+        self.assertEqual((recovered["status"], recovered["commit"]), ("complete", head))
+        self.assertEqual(state_path.read_bytes(), expected)
 
     def test_source_and_signed_decision_bytes_must_survive_migration(self):
         claim = self.claim()

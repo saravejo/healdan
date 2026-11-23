@@ -3,11 +3,12 @@ import hmac
 import secrets
 from pathlib import Path
 
-from .core import atomic, digest, read_json, require, safe_path, stamp
+from .core import atomic, decode, digest, read_json, require, safe_path, stamp
 from .ids import identity
 from .tasks import get_session, get_task, require_active, validate_evidence
 
 CSP_RULE_V1 = "CSP-1/i111/f0.1/numeric-v1"
+CSP_STATE_FIELDS_V1 = {"streak", "rule", "package", "defect_package"}
 
 
 def freeze_review(vault, task_id, extractor, reviewer):
@@ -66,11 +67,37 @@ def validate_review(vault, task_id, units):
     return {"independent": record, "comparison": comparison}
 
 
-def freeze_csp(units, state, seed=None):
-    require(state.get("rule", CSP_RULE_V1) == CSP_RULE_V1,
-            "A different inspection regime requires a separate human decision and a new sequence", 5)
-    streak = state.get("streak", 0)
+def csp_state_streak(state):
+    message = "Unknown inspection state fields or regime require a separate human decision and a new sequence"
+    require(isinstance(state, dict) and set(state) <= CSP_STATE_FIELDS_V1, message, 5)
+    require(state.get("rule", CSP_RULE_V1) == CSP_RULE_V1 and
+            all(isinstance(state[key], str) for key in {"package", "defect_package"} & state.keys()), message, 5)
+    streak = state.get("streak")
     require(type(streak) is int and 0 <= streak <= 111, "Invalid inspection sequence")
+    return streak
+
+
+def csp_state_bytes(vault):
+    try:
+        return (vault.control / "csp.json").read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def read_csp_state(vault):
+    original = csp_state_bytes(vault)
+    state = {"streak": 0} if original is None else decode(original)
+    csp_state_streak(state)
+    return state
+
+
+def require_csp_state(plan, state):
+    require(plan["state_digest"] == digest(state) and plan["initial_streak"] == state["streak"],
+            "CSP state changed; a new package is required", 5)
+
+
+def freeze_csp(units, state, seed=None):
+    streak = csp_state_streak(state)
     ordered = sorted(units, key=identity)
     require(len({identity(i) for i in ordered}) == len(ordered), "CSP identity collision")
     return {"rule": CSP_RULE_V1, "units": ordered, "units_digest": digest(units),

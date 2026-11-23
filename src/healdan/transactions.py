@@ -9,7 +9,7 @@ from .ids import aliases, committed_registries, identity, registry_records
 from .knowledge import Knowledge
 from .pages import generated_pages, validate_pages
 from .regression import require_suite
-from .review import csp_status, freeze_csp, inspect, validate_review
+from .review import csp_status, freeze_csp, inspect, read_csp_state, require_csp_state, validate_review
 from .signing import human_sign, trusted_signers, verify
 from .tasks import get_task, get_session, require_active, validate_evidence, task_path
 
@@ -117,6 +117,7 @@ def package_path(vault, identifier):
 def prepare(vault, task_id, *, cutoff=None):
     with vault.locked():
         vault.no_transaction()
+        csp_state = read_csp_state(vault)
         task = get_task(vault, task_id)
         require_active(task)
         validate_evidence(vault, task)
@@ -160,7 +161,6 @@ def prepare(vault, task_id, *, cutoff=None):
                 atomic(candidate.root / "wiki/index.md", index)
             changes, regression = validate_candidate(vault, candidate, cutoff)
         review = validate_review(vault, task_id, changes) if changes else None
-        csp_state = read_json(vault.control / "csp.json", {"streak": 0})
         payload = {"task": task_id, "base": vault.head(), "fingerprint": before, "files": files,
                    "input_hashes": vault.inputs(),
                    "claim_digests": changes, "cutoff": cutoff, "review": review, "regression": regression}
@@ -180,6 +180,7 @@ def inspect_package(vault, identifier, results):
         path = package_path(vault, identifier)
         record = read_json(path)
         require(record and not record["approval"], "Unknown or already signed package", 2)
+        read_csp_state(vault)
         status = inspect(record["csp"], results)
         if status["defect"]:
             atomic(vault.control / "csp.json", {"rule": record["csp"]["rule"], "streak": 0, "defect_package": identifier})
@@ -199,10 +200,10 @@ def approve(vault, identifier):
         require(record["id"] == digest(record["payload"]), "Frozen package content changed")
         require_active(get_task(vault, record["payload"]["task"]))
         require(vault.fingerprint() == record["payload"]["fingerprint"], "Approval base/content is stale", 5)
-        status = csp_status(record["csp"])
+        plan = record["csp"]
+        require_csp_state(plan, read_csp_state(vault))
+        status = csp_status(plan)
         require(status["complete"] and not status["defect"], "CSP inspection incomplete or defective", 5)
-        require(digest(read_json(vault.control / "csp.json", {"streak": 0})) == record["csp"]["state_digest"],
-                "CSP state changed; a new package is required", 5)
         with Candidate(vault, record["payload"]["files"]) as candidate:
             changes, _ = validate_candidate(vault, candidate, record["payload"]["cutoff"])
             require(changes == record["payload"]["claim_digests"], "Frozen claim digests changed")
@@ -229,14 +230,18 @@ def apply(vault, identifier=None, *, recover=False):
         require(record["id"] == digest(record["payload"]), "Frozen package content changed")
         signed = verify(record["approval"], "package", trusted_signers(vault))
         require(signed == approval_payload(record), "Package changed after approval")
+        csp_state = read_csp_state(vault)
+        plan = signed["csp"]
+        status = csp_status(plan)
+        require(status["complete"] and not status["defect"], "CSP inspection incomplete or defective", 5)
+        next_csp_state = {"rule": plan["rule"], "streak": status["streak"], "package": identifier}
         if not recover:
+            require_csp_state(plan, csp_state)
             require_active(get_task(vault, signed["task"]))
             require(vault.fingerprint() == signed["fingerprint"], "Approval invalidated by changed base/content", 5)
             require(not git(vault.root, "diff", "--cached", "--name-only"), "Index contains unrelated staged work", 5)
             with Candidate(vault, signed["files"]) as candidate:
                 validate_candidate(vault, candidate, signed["cutoff"])
-            require(digest(read_json(vault.control / "csp.json", {"streak": 0})) == record["csp"]["state_digest"],
-                    "CSP state changed", 5)
             files = dict(signed["files"])
             entries = vault.rows(LEDGER) + [record["approval"]]
             files[LEDGER] = base64.b64encode(jsonl(entries)).decode("ascii")
@@ -259,7 +264,11 @@ def apply(vault, identifier=None, *, recover=False):
             require(current_inputs.get(name) == signed["input_hashes"].get(name),
                     "An unsigned input changed during integration: " + name, 5)
         if recover:
-            validate_recovery_identities(vault, signed["files"], head if head != journal["base"] else None)
+            committed = head if head != journal["base"] else None
+            legacy_next_state = {"streak": status["streak"], "package": identifier}
+            if not committed or csp_state not in (next_csp_state, legacy_next_state):
+                require_csp_state(plan, csp_state)
+            validate_recovery_identities(vault, signed["files"], committed)
         for name, encoded in journal["files"].items():
             path = safe_path(vault.root, name)
             body = base64.b64decode(encoded, validate=True)
@@ -277,8 +286,7 @@ def apply(vault, identifier=None, *, recover=False):
             git(vault.root, "add", "--", *journal["files"])
             git(vault.root, "-c", "commit.gpgsign=false", "commit", "-m",
                 f"Apply approved knowledge package\n\nHealdan-Package: {identifier}", "--", *journal["files"])
-        atomic(vault.control / "csp.json", {"rule": record["csp"]["rule"],
-                                           "streak": csp_status(record["csp"])["streak"], "package": identifier})
+        atomic(vault.control / "csp.json", next_csp_state)
         journal.update(status="complete", commit=vault.head(), completed_at=stamp())
         atomic(journal_path, journal)
         vault.receipt("integration", {"package": identifier, "commit": vault.head()})

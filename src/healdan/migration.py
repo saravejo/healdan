@@ -4,7 +4,7 @@ import re
 from .core import Blocked, REGISTRIES, decode, digest, executable, git, read_json, require, run
 from .ids import identity, inventory as id_inventory, registry_records
 from .regression import case_projections
-from .review import CSP_RULE_V1, csp_status
+from .review import csp_state_bytes, csp_state_streak, csp_status
 from .signing import trusted_signers, verify_origin
 from .tasks import all_tasks
 
@@ -59,27 +59,22 @@ def _package_projections(vault):
             yield {"id": projection["id"], "status": "compatible", "projection": projection}
 
 
-def _sequence_bytes(vault):
-    try:
-        return (vault.control / "csp.json").read_bytes()
-    except FileNotFoundError:
-        return None
-
-
 def _sequence_preview(original):
     result = {"new_regime": {"human_decision_required": True, "new_sequence_required": True}}
     if original is None:
         return dict(result, status="not_established", state=None, sha256=None)
     state = decode(original)
-    known = (isinstance(state, dict) and set(state) <= {"streak", "rule", "package", "defect_package"} and
-             type(state.get("streak")) is int and 0 <= state["streak"] <= 111 and
-             state.get("rule", CSP_RULE_V1) == CSP_RULE_V1)
-    return dict(result, status="preserved" if known else "pending", state=state, sha256=digest(original))
+    result.update(state=state, sha256=digest(original))
+    try:
+        csp_state_streak(state)
+    except Blocked as exc:
+        return dict(result, status="pending", reason=str(exc))
+    return dict(result, status="preserved")
 
 
 def preview(vault):
     before = vault.fingerprint()
-    sequence = _sequence_bytes(vault)
+    sequence = csp_state_bytes(vault)
     cases = list(case_projections(vault))
     packages = list(_package_projections(vault))
     reviews = {}
@@ -103,7 +98,7 @@ def preview(vault):
                        "pending_fields": pending, "row_sha256": digest(original),
                        "approvals": reviews.get((row["id"], digest(row)), [])})
     inspection_sequence = _sequence_preview(sequence)
-    require(vault.fingerprint() == before and _sequence_bytes(vault) == sequence,
+    require(vault.fingerprint() == before and csp_state_bytes(vault) == sequence,
             "Inputs changed during migration preview", 5)
     return {"fingerprint": before, "cases": cases, "claims": claims, "packages": packages,
             "inspection_sequence": inspection_sequence}
