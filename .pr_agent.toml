@@ -1,0 +1,3 @@
+[review_agent]
+demand_self_review = true
+approve_pr_on_self_review = true
