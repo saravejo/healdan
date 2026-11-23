@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -39,6 +41,8 @@ jobs:
       - name: Run controller and real OS sandbox tests
         shell: bash
         run: python -m unittest discover -s tests -v 2>&1 | tee test-results.txt
+      - name: Exercise the sprint gate contract
+        run: python -m unittest scripts.test_sprint_gate -v
       - name: Audit public tree
         run: python scripts/audit_publication.py
       - uses: actions/upload-artifact@v4
@@ -51,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
