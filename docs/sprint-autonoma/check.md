@@ -10,7 +10,7 @@
 
 O workflow `.github/workflows/sprint-b00.yml` é disparado de `main` protegida. Os jobs obtêm o código público por `refs/pull/<n>/head` e verificam o SHA recebido da preparação. O teste nativo audita a árvore com o script do ref protegido antes de executar o código candidato em ambiente reduzido e com permissões vazias. O job de pacote compila com Python 3.12 em um contêiner sem rede, montagens do host ou tokens de repositório, sob UID não privilegiado. O runner guarda a saída e o log de compilação localmente. O auditor protegido lê o tar de saída sem extraí-lo, exige o wheel e o sdist esperados e rejeita entradas de link, dispositivo ou travessia nos cabeçalhos. O job `sprint-b00 gate` mantém `checks: write`, executa o verificador do ref protegido e exige sucesso real dos jobs `sprint-b00 test` e `sprint-b00 package` na mesma tentativa.
 
-A proteção do GitHub identifica o App GitHub Actions, compartilhado por workflows do repositório. A fonte da aprovação é confirmada no preflight pelo caminho, identidade, SHA e tentativa do workflow protegido e pelo ID de check no log oficial do job. A regra que restringe atualizações de `main` reserva a integração ao coordenador, que verifica esse vínculo antes do merge. [Proteção de branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches), [fonte de checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
+A proteção do GitHub identifica o App GitHub Actions, compartilhado por workflows do repositório. O preflight confirma o caminho, a identidade, o SHA e o ID da execução protegida, além da tentativa. O resumo do check vincula o ID e a tentativa da execução ao escopo e à atestação. O URL deve corresponder à execução ou à página canônica do próprio check, cujo ID precisa constar no log oficial do job. A regra que restringe atualizações de `main` reserva a integração ao coordenador, que verifica esse vínculo antes do merge. [Proteção de branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches), [fonte de checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
 ## Atestação GitHub
 
@@ -76,12 +76,12 @@ O resultado corresponde ao momento do preflight. Faça o merge imediatamente ap�
 
 ## Bootstrap da PR 1
 
-O workflow definitivo ainda não está disponível em `main` no primeiro B00. A entrada existente `.github/workflows/ci.yml` já aceita `workflow_dispatch`. Para a PR 1 do B00, publique um ref próprio a partir da `main` corrente com a política, matriz, scripts e testes auditados, usando a cópia do novo workflow em `.github/workflows/ci.yml`. Proteja `sprint-gate-bootstrap` contra atualizações, force-push e exclusão antes de usar o ref. Configure `SPRINT_B00_BOOTSTRAP_SHA` com o SHA completo da lógica auditada e confira o valor pela API. A PR continua com base em `main` e executa os mesmos jobs em seu próprio HEAD. [Eventos do GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
+O workflow definitivo ainda não está disponível em `main` no primeiro B00. A entrada existente `.github/workflows/ci.yml` já aceita `workflow_dispatch`. Para a PR 1 do B00, publique o ref `sprint-gate-bootstrap-v2` a partir da `main` corrente com a política, matriz, scripts e testes auditados, usando a cópia do novo workflow em `.github/workflows/ci.yml`. Proteja esse ref contra atualizações, force-push e exclusão antes de usá-lo. Configure `SPRINT_B00_BOOTSTRAP_SHA` com o SHA completo da lógica auditada e confira o valor pela API. A PR continua com base em `main` e executa os mesmos jobs em seu próprio HEAD. [Eventos do GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
 
 Para inventário e preflight use os mesmos comandos com `--bootstrap` e `SPRINT_BOOTSTRAP_SHA` local igual ao valor da variável do repositório. No disparo informe a base da PR explicitamente.
 
 ```bash
-gh workflow run ci.yml --repo saravejo/healdan --ref sprint-gate-bootstrap \
+gh workflow run ci.yml --repo saravejo/healdan --ref sprint-gate-bootstrap-v2 \
   -f base="$BASE" -f pull="$PR" -f head="$HEAD" -f attestation="$COMMENT"
 ```
 
