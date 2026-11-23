@@ -7,17 +7,17 @@ from uuid import uuid4
 
 from support import VaultTest
 from healdan import ids, review, tasks, transactions
-from healdan.core import Blocked, REQUIRED_REGISTRIES, atomic, digest, git, jsonl, read_json
+from healdan.core import Blocked, REQUIRED_REGISTRIES, atomic, canonical, digest, git, jsonl, read_json
 from healdan.knowledge import query
 from healdan.signing import verify
 
 
 class Transactions(VaultTest):
-    def prepare_fixture(self):
-        claim = self.claim()
+    def prepare_fixture(self, claim_count=1):
+        claims = [self.claim(f"C-{number:04d}") for number in range(1, claim_count + 1)]
         git(self.root, "add", ".")
         git(self.root, "commit", "-m", "Preserve source fixture")
-        ids.reserve(self.vault, "C", 1, str(uuid4()))
+        claim_ids = ids.reserve(self.vault, "C", claim_count, str(uuid4()))
         ids.reserve(self.vault, "Q", 1, str(uuid4()))
         task = tasks.create(self.vault, "Controller transaction fixture; no native execution claim")
         base = self.state / "tasks" / task["id"]
@@ -28,18 +28,19 @@ class Transactions(VaultTest):
             session["state"] = "completed"
             session["launches"] = [{"synthetic_controller_fixture": True}]
             atomic(self.vault.control / "sessions" / (session["operation"] + ".json"), session)
-            atomic(Path(session["proposal"]) / "extraction.json", {"units": [claim]})
+            atomic(Path(session["proposal"]) / "extraction.json", {"units": claims})
             sessions.append(session["operation"])
         frozen = review.freeze_review(self.vault, task["id"], *sessions)
         atomic(Path(tasks.get_session(self.vault, sessions[1])["proposal"]) / "comparison.json", {
             "extractions": {role: frozen["outputs"][role]["sha256"] for role in ("extractor", "reviewer")},
-            "units": {"C-0001": {"status": "conform", "sha256": digest(claim)}}, "defects": []})
+            "units": {claim["id"]: {"status": "conform", "sha256": digest(claim)} for claim in claims},
+            "defects": []})
         proposal = base / "proposals/editor"
-        atomic(proposal / "wiki/claims.jsonl", jsonl([claim]))
-        atomic(proposal / "wiki/control/query-cases.jsonl", jsonl([self.case()]))
+        atomic(proposal / "wiki/claims.jsonl", jsonl(claims))
+        atomic(proposal / "wiki/control/query-cases.jsonl", jsonl([self.case(expected_ids=claim_ids)]))
         atomic(proposal / "wiki/control/page-policy.json", {"cap": 6000, "decision": "Fixture human page choice"})
         atomic(proposal / "wiki/control/selectors.jsonl", jsonl([{
-            "path": "wiki/topics/instrument.md", "title": "Instrument", "topic": "measurement", "ids": ["C-0001"],
+            "path": "wiki/topics/instrument.md", "title": "Instrument", "topic": "measurement", "ids": claim_ids,
             "purpose": "current_at_cutoff", "cutoff": "2026-06-01T00:00:00Z"}]))
         package = transactions.prepare(self.vault, task["id"], cutoff="2026-06-01T00:00:00Z")
         return task, package
@@ -123,12 +124,103 @@ class Transactions(VaultTest):
             transactions.prepare(self.vault, task["id"])
 
     def test_csp_defect_resets_next_package_inspection_regime(self):
-        atomic(self.vault.control / "csp.json", {"streak": 110})
-        task, package = self.prepare_fixture()
-        transactions.inspect_package(self.vault, package["id"], {"C-0001": "defect"})
-        self.assertEqual(read_json(self.vault.control / "csp.json")["streak"], 0)
+        state_path = self.vault.control / "csp.json"
+        atomic(state_path, {"streak": 110})
+        task, package = self.prepare_fixture(claim_count=2)
+        package_id = package["id"]
+        result = transactions.inspect_package(self.vault, package_id, {"C-0001": "defect"})
+        self.assertTrue(result["defect"])
+        self.assertEqual(result["pending"], ["C-0002"])
+        self.assertEqual(read_json(state_path),
+                         {"rule": review.CSP_RULE_V1, "streak": 0, "defect_package": package_id})
+        reset = state_path.read_bytes()
+        results = {"C-0001": "defect", "C-0002": "conform"}
+        continued = transactions.inspect_package(self.vault, package_id, results)
+        self.assertTrue(continued["complete"] and continued["defect"])
+        self.assertEqual(state_path.read_bytes(), reset)
+        with patch("healdan.transactions.atomic") as write:
+            replay = transactions.inspect_package(self.vault, package_id, results)
+            write.assert_not_called()
+        self.assertEqual(replay, continued)
         with self.assertRaises(Blocked):
-            transactions.approve(self.vault, package["id"])
+            transactions.approve(self.vault, package_id)
+
+        next_package = transactions.prepare(self.vault, task["id"], cutoff="2026-06-02T00:00:00Z")
+        next_id = next_package["id"]
+        self.assertNotEqual(next_id, package_id)
+        self.assertEqual(next_package["csp"]["initial_streak"], 0)
+        inspection = transactions.inspect_package(self.vault, next_id, {"C-0001": "conform", "C-0002": "conform"})
+        self.assertTrue(inspection["complete"] and not inspection["defect"])
+        approval = transactions.approve(self.vault, next_id)
+        verified = verify(approval, "package", self.signers)
+        self.assertEqual(verified["package_id"], next_id)
+        applied = transactions.apply(self.vault, next_id)
+        self.assertEqual(applied["status"], "complete")
+        self.assertEqual(read_json(state_path),
+                         {"rule": review.CSP_RULE_V1, "streak": 2, "package": next_id})
+        latest = state_path.read_bytes()
+        record = transactions.package_path(self.vault, package_id)
+        original_record = record.read_bytes()
+        for replay in ({}, results):
+            with self.assertRaisesRegex(Blocked, "CSP state changed") as raised:
+                transactions.inspect_package(self.vault, package_id, replay)
+            self.assertEqual(raised.exception.code, 5)
+            self.assertEqual(state_path.read_bytes(), latest)
+            self.assertEqual(record.read_bytes(), original_record)
+            self.assertEqual(self.vault.rows("control/approvals/packages.jsonl"), [approval])
+
+    def test_defect_inspection_preserves_newer_or_unknown_sequence(self):
+        state_path = self.vault.control / "csp.json"
+        atomic(state_path, {"streak": 110, "package": "1" * 64})
+        _, package = self.prepare_fixture()
+        package_id = package["id"]
+        record = transactions.package_path(self.vault, package_id)
+        before = record.read_bytes()
+        states = (
+            ({"streak": 110, "rule": review.CSP_RULE_V1, "package": "2" * 64}, "CSP state changed"),
+            ({"streak": 0, "rule": review.CSP_RULE_V1, "defect_package": "3" * 64}, "CSP state changed"),
+            ({"streak": 110, "rule": "future-inspection-regime"}, "separate human decision"),
+        )
+        for state, message in states:
+            for inspection in ("defect", "conform"):
+                with self.subTest(state=state, inspection=inspection):
+                    original = b" " + canonical(state) + b"\r\n"
+                    atomic(state_path, original)
+                    atomic(record, before)
+                    with self.assertRaisesRegex(Blocked, message) as raised:
+                        transactions.inspect_package(self.vault, package_id, {"C-0001": inspection})
+                    self.assertEqual(raised.exception.code, 5)
+                    self.assertEqual(state_path.read_bytes(), original)
+                    self.assertEqual(record.read_bytes(), before)
+
+    def test_defect_inspection_recovers_after_the_sequence_was_reset(self):
+        state_path = self.vault.control / "csp.json"
+        atomic(state_path, {"streak": 110})
+        _, package = self.prepare_fixture()
+        package_id = package["id"]
+        record = transactions.package_path(self.vault, package_id)
+        before = record.read_bytes()
+
+        def interrupt_after_reset(path, data):
+            if Path(path) == record:
+                raise OSError("Injected failure after the sequence was reset")
+            return atomic(path, data)
+
+        with patch("healdan.transactions.atomic", side_effect=interrupt_after_reset), self.assertRaises(OSError):
+            transactions.inspect_package(self.vault, package_id, {"C-0001": "defect"})
+        reset = state_path.read_bytes()
+        self.assertEqual(read_json(state_path)["defect_package"], package_id)
+        self.assertEqual(record.read_bytes(), before)
+        with self.assertRaisesRegex(Blocked, "Retry the defect inspection") as raised:
+            transactions.inspect_package(self.vault, package_id, {"C-0001": "conform"})
+        self.assertEqual(raised.exception.code, 5)
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual(state_path.read_bytes(), reset)
+
+        result = transactions.inspect_package(self.vault, package_id, {"C-0001": "defect"})
+        self.assertTrue(result["defect"])
+        self.assertEqual(read_json(record)["csp"]["inspections"], {"C-0001": "defect"})
+        self.assertEqual(state_path.read_bytes(), reset)
 
     def test_unknown_inspection_state_blocks_preparation_and_approval(self):
         state_path = self.vault.control / "csp.json"
@@ -147,16 +239,21 @@ class Transactions(VaultTest):
         inspection = self.base / "inspection.json"
         atomic(inspection, {})
 
-        for unsupported in (dict(legacy_state, format="healdan-inspection-state-v99"),
-                            dict(legacy_state, authority="unknown metadata"),
-                            dict(legacy_state, rule="unknown-inspection-regime")):
+        unsupported_states = (
+            (dict(legacy_state, format="healdan-inspection-state-v99"), "separate human decision and a new sequence"),
+            (dict(legacy_state, authority="unknown metadata"), "separate human decision and a new sequence"),
+            (dict(legacy_state, rule="unknown-inspection-regime"), "separate human decision and a new sequence"),
+            ({"rule": review.CSP_RULE_V1}, "Inspection state requires an integer streak"),
+            (["invalid state"], "separate human decision and a new sequence"),
+        )
+        for unsupported, message in unsupported_states:
             with self.subTest(state=unsupported):
                 atomic(state_path, unsupported)
                 before = state_path.read_bytes()
                 for when in (cutoff, "2026-06-02T00:00:00Z"):
                     code, result = self.cli("review", "package", task["id"], "--cutoff", when)
-                    self.assertEqual(code, 5, result)
-                    self.assertIn("separate human decision and a new sequence", result["error"])
+                    self.assertEqual(code, 5, result.get("error"))
+                    self.assertIn(message, result["error"])
                 self.assertEqual(list(path.parent.glob("*.json")), [path])
 
                 old = copy.deepcopy(frozen)
@@ -166,7 +263,7 @@ class Transactions(VaultTest):
                 self.assertEqual(code, 5, result.get("error"))
                 code, result = self.cli("approve", frozen["id"])
                 self.assertEqual(code, 5, result)
-                self.assertIn("separate human decision and a new sequence", result["error"])
+                self.assertIn(message, result["error"])
                 self.assertIsNone(read_json(path)["approval"])
                 self.assertEqual(set(receipts.glob("*.json")), before_receipts)
                 old["approval"] = self.signed(transactions.approval_payload(old), "package")

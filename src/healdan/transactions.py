@@ -180,12 +180,26 @@ def inspect_package(vault, identifier, results):
         path = package_path(vault, identifier)
         record = read_json(path)
         require(record and not record["approval"], "Unknown or already signed package", 2)
-        read_csp_state(vault)
-        status = inspect(record["csp"], results)
-        if status["defect"]:
-            atomic(vault.control / "csp.json", {"rule": record["csp"]["rule"], "streak": 0, "defect_package": identifier})
-        atomic(path, record)
-        return csp_status(record["csp"])
+        state = read_csp_state(vault)
+        plan = record["csp"]
+        legacy_reset = {"streak": 0, "defect_package": identifier}
+        reset = dict(legacy_reset, rule=plan["rule"])
+        already_reset = state in (reset, legacy_reset)
+        if already_reset:
+            recorded = plan["inspections"]
+            require(all(unit not in recorded or recorded[unit] == outcome for unit, outcome in results.items()),
+                    "Inspection result differs from the recorded decision", 5)
+            results = {unit: outcome for unit, outcome in results.items() if unit not in recorded}
+        else:
+            require_csp_state(plan, state)
+        status = inspect(plan, results)
+        if already_reset:
+            require(status["defect"], "Retry the defect inspection to finish recording the reset", 5)
+        elif status["defect"]:
+            atomic(vault.control / "csp.json", reset)
+        if results:
+            atomic(path, record)
+        return status
 
 
 def approval_payload(record):

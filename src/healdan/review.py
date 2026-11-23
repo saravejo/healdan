@@ -73,7 +73,7 @@ def csp_state_streak(state):
     require(state.get("rule", CSP_RULE_V1) == CSP_RULE_V1 and
             all(isinstance(state[key], str) for key in {"package", "defect_package"} & state.keys()), message, 5)
     streak = state.get("streak")
-    require(type(streak) is int and 0 <= streak <= 111, "Invalid inspection sequence")
+    require(type(streak) is int and 0 <= streak <= 111, "Inspection state requires an integer streak from 0 through 111", 5)
     return streak
 
 
