@@ -273,6 +273,10 @@ class Vault:
         bound(self.repository, self.state, expected=self.binding)
         with pair_lock(self.repository, self.state):
             bound(self.repository, self.state, expected=self.binding)
+            if hasattr(self, "controller_selection"):
+                from .build import read_selection
+                require(read_selection(self.control, self.identity) == self.controller_selection,
+                        "Controller selection changed; run the command again", 5)
             self._lock.held = True
             try:
                 yield

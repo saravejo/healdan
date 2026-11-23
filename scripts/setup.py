@@ -1,25 +1,55 @@
 #!/usr/bin/env python3
-"""Bootstrap a non-editable, external controller; keep credentials out of Git."""
+"""Prepare a wheel outside the vault and activate its verified controller."""
+import argparse
 from pathlib import Path
-import os
-import subprocess
 import sys
-import venv
+import tempfile
 
 if sys.version_info < (3, 12):
     raise SystemExit("Python 3.12+ is required")
 
-root = Path(__file__).resolve().parent.parent
-installation = Path.home() / ".local/share/healdan/controller-1.0"
-if installation.resolve().is_relative_to(root):
-    raise SystemExit("Controller installation must be outside the vault")
-if not (installation / "pyvenv.cfg").exists():
-    venv.EnvBuilder(with_pip=True).create(installation)
-binary = installation / ("Scripts" if os.name == "nt" else "bin")
-python = binary / ("python.exe" if os.name == "nt" else "python")
-subprocess.run([str(python), "-m", "pip", "install", "--upgrade", str(root)], check=True)
-command = [str(python), "-m", "healdan", "--vault", str(root), "setup"]
-if sys.stdin.isatty():
-    command.append("--interactive")
-subprocess.run(command, check=True)
-print("Add this controller directory to PATH: " + str(binary))
+SOURCE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SOURCE / "src"))
+from healdan.build import store_path
+from healdan.core import Blocked, canonical, require, run
+from healdan.installation import prepare, run_installed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--vault", type=Path, default=SOURCE)
+    parser.add_argument("--state", type=Path)
+    parser.add_argument("--wheel", type=Path)
+    parser.add_argument("--store", type=Path, default=store_path())
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--interactive", action=argparse.BooleanOptionalAction, default=sys.stdin.isatty())
+    args = parser.parse_args()
+    try:
+        require(not args.store.resolve().is_relative_to(args.vault.resolve()) and
+                (args.state is None or not args.store.resolve().is_relative_to(args.state.resolve())),
+                "Controller installations must stay outside the vault and external state", 5)
+        if args.wheel:
+            build = prepare(args.wheel, args.store)
+        else:
+            with tempfile.TemporaryDirectory(prefix="healdan-wheel-") as directory:
+                run([sys.executable, "-m", "pip", "wheel", "--no-deps", "--wheel-dir", directory, SOURCE], timeout=300)
+                wheels = list(Path(directory).glob("*.whl"))
+                require(len(wheels) == 1, "Expected one controller wheel")
+                build = prepare(wheels[0], args.store)
+        if args.prepare_only:
+            print(canonical({"build": build.identity, "controller": str(build.entry_point)}).decode("utf-8"))
+            return 0
+        selection = ["--vault", str(args.vault)]
+        if args.state is not None:
+            selection.extend(("--state", str(args.state)))
+        result = run_installed(build, [*selection, "setup", *(["--interactive"] if args.interactive else [])])
+        if result:
+            return result
+        return run_installed(build, [*selection, "build", "activate", build.identity["sha256"], "--store", args.store])
+    except (Blocked, OSError, ValueError) as exc:
+        print(canonical({"error": str(exc)}).decode("utf-8"))
+        return exc.code if isinstance(exc, Blocked) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

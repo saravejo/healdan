@@ -22,6 +22,15 @@ def parser():
                               ("rebind", "Check the vault and state at their new locations")):
         operation = state_actions.add_parser(name, help=description)
         operation.add_argument("--confirm", help="Confirmation digest from the preview")
+    build = commands.add_parser("build", help="Prepare, identify, or select the vault's controller")
+    build_actions = build.add_subparsers(dest="action", required=True)
+    build_actions.add_parser("identity")
+    prepare = build_actions.add_parser("prepare")
+    prepare.add_argument("wheel", type=Path)
+    prepare.add_argument("--store", type=Path)
+    activate = build_actions.add_parser("activate")
+    activate.add_argument("sha256")
+    activate.add_argument("--store", type=Path)
     commands.add_parser("doctor")
     commands.add_parser("status")
     query = commands.add_parser("query")
@@ -161,7 +170,7 @@ def parser():
 
 
 def dispatch(args):
-    from . import backups, binding, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
+    from . import backups, binding, build, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
     from . import pages, regression, review, setup, tasks, transactions
     from .knowledge import query
     from .signing import human_sign
@@ -170,10 +179,20 @@ def dispatch(args):
     if args.command == "state":
         change = binding.adopt if args.action == "adopt" else binding.rebind
         return change(args.vault, args.state, args.confirm)
+    if args.command == "build" and args.action == "prepare":
+        from .installation import prepare
+        prepared = prepare(args.wheel, args.store)
+        return {"build": prepared.identity, "controller": str(prepared.entry_point)}
     external_recovery = (args.command, getattr(args, "action", None)) in {
         ("restore", None), ("backup", "verify"), ("session", "restore"), ("session", "approve-recovery")
     }
     vault = Vault(args.vault, args.state, operational=not external_recovery)
+    if hasattr(args, "controller_selection"):
+        vault.controller_selection = args.controller_selection
+    if args.command == "build":
+        if args.action == "activate":
+            return build.activate(vault, args.sha256, args.store)
+        return {"build": build.require_active(vault).identity, "vault_id": vault.identity}
     if args.command == "doctor":
         result = setup.doctor(vault)
         return result, 0 if result["ready"] else 5
@@ -334,9 +353,30 @@ def dispatch(args):
     raise Blocked("Unsupported operation", 2)
 
 
+def redirect(args, argv):
+    if args.command in {"setup", "state"} or (args.command == "build" and args.action in {"prepare", "activate"}):
+        return None
+    from .binding import Repository, bound
+    from .build import read_selection, selected_build
+    from .installation import run_installed
+
+    repository = Repository.open(args.vault)
+    binding = bound(repository, args.state)
+    args.controller_selection = read_selection(repository.control, binding["vault_id"])
+    if args.controller_selection:
+        build = selected_build(repository, binding, args.controller_selection)
+        if not build.running():
+            return run_installed(build, argv)
+    return None
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     args = parser().parse_args(argv)
     try:
+        redirected = redirect(args, argv)
+        if redirected is not None:
+            return redirected
         result = dispatch(args)
         value, code = result if isinstance(result, tuple) else (result, 0)
     except Blocked as exc:

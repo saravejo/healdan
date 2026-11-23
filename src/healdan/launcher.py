@@ -131,8 +131,10 @@ def _profile(vault, operation):
 
 
 def launch(vault, operation, *, resume=False, recovery_material=None):
-    require(not Path(__file__).resolve().is_relative_to(vault.root), "Install the controller outside the vault before launch", 5)
+    from .build import require_active
+
     with vault.locked():
+        require_active(vault)
         _probe(vault)  # Run a fresh OS isolation probe before every launch.
         vault.no_transaction()
         session = get_session(vault, operation)

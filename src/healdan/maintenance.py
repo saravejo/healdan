@@ -3,8 +3,8 @@ from datetime import timedelta
 from pathlib import Path
 import platform
 import plistlib
-import sys
 
+from .build import active
 from .core import Blocked, atomic, digest, executable, read_json, require, run, stamp, utc
 from .signing import human_sign, trusted_signers, verify
 
@@ -86,22 +86,27 @@ def schedule(vault, *, activate=False):
         return _schedule(vault, activate=activate)
 
 
+def schedule_definitions(vault, build=None):
+    build = build if build is not None else active(vault)
+    definitions = []
+    for job, calendar in vault.policy["schedules"].items():
+        label = f"org.healdan.{vault.identity}.{job}"
+        command = ["lint"] if job == "lint" else ["maintenance", "daily"]
+        definitions.append({"Label": label, "ProgramArguments": [str(build.entry_point), "--vault", str(vault.repository.primary),
+                 "--state", str(vault.state), *command], "StartCalendarInterval": calendar,
+                 "StandardOutPath": str(vault.state / (job + ".out")),
+                 "StandardErrorPath": str(vault.state / (job + ".err"))})
+    return definitions
+
+
 def _schedule(vault, *, activate):
     require(platform.system() == "Darwin", "launchd schedules require macOS", 5)
     from .setup import doctor
-    require(doctor(vault)["ready"], "Configuration/recovery must pass before scheduling", 5)
-    executable_path = Path(sys.executable).parent / "healdan"
-    require(executable_path.is_file() and not executable_path.resolve().is_relative_to(vault.root),
-            "External installed controller required", 5)
+    if activate:
+        require(doctor(vault)["ready"], "Configuration and native trials must pass before activating a schedule", 5)
     output = []
-    for job, calendar in vault.policy["schedules"].items():
-        label = "org.healdan." + digest(str(vault.common))[:12] + "." + job
-        command = ["lint"] if job == "lint" else ["maintenance", "daily"]
-        plist = {"Label": label, "ProgramArguments": [str(executable_path), "--vault", str(vault.root),
-                 "--state", str(vault.state), *command], "StartCalendarInterval": calendar,
-                 "StandardOutPath": str(vault.state / (job + ".out")),
-                 "StandardErrorPath": str(vault.state / (job + ".err"))}
-        destination = vault.state / "launchd" / (label + ".plist")
+    for plist in schedule_definitions(vault):
+        destination = vault.state / "launchd" / (plist["Label"] + ".plist")
         atomic(destination, plistlib.dumps(plist))
         if activate:
             import os

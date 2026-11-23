@@ -1,6 +1,4 @@
 """Idempotent vault setup and read-only installation diagnostics."""
-import json
-import os
 from pathlib import Path
 import platform
 import shutil
@@ -106,8 +104,11 @@ def doctor(vault):
             check(name, True, executable(name))
         except Blocked as exc:
             check(name, False, str(exc))
-    check("external_controller", not Path(__file__).resolve().is_relative_to(vault.root),
-          "Install non-editably outside the vault before production launch")
+    from .build import require_active
+    try:
+        check("external_controller", True, require_active(vault).identity)
+    except Blocked as exc:
+        check("external_controller", False, str(exc))
     for name in ("git_name", "git_email", "signing_identity", "signing_key", "allowed_signers", "age_identity",
                  "age_recipients", "offline_recipients", "backup_destinations", "backup_interval_hours", "backup_generation_days",
                  "backup_signing_key", "backup_signing_identity", "backup_allowed_signers"):
