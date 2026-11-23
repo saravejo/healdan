@@ -12,6 +12,11 @@ TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", 
 
 
 def attest(vault, name, evidence):
+    with vault.locked():
+        return _attest(vault, name, evidence)
+
+
+def _attest(vault, name, evidence):
     require(name in TRIALS, "Unknown native acceptance trial", 2)
     require(evidence.get("platform") == "Darwin" and evidence.get("commit") == vault.head() and
             evidence.get("passed") is True and evidence.get("versions") and evidence.get("artifacts") and
@@ -77,6 +82,11 @@ def daily(vault, now=None):
 
 
 def schedule(vault, *, activate=False):
+    with vault.locked():
+        return _schedule(vault, activate=activate)
+
+
+def _schedule(vault, *, activate):
     require(platform.system() == "Darwin", "launchd schedules require macOS", 5)
     from .setup import doctor
     require(doctor(vault)["ready"], "Configuration/recovery must pass before scheduling", 5)

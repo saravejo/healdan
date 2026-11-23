@@ -1,0 +1,253 @@
+"""Preflight a moved vault without rewriting signed custody or historical records."""
+import base64
+from pathlib import Path
+import plistlib
+
+from .binding import CONFIG_PATHS, CONFIG_ROOTS, relocated_path
+from .core import atomic, digest, git, read_json, require, safe_path
+
+SESSION_PATHS = ("proposal", "active_profile", "recovery_profile")
+
+
+def _absolute(base, value):
+    path = Path(value)
+    return (path if path.is_absolute() else base / path).resolve()
+
+
+def _records(repository, directory):
+    for path in sorted(safe_path(repository.control, directory).glob("*.json")):
+        yield read_json(safe_path(repository.control, f"{directory}/{path.name}", exists=True))
+
+
+def _metadata(repository):
+    for admin in sorted(safe_path(repository.common, "worktrees").glob("*")):
+        pointer = safe_path(repository.common, f"worktrees/{admin.name}/gitdir", exists=True)
+        linked = _absolute(admin, pointer.read_text(encoding="utf-8").rstrip("\r\n"))
+        require(linked.name == ".git", "Invalid linked worktree Git metadata", 5)
+        yield admin, linked
+
+
+def _backlink(linked):
+    text = safe_path(linked.parent, ".git", exists=True).read_text(encoding="utf-8").rstrip("\r\n")
+    require(text.startswith("gitdir: "), "Invalid linked worktree backlink: " + str(linked), 5)
+    return _absolute(linked.parent, text.removeprefix("gitdir: "))
+
+
+def _materials(repository):
+    return read_json(safe_path(repository.control, "materials.json"), {}).values()
+
+
+def legacy_proof(repository, state):
+    """Only a recorded path and independently verifiable evidence establish custom provenance."""
+    proof = []
+    linked = {path.parent: admin for admin, path in _metadata(repository)}
+    for task in _records(repository, "tasks"):
+        worktree = Path(task["worktree"])
+        require(worktree == state / "tasks" / task["id"] / "worktree",
+                "Recorded task worktree identifies a different external state", 5)
+        if worktree in linked and worktree.is_dir():
+            require(_backlink(worktree / ".git") == linked[worktree],
+                    "Legacy task worktree administrative links disagree", 5)
+            proof.append({"kind": "git-worktree", "path": str(worktree), "git_directory": str(linked[worktree])})
+    for session in _records(repository, "sessions"):
+        for field in ("proposal", "active_profile"):
+            if session.get(field):
+                require(Path(session[field]).is_relative_to(state / "tasks"),
+                        "Recorded session identifies a different external state", 5)
+    for record in _materials(repository):
+        if record.get("kind") == "backup":
+            continue
+        for copy in record["copies"]:
+            root = Path(copy["root"])
+            if copy["kind"] != "ciphertext":
+                continue
+            require(root == state / "custody", "Controller ciphertext identifies a different external state", 5)
+            if copy.get("status") == "present":
+                cipher = safe_path(root, copy["path"], exists=True)
+                require(digest(cipher.read_bytes()) == copy["sha256"], "Legacy custody bytes disagree with Git control", 5)
+                proof.append({"kind": "custody", "path": str(cipher), "sha256": copy["sha256"]})
+    return proof
+
+
+def _linked_worktrees(repository, old, new):
+    """Validate both ends of every registered link, including links that need repair."""
+    worktrees = []
+    previous_common = Path(old["location"]["common"])
+    for admin, linked in _metadata(repository):
+        target = relocated_path(linked, new)
+        expected = previous_common / admin.relative_to(repository.common)
+        backlink = _backlink(target)
+        require(backlink in (admin, expected), "Linked worktree points to another Git directory: " + str(target), 5)
+        require(target == linked or not linked.exists(), "Both original and relocated worktrees exist: " + str(linked), 5)
+        worktrees.append({"path": str(target.parent), "git_directory": str(admin),
+                          "needs_repair": linked != target or backlink != admin})
+    return worktrees
+
+
+def _references(repository, binding, worktrees):
+    state = Path(binding["location"]["state"])
+    config = read_json(safe_path(state, "config.json"), {})
+    locations = []
+
+    def report(kind, original, target):
+        locations.append({"kind": kind, "from": str(original), "to": str(target)})
+
+    for name in (*CONFIG_PATHS, *CONFIG_ROOTS):
+        values = config.get(name)
+        for value in (values or []) if name in CONFIG_ROOTS else ([values] if values else []):
+            original = Path(value)
+            target = relocated_path(original, binding)
+            if target != original:
+                target = safe_path(target.parent, target.name)
+                available = target.is_dir() if name in CONFIG_ROOTS else target.is_file()
+                require(available, "Relocated configuration path is unavailable: " + str(target), 5)
+                report("config:" + name, original, target)
+
+    registered = {Path(tree["path"]) for tree in worktrees}
+    for task in _records(repository, "tasks"):
+        require(not task.get("processes"), "Reconcile active native tasks before moving the vault", 5)
+        original = Path(task["worktree"])
+        target = relocated_path(original, binding)
+        if target != original:
+            require(target in registered or task.get("worktree_removed") or task["state"] in {"closed", "cancelled"},
+                    "Relocated task worktree is unavailable: " + str(target), 5)
+            report("task:worktree", original, target)
+
+    for session in _records(repository, "sessions"):
+        require(session.get("state") != "running", "Reconcile running sessions before moving the vault", 5)
+        for name in SESSION_PATHS:
+            if not session.get(name):
+                continue
+            original = Path(session[name])
+            target = relocated_path(original, binding)
+            if target != original:
+                require(safe_path(target.parent, target.name).is_dir(),
+                        "Relocated session directory is unavailable: " + str(target), 5)
+                report("session:" + name, original, target)
+
+    for record in _materials(repository):
+        for copy in record["copies"]:
+            original = Path(copy["root"])
+            target = relocated_path(original, binding)
+            if target == original:
+                continue
+            file = safe_path(target, copy["path"])
+            status = copy.get("status")
+            if status == "present" and copy["kind"] == "ciphertext":
+                require(file.is_file(), "Relocated ciphertext is unavailable: " + str(file), 5)
+            if status == "present" and file.exists():
+                # A Git worktree backlink is repaired in place. Its archived bytes stay in custody.
+                backlink = file.name == ".git" and file.parent in registered and copy["kind"] == "checkpoint"
+                require(backlink or (file.is_file() and digest(file.read_bytes()) == copy["sha256"]),
+                        "Relocated custody bytes changed: " + str(file), 5)
+            report("custody:" + status, original / copy["path"], file)
+
+    for deletion in _records(repository, "deletions"):
+        for entry in deletion["entries"]:
+            copy = entry["copy"]
+            original = Path(copy["root"])
+            target = relocated_path(original, binding)
+            if target != original:
+                report("deletion:" + entry["status"], original / copy["path"], safe_path(target, copy["path"]))
+    return locations
+
+
+def _plists(binding):
+    state = Path(binding["location"]["state"])
+    plists = []
+    for path in sorted(safe_path(state, "launchd").glob("*.plist")):
+        original = safe_path(state, f"launchd/{path.name}", exists=True).read_bytes()
+        value = plistlib.loads(original)
+        label = value.get("Label", "")
+        args = value.get("ProgramArguments")
+        require(label.startswith("org.healdan.") and path.name == label + ".plist" and isinstance(args, list) and
+                len(args) >= 6 and isinstance(args[0], str) and Path(args[0]).is_absolute() and
+                args[1] == "--vault" and args[3] == "--state" and
+                args[5:] in (["lint"], ["maintenance", "daily"]), "Unrecognized launchd definition: " + str(path), 5)
+        args[2] = str(relocated_path(args[2], binding))
+        args[4] = str(relocated_path(args[4], binding))
+        require(Path(args[2]) == Path(binding["location"]["root"]) and Path(args[4]) == state,
+                "Launchd definition points to a different vault: " + str(path), 5)
+        program = relocated_path(args[0], binding)
+        if program != Path(args[0]):
+            require(program.is_file(), "Relocated launchd controller is unavailable: " + str(program), 5)
+            args[0] = str(program)
+        for log in ("StandardOutPath", "StandardErrorPath"):
+            target = relocated_path(value[log], binding)
+            require(target.is_relative_to(state), "Launchd log is outside controller state: " + str(target), 5)
+            value[log] = str(safe_path(state, target.relative_to(state)))
+        updated = plistlib.dumps(value)
+        if plistlib.loads(original) == value:
+            continue
+        installed = Path.home() / "Library/LaunchAgents" / path.name
+        require(not installed.exists() and not installed.is_symlink(),
+                "Unload and remove the installed LaunchAgent before reassociation: " + str(installed), 5)
+        plists.append({"name": path.name, "before": digest(original), "after": digest(updated),
+                       "value": base64.b64encode(updated).decode("ascii")})
+    return plists
+
+
+def _validate_move(repository, old, new):
+    for name, value in old["location"].items():
+        previous = Path(value)
+        current = Path(new["location"][name])
+        if previous != current:
+            require(not previous.exists() and not previous.is_symlink(),
+                    "Original location is still occupied: " + value, 5)
+            require(not current.is_relative_to(previous) and not previous.is_relative_to(current),
+                    "Original and relocated paths overlap: " + value, 5)
+    for location in new["previous"]:
+        for name, value in location.items():
+            previous = Path(value)
+            current = Path(new["location"][name])
+            require(previous == current or not (current.is_relative_to(previous) or previous.is_relative_to(current)),
+                    "Relocation overlaps a historical path: " + value, 5)
+        historic_state = Path(location["state"])
+        for name in ("root", "common"):
+            current = Path(new["location"][name])
+            require(not current.is_relative_to(historic_state) and not historic_state.is_relative_to(current),
+                    "Vault location overlaps a historical state path: " + str(historic_state), 5)
+            current_state = Path(new["location"]["state"])
+            historic_git = Path(location[name])
+            require(not current_state.is_relative_to(historic_git) and not historic_git.is_relative_to(current_state),
+                    "External state overlaps a historical vault path: " + str(historic_git), 5)
+    journal = read_json(safe_path(repository.control, "transaction.json"))
+    require(not journal or journal.get("status") == "complete", "Recover the integration before reassociation", 5)
+
+
+def relocation_plan(repository, old, new):
+    _validate_move(repository, old, new)
+    worktrees = _linked_worktrees(repository, old, new)
+    return {"old": old, "worktrees": worktrees, "paths": _references(repository, new, worktrees), "plists": _plists(new)}
+
+
+def relocation_summary(plan):
+    return {"worktrees": plan["worktrees"], "paths": plan["paths"],
+            "plists": [{k: v for k, v in item.items() if k != "value"} for item in plan["plists"]]}
+
+
+def apply_relocation(repository, binding, plan):
+    _validate_move(repository, plan["old"], binding)
+    worktrees = _linked_worktrees(repository, plan["old"], binding)
+    fields = ("path", "git_directory")
+    require([tuple(tree[key] for key in fields) for tree in worktrees] ==
+            [tuple(tree[key] for key in fields) for tree in plan["worktrees"]] and
+            _references(repository, binding, worktrees) == plan["paths"],
+            "Reassociation paths changed after confirmation", 5)
+    changes = []
+    state = Path(binding["location"]["state"])
+    for plist in plan["plists"]:
+        path = safe_path(state / "launchd", plist["name"], exists=True)
+        updated = base64.b64decode(plist["value"], validate=True)
+        current = digest(path.read_bytes())
+        require(digest(updated) == plist["after"] and current in (plist["before"], plist["after"]),
+                "Launchd definition changed after confirmation: " + str(path), 5)
+        if current == plist["before"]:
+            changes.append((path, updated))
+    repair = [tree["path"] for tree in worktrees if tree["needs_repair"]]
+    if repair:
+        git(repository.root, "worktree", "repair", *repair)
+        require(not any(t["needs_repair"] for t in _linked_worktrees(repository, plan["old"], binding)),
+                "Git worktree repair needs reconciliation", 5)
+    for path, updated in changes:
+        atomic(path, updated)

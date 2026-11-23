@@ -53,6 +53,11 @@ def clean_env(temporary, profile=None):
 
 
 def probe(vault):
+    with vault.locked():
+        return _probe(vault)
+
+
+def _probe(vault):
     version = runtime_version(vault)
     vault.state.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="probe-", dir=vault.state) as temp, \
@@ -108,6 +113,11 @@ print(json.dumps(result))
 
 
 def profile(vault, operation):
+    with vault.locked():
+        return _profile(vault, operation)
+
+
+def _profile(vault, operation):
     session = get_session(vault, operation)
     directory = vault.state / "tasks" / session["task"] / "temporary" / session["role"] / session["uuid"] / "native"
     directory.mkdir(parents=True, exist_ok=True)
@@ -121,9 +131,9 @@ def profile(vault, operation):
 
 
 def launch(vault, operation, *, resume=False, recovery_material=None):
-    probe(vault)  # Never reuse an old successful probe as authorization to launch.
     require(not Path(__file__).resolve().is_relative_to(vault.root), "Install the controller outside the vault before launch", 5)
     with vault.locked():
+        _probe(vault)  # Run a fresh OS isolation probe before every launch.
         vault.no_transaction()
         session = get_session(vault, operation)
         task = get_task(vault, session["task"])
@@ -137,6 +147,7 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
         require(bool(session["launches"]) == resume, "Use resume for an existing session; new launches need a new S-", 2)
         base = vault.state / "tasks" / session["task"]
         proposal = Path(session["proposal"])
+        require(proposal.resolve().is_relative_to(base / "proposals"), "Session proposal belongs outside this vault state", 5)
         temporary = base / "temporary" / session["role"] / session["uuid"]
         native = Path(session["recovery_profile"]) if recovery_material else profile(vault, operation)
         require(native.resolve().is_relative_to(vault.state), "Native recovery profile must stay in controller state")

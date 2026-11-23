@@ -16,6 +16,12 @@ def parser():
     commands = result.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup")
     setup.add_argument("--interactive", action="store_true")
+    state = commands.add_parser("state", help="Inspect and confirm changes to the vault binding")
+    state_actions = state.add_subparsers(dest="action", required=True)
+    for name, description in (("adopt", "Adopt proven legacy or restored state"),
+                              ("rebind", "Check the vault and state at their new locations")):
+        operation = state_actions.add_parser(name, help=description)
+        operation.add_argument("--confirm", help="Confirmation digest from the preview")
     commands.add_parser("doctor")
     commands.add_parser("status")
     query = commands.add_parser("query")
@@ -155,12 +161,15 @@ def parser():
 
 
 def dispatch(args):
-    from . import backups, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
+    from . import backups, binding, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
     from . import pages, regression, review, setup, tasks, transactions
     from .knowledge import query
     from .signing import human_sign
     if args.command == "setup":
         return setup.initialize(args.vault, args.state, interactive=args.interactive)
+    if args.command == "state":
+        change = binding.adopt if args.action == "adopt" else binding.rebind
+        return change(args.vault, args.state, args.confirm)
     external_recovery = (args.command, getattr(args, "action", None)) in {
         ("restore", None), ("backup", "verify"), ("session", "restore"), ("session", "approve-recovery")
     }
@@ -170,7 +179,7 @@ def dispatch(args):
         return result, 0 if result["ready"] else 5
     if args.command == "status":
         state = read_json(vault.control / "lint-state.json", {})
-        return {"commit": vault.head(), "state": str(vault.state),
+        return {"commit": vault.head(), "vault_id": vault.identity, "state": str(vault.state),
                 "lint_overdue": linting.stale(state.get("last_complete_lint_at")),
                 "last_complete_lint_at": state.get("last_complete_lint_at"),
                 "tasks": [{"id": t["id"], "state": t["state"], "worktree_age": tasks.age_status(t),
@@ -265,9 +274,10 @@ def dispatch(args):
         if args.action == "inspect":
             return transactions.inspect_package(vault, args.package, read_json(args.results))
         if args.action == "sign-case":
-            signed = regression.sign_case(vault, read_json(args.input))
-            atomic(args.output, signed)
-            return {"output": str(args.output), "digest": signed["approval"]["digest"]}
+            with vault.locked():
+                signed = regression.sign_case(vault, read_json(args.input))
+                atomic(args.output, signed)
+                return {"output": str(args.output), "digest": signed["approval"]["digest"]}
         if args.action == "regression":
             result = regression.suite(vault)
             return result, 5 if result["failed"] or result["pending"] else 0
@@ -314,12 +324,13 @@ def dispatch(args):
             result = migration.purge_check(vault)
             return result, 0 if result["eligible_for_review"] else 5
         if args.action == "sign-alias":
-            value = read_json(args.input)
-            require(ids.identity(value["alias"]) == ids.identity(value["target"]), "Alias changes identity")
-            require(value.get("reason") and value.get("decided_at"), "Alias needs a human decision", 2)
-            value["approval"] = human_sign(vault, value.copy(), "alias")
-            atomic(args.output, value)
-            return {"output": str(args.output)}
+            with vault.locked():
+                value = read_json(args.input)
+                require(ids.identity(value["alias"]) == ids.identity(value["target"]), "Alias changes identity")
+                require(value.get("reason") and value.get("decided_at"), "Alias needs a human decision", 2)
+                value["approval"] = human_sign(vault, value.copy(), "alias")
+                atomic(args.output, value)
+                return {"output": str(args.output)}
     raise Blocked("Unsupported operation", 2)
 
 

@@ -5,6 +5,7 @@ import os
 import shutil
 from uuid import uuid4
 
+from .binding import project_record
 from .core import atomic, digest, git, jsonl, read_json, require, safe_path, stamp, utc
 from .ids import reserve
 
@@ -16,7 +17,7 @@ def task_path(vault, identifier):
 def get_task(vault, identifier):
     task = read_json(task_path(vault, identifier))
     require(task, "Unknown task", 2)
-    return task
+    return project_record(task, vault.binding, ("worktree",))
 
 
 def age_status(task, now=None):
@@ -30,7 +31,7 @@ def require_active(task, now=None):
 
 
 def all_tasks(vault):
-    return [read_json(p) for p in (vault.control / "tasks").glob("*.json")]
+    return [get_task(vault, p.stem) for p in (vault.control / "tasks").glob("*.json")]
 
 
 def create(vault, title, now=None):
@@ -94,7 +95,7 @@ def new_session(vault, task_id, action, role, context, *, operation=None):
         if existing:
             require((existing["task"], existing["action"], existing["role"], existing["context_sha256"]) ==
                     (task_id, action, role, digest(body)), "Session operation arguments changed")
-            return existing
+            return get_session(vault, operation)
         sid = reserve(vault, "S", 1, operation, locked=True)[0]
         session = {"id": sid, "operation": operation, "uuid": str(uuid4()), "task": task_id,
                    "action": action, "role": role, "context_bytes": len(body), "context_sha256": digest(body),
@@ -112,9 +113,10 @@ def new_session(vault, task_id, action, role, context, *, operation=None):
 
 
 def get_session(vault, operation):
+    from .relocation import SESSION_PATHS
     record = read_json(safe_path(vault.control / "sessions", operation + ".json"))
     require(record, "Unknown session", 2)
-    return record
+    return project_record(record, vault.binding, SESSION_PATHS)
 
 
 def present(vault, task_id, question, delivery_receipt, now=None):

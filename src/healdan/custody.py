@@ -63,12 +63,18 @@ def materials(vault):
 
 
 def save_material(vault, record):
-    rows = materials(vault)
-    rows[record["id"]] = record
-    atomic(vault.control / "materials.json", rows)
+    with vault.locked():
+        rows = materials(vault)
+        rows[record["id"]] = record
+        atomic(vault.control / "materials.json", rows)
 
 
 def capture_tree(vault, root, *, task, classification, session=None, purpose=None):
+    with vault.locked():
+        return _capture_tree(vault, root, task, classification, session, purpose)
+
+
+def _capture_tree(vault, root, task, classification, session, purpose):
     root = Path(root).resolve()
     require(not root.is_relative_to(vault.root), "Conversation capture must originate outside Git")
     require(root.is_relative_to(vault.state), "Capture root is not a controller-owned task/profile")
@@ -158,9 +164,14 @@ def native_guard(vault, material):
 
 
 def restore_capture(vault, identifier, destination):
+    with vault.locked():
+        return _restore_capture(vault, identifier, destination)
+
+
+def _restore_capture(vault, identifier, destination):
     record = materials(vault)[identifier]
     copy = next(c for c in record["copies"] if c["kind"] == "ciphertext" and c["status"] == "present")
-    cipher = safe_path(copy["root"], copy["path"], exists=True).read_bytes()
+    cipher = safe_path(vault.relocated_path(copy["root"]), copy["path"], exists=True).read_bytes()
     require(digest(cipher) == copy["sha256"], "Ciphertext changed")
     plain = decrypt(vault, cipher)
     require(digest(plain) == record["plain_sha256"], "Plaintext archive digest mismatch")

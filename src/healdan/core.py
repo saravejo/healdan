@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -242,26 +243,45 @@ REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/contro
 
 class Vault:
     def __init__(self, root, state=None, *, operational=True):
-        self.root = Path(root).resolve()
-        common = Path(git(self.root, "rev-parse", "--git-common-dir"))
-        self.common = (self.root / common).resolve() if not common.is_absolute() else common.resolve()
-        self.control = self.common / "healdan"
-        key = digest(str(self.common))[:20]
-        self.state = Path(state).resolve() if state else Path.home() / ".local/share/healdan" / key
-        require(not self.state.is_relative_to(self.root), "Controller state must be outside the vault")
+        from .binding import Repository, bound, project_config
+        self.repository = Repository.open(root)
+        self.root = self.repository.root
+        self.common = self.repository.common
+        self.control = self.repository.control
+        self.binding = bound(self.repository, state)
+        self.identity = self.binding["vault_id"]
+        self.state = Path(self.binding["location"]["state"])
         self.config_path = self.state / "config.json"
-        self.config = read_json(self.config_path, {})
-        self.policy = read_json(Path(__file__).with_name("defaults.json"))
-        if "context_bytes" in self.config:
-            limits = self.config["context_bytes"]
-            require(set(limits) == set(self.policy["context_bytes"]) and
-                    all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
-            self.policy["context_bytes"] = limits
-        if operational:
-            self.check_registries()
+        self._lock = threading.local()
+        with self.locked():
+            self.config = project_config(read_json(safe_path(self.state, "config.json"), {}), self.binding)
+            self.policy = read_json(Path(__file__).with_name("defaults.json"))
+            if "context_bytes" in self.config:
+                limits = self.config["context_bytes"]
+                require(set(limits) == set(self.policy["context_bytes"]) and
+                        all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
+                self.policy["context_bytes"] = limits
+            if operational:
+                self.check_registries()
 
+    @contextlib.contextmanager
     def locked(self):
-        return lock(self.control / "controller.lock")
+        from .binding import bound, pair_lock
+        if getattr(self._lock, "held", False):
+            yield
+            return
+        bound(self.repository, self.state, expected=self.binding)
+        with pair_lock(self.repository, self.state):
+            bound(self.repository, self.state, expected=self.binding)
+            self._lock.held = True
+            try:
+                yield
+            finally:
+                self._lock.held = False
+
+    def relocated_path(self, path):
+        from .binding import relocated_path
+        return relocated_path(path, self.binding)
 
     def rows(self, name, *, include_bytes=False):
         required = Path(name).as_posix() in REQUIRED_REGISTRIES
@@ -305,7 +325,8 @@ class Vault:
     def receipt(self, kind, payload):
         value = {"kind": kind, "at": stamp(), "payload": payload}
         identifier = digest(value)
-        atomic(self.control / "receipts" / (identifier + ".json"), value)
+        with self.locked():
+            atomic(self.control / "receipts" / (identifier + ".json"), value)
         return identifier
 
     def no_transaction(self):

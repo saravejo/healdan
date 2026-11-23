@@ -78,7 +78,7 @@ def create(vault, kind, expires_at, member_ids=(), *, now=None):
                                                          "body": base64.b64encode(checkpoint_data).decode("ascii")}
         for member in members:
             copy = next(c for c in member["copies"] if c["kind"] == "ciphertext" and c["status"] == "present")
-            data = safe_path(copy["root"], copy["path"], exists=True).read_bytes()
+            data = safe_path(vault.relocated_path(copy["root"]), copy["path"], exists=True).read_bytes()
             require(digest(data) == copy["sha256"], "Member ciphertext changed")
             files["custody/" + member["id"] + ".age"] = {
                 "sha256": digest(data), "size": len(data), "body": base64.b64encode(data).decode("ascii")}
@@ -117,23 +117,37 @@ def create(vault, kind, expires_at, member_ids=(), *, now=None):
 
 
 def verify_backup(vault, identifier):
+    with vault.locked():
+        return _verify_backup(vault, identifier)
+
+
+def _verify_backup(vault, identifier):
     record = materials(vault)[identifier]
     require(record["kind"] == "backup", "Not a backup", 2)
     signed = verify(record.get("approval"), "backup", vault.config.get("backup_allowed_signers", ""))
     require({k: v for k, v in record.items() if k != "approval"} == signed, "Signed backup manifest changed")
     checks = []
     for copy in record["copies"]:
-        cipher = safe_path(copy["root"], copy["path"], exists=True).read_bytes()
+        root = vault.relocated_path(copy["root"])
+        if root != Path(copy["root"]):
+            require(root in map(Path, vault.config.get("backup_destinations", [])),
+                    "Relocated backup destination is not authorized", 5)
+        cipher = safe_path(root, copy["path"], exists=True).read_bytes()
         require(digest(cipher) == copy["sha256"], "Backup ciphertext mismatch")
         require(digest(decrypt(vault, cipher)) == record["plain_sha256"], "Backup plaintext mismatch")
-        checks.append({"root": copy["root"], "verified": True})
+        checks.append({"root": str(root), "verified": True})
     return {"id": identifier, "copies": checks}
 
 
 def restore(vault, identifier, destination):
-    verify_backup(vault, identifier)
+    with vault.locked():
+        return _restore(vault, identifier, destination)
+
+
+def _restore(vault, identifier, destination):
+    _verify_backup(vault, identifier)
     copy = materials(vault)[identifier]["copies"][0]
-    cipher = safe_path(copy["root"], copy["path"], exists=True).read_bytes()
+    cipher = safe_path(vault.relocated_path(copy["root"]), copy["path"], exists=True).read_bytes()
     result = restore_tree(decode(decrypt(vault, cipher)), destination)
     bundle = Path(destination) / "control/repository.bundle"
     if bundle.exists():
@@ -142,11 +156,13 @@ def restore(vault, identifier, destination):
         git(destination, "symbolic-ref", "HEAD", "refs/heads/healdan-recovered")
         git(destination, "reset", "--mixed", materials(vault)[identifier]["commit"])
         result["commit"] = git(destination, "rev-parse", "HEAD")
+        control = Path(destination) / ".git/healdan"
         checkpoints = read_json(Path(destination) / "control/controller-checkpoints.json")
         if checkpoints:
-            control = Path(destination) / ".git/healdan"
             atomic(control / "reservations.json", checkpoints["reservations"])
             atomic(control / "csp.json", checkpoints["csp"])
             for session in checkpoints["sessions"]:
                 atomic(control / "sessions" / (session["operation"] + ".json"), session)
+        atomic(control / "restored-from.json", {"format": "healdan-restored-vault-v1", "source_vault": vault.identity,
+                                                "backup": identifier, "commit": result["commit"]})
     return result
