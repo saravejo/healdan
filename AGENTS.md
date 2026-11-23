@@ -2,10 +2,10 @@
 
 Trabalhe em um checkout de desenvolvimento isolado do vault em uso. As regras de `CLAUDE.md` regem as sessões do produto. Preserve as aprovações humanas, os bytes assinados e o histórico das instalações existentes.
 
-Na sprint, o coordenador parte da main remota e registra a base e o HEAD completos em cada transição. Use até quatro sessões simultâneas contando o coordenador. Abra contexto novo por lote e por auditoria. Só o coordenador faz push e merge.
+Na sprint, o coordenador parte da main remota e registra a base e o HEAD completos em cada transição. Use um implementador por vez e até quatro sessões simultâneas contando o coordenador. O coordenador e os novos agentes usam `gpt-6.2-sol` com esforço `high`. Abra os novos agentes com contexto limpo. Só o coordenador faz commit, push e merge.
 
-1. O leitor prepara um contrato com os IDs originais, aceite, contraprova, interfaces, migração e testes. O coordenador revisa o contrato antes da implementação.
-2. O implementador trabalha no lote autorizado e executa os testes. O auditor começa pelo requisito e pelo commit congelado, executa controles positivos e negativos e registra o parecer por ID.
+1. O coordenador revisa o contrato versionado antes da implementação. Acione o leitor quando houver uma dúvida concreta sobre critérios, interfaces, migração ou testes na base atual.
+2. O implementador trabalha no lote autorizado e executa os testes. O auditor começa pelo requisito e pelo código do candidato congelado, executa controles positivos e negativos e verifica o histórico do Qodo antes de fechar o parecer por ID.
 3. O coordenador coleta a revisão completa do Qodo e todas as versões anteriores disponíveis. Registra separadamente cada achado, origem, evidência, correção/teste ou contraprova aprovada pelo auditor. Nova alteração exige revalidar as evidências afetadas.
 4. Confira o SHA, os checks e as conversas antes do merge. Acompanhe o CI do novo commit da main antes de integrar outro lote.
 
