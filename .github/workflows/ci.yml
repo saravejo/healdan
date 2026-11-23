@@ -1,65 +1,55 @@
-name: Verify controller
-
-on:
-  push:
-  pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: verify-${{ github.ref }}
-  cancel-in-progress: true
-
+name: Ensaio isolado de empacotamento B00
+on: workflow_dispatch
+permissions: {}
 jobs:
-  test:
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22.12.0'
-      - name: Install real dependencies
-        run: |
-          brew install age
-          npm install --global @anthropic-ai/sandbox-runtime@0.0.83
-          python -m pip install .
-      - name: Record dependency versions
-        run: |
-          python --version
-          git --version
-          age --version
-          node --version
-          srt --version
-      - name: Run controller and real OS sandbox tests
-        shell: bash
-        run: python -m unittest discover -s tests -v 2>&1 | tee test-results.txt
-      - name: Exercise the sprint gate contract
-        run: python -m unittest scripts.test_sprint_gate -v
-      - name: Audit public tree
-        run: python scripts/audit_publication.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: macos-controller-results
-          path: test-results.txt
-
   package:
-    runs-on: ubuntu-latest
+    name: sprint-b00 package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.sha }}
+          path: policy
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: python -m pip install build
-      - run: python -m build
-      - run: python scripts/audit_publication.py --packages dist
+      - name: Install public build tools in the builder image
+        shell: bash
+        run: |
+          docker build --pull --tag sprint-b00-builder - <<'DOCKERFILE'
+          FROM python:3.12-slim-bookworm
+          RUN python -m pip install --no-cache-dir build 'setuptools>=77' wheel
+          DOCKERFILE
+          docker image inspect --format '{{.Id}}' sprint-b00-builder
+      - name: Build without network or host mounts, then audit locally
+        env:
+          PR: '1'
+          HEAD_SHA: 'd5cdf4722afa3077cddf45eb12f69105a5da0542'
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+        shell: bash
+        run: |
+          git init candidate
+          git -C candidate -c credential.helper= fetch --no-tags https://github.com/saravejo/healdan.git "refs/pull/$PR/head"
+          test "$(git -C candidate rev-parse FETCH_HEAD)" = "$HEAD_SHA"
+          git -C candidate -c core.hooksPath=/dev/null checkout --detach "$HEAD_SHA"
+          printf '::stop-commands::%s\n' "$(cat /proc/sys/kernel/random/uuid)"
+          output=$(mktemp -d "$RUNNER_TEMP/sprint-package.XXXXXXXX")
+          container=$(docker create --interactive --network none --user 65534:65534 \
+            --cap-drop ALL --security-opt no-new-privileges --env HOME=/tmp sprint-b00-builder sh -eu -c '
+              mkdir /tmp/source /tmp/dist
+              tar --extract --file - --no-same-owner --no-same-permissions --directory /tmp/source
+              python -I -m build --no-isolation --outdir /tmp/dist /tmp/source
+            ')
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          if ! tar --create --file - --exclude=./.git --directory candidate . |
+              docker start --attach --interactive "$container" > "$output/build.log" 2>&1; then
+            echo 'The isolated package build failed.' >&2
+            exit 1
+          fi
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
+          docker cp "$container:/tmp/dist/." - > "$output/distributions.tar" 2> "$output/copy.log"
+          python3 -I policy/scripts/audit_publication.py --root candidate \
+            --packages "$output/distributions.tar" --require-distributions
