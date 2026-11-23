@@ -8,13 +8,21 @@
 - Mantenha um ruleset ativo para `main` com a regra `Restrict updates`. Configure apenas o papel de administrador do repositório, ID 5, com bypass `pull_request` nesse ruleset. O coordenador é o único administrador e integra através da PR. A proteção clássica permanece aplicada aos administradores.
 - Em Actions, configure as variáveis `SPRINT_B00_COORDINATOR_ID`, `SPRINT_B00_QODO_BOT_ID` e `SPRINT_B00_QODO_APP_ID` com os IDs numéricos verificados. A instalação observada do Qodo usa bot `151058649` e App `484649`. Confirme a instalação antes de alterar esses IDs.
 
-O workflow `.github/workflows/sprint-b00.yml` é disparado de `main` protegida. Os jobs de teste nativo e empacotamento obtêm o código público por `refs/pull/<n>/head`, verificam o SHA recebido do job de preparação e executam com permissões vazias e ambiente reduzido. Cada job usa um runner separado. O job `sprint-b00 gate` mantém `checks: write` e só executa o verificador do ref protegido. O verificador lê comentários e critérios como dados, usa metadados oficiais da execução e exige sucesso real dos jobs `sprint-b00 test` e `sprint-b00 package` na mesma tentativa.
+O workflow `.github/workflows/sprint-b00.yml` é disparado de `main` protegida. Os jobs que executam código candidato obtêm o código público por `refs/pull/<n>/head`, verificam o SHA recebido do job de preparação e usam permissões vazias e ambiente reduzido. O teste nativo audita a árvore com o script do ref protegido antes de executar o código candidato. O empacotamento envia wheel e sdist a outro runner, que usa o mesmo auditor protegido para inspecionar os artefatos e a árvore como dados. O job `sprint-b00 gate` mantém `checks: write`, executa o verificador do ref protegido e exige sucesso real dos jobs `sprint-b00 test` e `sprint-b00 package` na mesma tentativa.
 
 A proteção do GitHub identifica o App GitHub Actions, compartilhado por workflows do repositório. A fonte da aprovação é confirmada no preflight pelo caminho, identidade, SHA e tentativa do workflow protegido e pelo ID de check no log oficial do job. A regra que restringe atualizações de `main` reserva a integração ao coordenador, que verifica esse vínculo antes do merge. [Proteção de branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches), [fonte de checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 
 ## Atestação GitHub
 
-Use a branch `sprint/bNN-descricao` no próprio repositório e atualize o HEAD com a `main` corrente. Registre o número da PR e os SHAs completos. A matriz e o contrato B00 vêm do commit que executa a política. Os IDs numéricos da matriz aparecem como chaves de texto na atestação. O inventário do B00 usa as linhas de aceite de `B00.md`.
+Use a branch `sprint/bNN-descricao` no próprio repositório e atualize o HEAD com a `main` corrente. Registre o número da PR e os SHAs completos. A matriz e o contrato `BNN.md` vêm do commit que executa a política. O verificador também lê a matriz candidata como dados no HEAD e exige os mesmos IDs, lotes, aceites e dependências. Os IDs numéricos aparecem como chaves de texto na atestação.
+
+Em B00, mantenha os itens da matriz pendentes. Em lotes seguintes, uma linha pode registrar `concluido` com número ou URL da PR já integrada do lote correto, SHAs de commits da PR e links GitHub verificáveis em `testes` e `pareceres`. O merge dessa PR precisa estar no histórico da base protegida. Antes de avaliar o lote corrente, o gate confere a integração de B00 e os itens de cada dependência declarada no contrato da matriz.
+
+O B00 usa cada linha de `B00.md` como um controle de aceite. Para os demais lotes, coloque o contrato detalhado revisado no ref protegido antes da verificação. Preserve na PR o contrato detalhado do lote em execução. Além da descrição humana, use um único bloco `json` de cenários com os mesmos IDs do lote e controles e contraprovas separados.
+
+```json
+{"scenarios":{"15":{"positivo":"Exercitar o registro válido","contraprova":"Bloquear o registro inválido"}}}
+```
 
 Em um checkout confiável que contém `scripts/sprint_gate.py`, carregue as variáveis de configuração locais e obtenha o inventário. `$PR`, `$HEAD`, `$BASE`, `$RUN` e `$ATTEMPT` nos comandos são os valores registrados pelo coordenador. O token vem da sessão autenticada do GitHub CLI.
 
@@ -27,15 +35,23 @@ python scripts/sprint_gate.py snapshot --pull "$PR" --head "$HEAD" --base "$BASE
 python scripts/sprint_gate.py snapshot --pull "$PR" --head "$HEAD" --base "$BASE" --template > atestacao.json
 ```
 
-O inventário contém os corpos e hashes de comentários de conversa, revisões, comentários inline e edições disponíveis. Ele ainda guarda revisões de SHAs anteriores e comentários incrementais. Uma revisão completa do App observado tem `Code Review by Qodo`, os contadores de achados e o marcador de commit no corpo autenticado com o HEAD inteiro. O `PR Summary` entra no inventário. Uma revisão incremental ou um resumo descritivo deixa a condição de revisão completa pendente. Se o Qodo estiver ausente, se falhar a coleta ou se houver histórico indisponível, a execução bloqueia.
+O inventário contém os corpos e hashes de comentários de conversa, revisões, comentários inline e edições disponíveis. Ele inclui revisões de SHAs anteriores e comentários incrementais. Uma revisão completa tem `Code Review by Qodo`, contadores de achados e o marcador do HEAD inteiro no corpo autenticado. Quando o comentário foi editado, o verificador confere que a última edição veio do bot. Um `PR Summary` ou uma revisão incremental entra no inventário e deixa a revisão completa pendente.
 
-Preencha o modelo a partir das verificações registradas pelo auditor e pelo coordenador.
+Preserve snapshots contemporâneos dos corpos observados junto com ID da fonte, autor e horário. Se uma publicação desaparecer ou for reescrita, inclua sua versão arquivada no inventário com `--archives snapshots.json`. Cada entrada contém `kind`, `record` com o objeto REST integral da captura e `anchor` com o ID do comentário GitHub do coordenador. O comentário-âncora deve permanecer sem edição, identificar o `bot GitHub <BOT_ID>, App <APP_ID>` e ter uma linha de tabela com ID do registro, descrição e SHA-256 dos bytes UTF-8 do corpo. Quando a timeline expõe um evento de exclusão, informe também seu `event` e vincule-o a uma âncora anterior. O gate reconcilia cada versão registrada pelo coordenador com a coleta atual ou com um corpo arquivado. O parecer independente cobre cada versão. Ausência do Qodo, exclusão sem prova ou histórico de edições possivelmente truncado bloqueiam a execução.
 
-- Liste os identificadores de sessão dos implementadores em `implementers`. Registre em `audit.agent` uma sessão de auditoria independente, com `result` igual a `pass`, `history_complete` igual a `true` e evidências do parecer para o SHA revisado.
-- Em `items`, mantenha os hashes do modelo e registre `result` igual a `pass` e evidência de cada aceite. Uma evidência é um objeto com `url` do repositório no GitHub e `detail` com a verificação e seu resultado. Use o mesmo formato de evidência para auditoria e achados.
-- Em `qodo.completion`, selecione o ID da revisão completa do inventário. Cubra todas as chaves em `qodo.records`, inclusive as versões anteriores. Para cada achado registre `quote` com trecho literal da origem, `resolution` igual a `fixed` ou `dismissed-with-reason` e `evidence` com a prova. Use `no_findings` com justificativa para os registros sem achados. A contagem do Qodo exige cobertura mínima. A atribuição dos achados a cada trecho e a validade da resolução são parte do parecer independente atestado pelo coordenador.
+Preencha o modelo a partir das verificações registradas pelo auditor e pelo coordenador. Mantenha `contract_sha256` e os hashes dos aceites e dos cenários do inventário.
 
-O coordenador publica a atestação como um comentário da própria PR, com um único bloco cercado `json` e o conteúdo de `atestacao.json`. Registre o número após `issuecomment-` no URL, aqui chamado `$COMMENT`. A API verifica o autor do comentário pelo ID. O verificador confronta o comentário e o inventário com o estado atual da PR.
+- Liste os identificadores de sessão dos implementadores em `implementers`. Em `items`, registre `result` igual a `pass` e evidências do aceite e de cada cenário. Uma evidência contém `url` e `detail` com a verificação e seu resultado. Use um link de comentário ou revisão da PR, execução ou job de Actions, commit, ou arquivo versionado por SHA. A API precisa confirmar que a referência existe no escopo correto.
+- Em `qodo.completion`, selecione o ID da revisão completa. Cubra todas as chaves em `qodo.records`, inclusive versões anteriores e snapshots. Para cada achado registre `id` individual dentro da origem, `quote` literal com o título do achado quando ele estiver presente e `resolution` igual a `fixed` ou `dismissed-with-reason`. Uma correção inclui `commit` com SHA novo e ancestral do HEAD. Uma dispensa inclui `reason` com a explicação sustentada pela contraprova. Ambas incluem `test` com `command`, `result` e `evidence`. O comando e o resultado precisam constar no log do job no SHA ou em comentário autenticado do coordenador que nomeia o SHA. Use `no_findings` com justificativa para registros sem achados.
+- Gere o modelo do parecer e registre a sessão independente em `agent`, o resultado geral e por ID, `history_complete` e as evidências. Em cada achado, a sessão independente registra `approved` igual a `true` e `detail` com o parecer sobre a correção ou contraprova. Os hashes vinculam o parecer aos cenários, às origens e às resoluções da atestação. O coordenador publica o parecer separado em um único bloco `json` na PR e registra seu ID GitHub.
+
+```bash
+python scripts/sprint_gate.py audit-template --manifest atestacao.json > parecer.json
+python scripts/sprint_gate.py snapshot --pull "$PR" --head "$HEAD" --base "$BASE" \
+  --audit-comment "$AUDIT_COMMENT" > atestacao-vinculos.json
+```
+
+Copie `audit` de `atestacao-vinculos.json` para a atestação preenchida. Use as mesmas opções de `--bootstrap` e `--archives` nas coletas vinculadas a essa PR. O coordenador publica a atestação como outro comentário da própria PR, com um único bloco `json` e o conteúdo de `atestacao.json`. Registre o ID após `issuecomment-` no URL como `$COMMENT`. Preserve o parecer e a atestação sem edições. Se precisar corrigi-los, publique uma nova versão e vincule seu novo ID. O verificador autentica os dois comentários, confere o hash do parecer e compara o inventário com o estado atual da PR.
 
 ## Execução e retomada
 
@@ -46,7 +62,7 @@ gh workflow run sprint-b00.yml --repo saravejo/healdan --ref main \
   -f pull="$PR" -f head="$HEAD" -f attestation="$COMMENT"
 ```
 
-Use `publish=false` para ensaiar sem publicar. Registre o ID da execução e a tentativa. Se um job for cancelado, dispare de novo ou reexecute todos os jobs da tentativa. O verificador reconstrói o estado por metadados oficiais. Uma repetição equivalente reaproveita o check existente e uma nova tentativa para o mesmo escopo atualiza seu resultado, preservando seu ID. Mudança no HEAD, na base ou no histórico do Qodo exige revalidar a evidência afetada.
+Use `publish=false` para ensaiar sem publicar. Registre o ID da execução e a tentativa. Se um job for cancelado, dispare de novo ou reexecute todos os jobs da tentativa. O verificador reconstrói o estado por metadados oficiais. Uma repetição equivalente reaproveita o check existente. Se o GitHub recalcular o merge de teste com a mesma PR, a mesma base e o mesmo HEAD, revalide e publique com o ID existente. Mudança no HEAD, na base ou no histórico do Qodo exige revalidar a evidência afetada.
 
 Depois de obter a conclusão do workflow, execute o preflight com as credenciais autenticadas do coordenador. Ele verifica a proteção, a execução, a evidência atual, os jobs e o log oficial de publicação. Use o HEAD verificado também no comando de merge e acompanhe os checks da nova `main` antes de iniciar outra integração.
 

@@ -4,13 +4,10 @@ import argparse
 import hashlib
 from pathlib import Path
 import re
+import shutil
 import subprocess
-import sys
 import tarfile
 import zipfile
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from healdan.core import executable
 
 BAD_PATHS = re.compile(r"(^|/)(wiki-1\.4\.md|\.local-tools|\.verification|config/local\.json|\.env|transcripts)(/|$)", re.I)
 PRIVATE = re.compile(rb"(?m)^-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----\r?$|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|sk-ant-api[0-9]+-[A-Za-z0-9_-]{30,}")
@@ -28,10 +25,14 @@ def check(name, data, failures, reference_hash):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--packages", type=Path)
+    parser.add_argument("--require-distributions", action="store_true")
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent.parent
-    git = executable("git")
+    root = args.root.resolve()
+    git = shutil.which("git")
+    if git is None:
+        parser.error("git is required")
     reference = root / "wiki-1.4.md"
     reference_hash = hashlib.sha256(reference.read_bytes()).hexdigest() if reference.exists() else None
     failures, count = [], 0
@@ -40,7 +41,9 @@ def main():
     for raw in tracked.split(b"\0"):
         if raw:
             name = raw.decode("utf-8")
-            check(name, (root / name).read_bytes(), failures, reference_hash)
+            tracked_file = root / name
+            data = str(tracked_file.readlink()).encode() if tracked_file.is_symlink() else tracked_file.read_bytes()
+            check(name, data, failures, reference_hash)
             count += 1
     objects = subprocess.run(command + ["rev-list", "--objects", "--all"], capture_output=True, check=True).stdout
     seen = set()
@@ -59,19 +62,30 @@ def main():
         if (root / registry).exists() and (root / registry).stat().st_size:
             failures.append("Distribution knowledge registry must start empty: " + registry)
     if args.packages:
+        kinds = set()
         for package in args.packages.iterdir():
-            if package.suffix in {"whl", ".zip"} or package.suffix == ".whl":
+            if package.is_symlink() or not package.is_file():
+                failures.append("Unexpected distribution entry: " + package.name)
+                continue
+            if package.suffix in {".whl", ".zip"}:
+                if package.suffix == ".whl":
+                    kinds.add("wheel")
                 with zipfile.ZipFile(package) as archive:
                     for entry in archive.infolist():
                         if not entry.is_dir():
                             check(entry.filename, archive.read(entry), failures, reference_hash)
                             count += 1
             elif package.name.endswith(".tar.gz"):
+                kinds.add("sdist")
                 with tarfile.open(package) as archive:
                     for entry in archive.getmembers():
                         if entry.isfile():
                             check(entry.name, archive.extractfile(entry).read(), failures, reference_hash)
                             count += 1
+        if args.require_distributions and kinds != {"wheel", "sdist"}:
+            failures.append("Expected both a wheel and a source distribution")
+    elif args.require_distributions:
+        failures.append("Expected a distribution directory")
     for failure in sorted(set(failures)):
         print(failure)
     print(f"Audited {count} tracked/archive/historical entries; {len(failures)} findings")
