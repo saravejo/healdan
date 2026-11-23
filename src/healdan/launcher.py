@@ -20,10 +20,16 @@ from .tasks import get_session, get_task, require_active, task_path, validate_ev
 def runtime_version(vault):
     require(platform.system() == "Darwin", "Production sandbox launch requires macOS", 5)
     version = run([executable("srt"), "--version"]).stdout.decode().strip()
-    require(version == vault.policy["srt_version"], "srt version differs from pinned policy", 5)
-    node = run([executable("node"), "--version"]).stdout.decode().strip().lstrip("v")
-    require(tuple(map(int, node.split(".")[:3])) >= (22, 12, 0), "Node.js 22.12+ is required", 5)
+    node = run([executable("node"), "--version"]).stdout.decode().strip()
+    validate_runtime(vault, version, node)
     return version
+
+
+def validate_runtime(vault, version, node):
+    require(version == vault.policy["srt_version"], "srt version differs from pinned policy", 5)
+    parts = node.removeprefix("v").split(".")
+    require(len(parts) == 3 and all(part.isascii() and part.isdecimal() for part in parts) and
+            tuple(map(int, parts)) >= (22, 12, 0), "Node.js 22.12+ is required", 5)
 
 
 def settings(vault, writable, readable, *, network=False):
@@ -74,7 +80,8 @@ def _probe(vault):
         sentinel = "denial-probe-" + str(uuid4())
         targets = [secret, vault.root / sentinel, vault.common / sentinel,
                    vault.state / sentinel, Path(__file__).parent / sentinel, Path("/tmp/claude") / sentinel]
-        config = settings(vault, [allowed], [allowed, Path(sys.executable).resolve().parent.parent])
+        config = settings(vault, [allowed], [allowed, Path(sys.prefix), Path(sys.base_prefix),
+                                            Path(sys.executable).resolve().parent.parent])
         config_path = root / "sandbox.json"
         atomic(config_path, config)
         script = """import json, os, pathlib, socket, subprocess, sys

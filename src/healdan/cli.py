@@ -13,6 +13,7 @@ def parser():
     result.add_argument("--version", action="version", version=__version__)
     result.add_argument("--vault", default=".")
     result.add_argument("--state", help="External controller state directory")
+    result.add_argument("--vault-id", help="Require the selected vault identity")
     commands = result.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup")
     setup.add_argument("--interactive", action="store_true")
@@ -136,6 +137,9 @@ def parser():
     attest = maintenance.add_parser("attest")
     attest.add_argument("trial")
     attest.add_argument("evidence", type=Path)
+    environment = maintenance.add_parser("trial-environment", help="Measure the installed native trial environment")
+    environment.add_argument("trial")
+    environment.add_argument("--profile", type=Path)
     hold = maintenance.add_parser("hold")
     hold.add_argument("material")
     hold.add_argument("--owner", required=True)
@@ -318,6 +322,10 @@ def dispatch(args):
             return maintenance.schedule(vault, activate=args.activate)
         if args.action == "attest":
             return maintenance.attest(vault, args.trial, read_json(args.evidence))
+        if args.action == "trial-environment":
+            from .trials import environment
+            with vault.locked():
+                return environment(vault, args.trial, args.profile)
         if args.action == "hold":
             with vault.locked():
                 return custody.hold(vault, args.material, args.reason, args.owner, review_at=args.review_at)
@@ -362,6 +370,7 @@ def redirect(args, argv):
 
     repository = Repository.open(args.vault)
     binding = bound(repository, args.state)
+    require(args.vault_id is None or args.vault_id == binding["vault_id"], "The selected vault identity differs", 5)
     args.controller_selection = read_selection(repository.control, binding["vault_id"])
     if args.controller_selection:
         build = selected_build(repository, binding, args.controller_selection)

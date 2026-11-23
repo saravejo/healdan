@@ -1,6 +1,8 @@
 """Read the persisted formats required before changing a vault's controller."""
 from base64 import b64decode
+from pathlib import Path
 
+from .binding import Repository
 from .core import read_json, require, safe_path
 from .migration import PACKAGE_FORMATS
 from .regression import CASE_REGISTRY, _compatible_case
@@ -23,7 +25,7 @@ def _journal(vault):
             all(isinstance(name, str) and name in journal["files"] for name in journal["written"]),
             "Unsupported integration journal entries", 5)
     for name, body in journal["files"].items():
-        safe_path(vault.root, name)
+        safe_path(vault.repository.primary, name)
         b64decode(body, validate=True)
     return "healdan-transaction-legacy-v1"
 
@@ -35,21 +37,36 @@ def _package_format(payload):
     return PACKAGE_FORMATS.get(frozenset(payload))
 
 
+def _operating_roots(vault):
+    from .tasks import all_tasks
+
+    roots = {vault.root, vault.repository.primary}
+    for task in all_tasks(vault):
+        if task["state"] not in {"closed", "cancelled"} and not task.get("worktree_removed"):
+            worktree = Repository.open(Path(task["worktree"]))
+            require(worktree.common == vault.common and worktree.primary == vault.repository.primary,
+                    "Active task worktree belongs to another Git repository", 5)
+            roots.add(worktree.root)
+    return sorted(roots)
+
+
 def check(vault, capabilities):
     def needs(kind, value):
         require(any(type(value) is type(supported) and value == supported for supported in capabilities[kind]),
                 f"Build cannot read current {kind} format: {value!r}", 5)
 
-    vault.check_registries()
     needs("binding", vault.binding["format"])
     needs("policy", vault.policy["schema_version"])
     config = read_json(safe_path(vault.state, "config.json"), {})
     require(isinstance(config, dict), "Invalid external configuration", 5)
     needs("config", config.get("schema_version", 1))
-    for row in vault.rows(CASE_REGISTRY):
-        needs("case", row.get("format"))
-        _compatible_case({key: value for key, value in row.items() if key != "approval"})
-    payloads = [row.get("payload") for row in vault.rows("control/approvals/packages.jsonl")]
+    payloads = []
+    for root in _operating_roots(vault):
+        vault.check_registries(root=root)
+        for row in vault.rows(CASE_REGISTRY, root=root):
+            needs("case", row.get("format"))
+            _compatible_case({key: value for key, value in row.items() if key != "approval"})
+        payloads.extend(row.get("payload") for row in vault.rows("control/approvals/packages.jsonl", root=root))
     for path in sorted(safe_path(vault.control, "packages").glob("*.json")):
         package = read_json(safe_path(vault.control, "packages/" + path.name, exists=True))
         approval = package.get("approval")

@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+import os
 from pathlib import Path
 import plistlib
 import sys
@@ -55,7 +56,16 @@ class VaultBinding(VaultTest):
         sibling = self.base / "another vault"
         git(self.root, "clone", "--no-local", str(self.root), str(sibling))
         initialize(sibling, self.base / "other vault state")
-        self.assertNotEqual(Vault(sibling).identity, self.vault.identity)
+        sibling_id = Vault(sibling).identity
+        self.assertNotEqual(sibling_id, self.vault.identity)
+        with patch.dict(os.environ, {"GIT_DIR": str(self.vault.common), "GIT_WORK_TREE": str(sibling),
+                                     "GIT_INDEX_FILE": str(self.vault.common / "index")}):
+            self.assertEqual(Vault(sibling).identity, sibling_id)
+            with self.assertRaisesRegex(Blocked, "differs"):
+                Vault(sibling, self.state)
+            git(sibling, "config", "--local", "healdan.fixture", "selected")
+            self.assertEqual(git(self.root, "config", "--get", "healdan.fixture", check=False), "")
+            self.assertEqual(git(sibling, "config", "--get", "healdan.fixture"), "selected")
         empty = self.base / "new zip vault"
         initialize(empty, self.base / "new zip state")
         self.assertIsNone(Vault(empty).head())
@@ -151,8 +161,10 @@ class VaultBinding(VaultTest):
     def test_rebind_separately_and_together_preserves_worktrees_and_signed_custody(self):
         self.age()
         destination = self.state / "backup location"
+        external_destination = self.base / "fixed backup location"
         destination.mkdir()
-        self.vault.config["backup_destinations"] = [str(destination)]
+        external_destination.mkdir()
+        self.vault.config["backup_destinations"] = [str(destination), str(external_destination)]
         atomic(self.vault.config_path, self.vault.config)
         backup = backups.create(self.vault, "long", utc() + timedelta(days=2))
         material_file = self.vault.control / "materials.json"
@@ -178,6 +190,18 @@ class VaultBinding(VaultTest):
                 state.rename(next_state)
             with self.assertRaises(Blocked):
                 Vault(next_root, next_state)
+            if not move_state:
+                offline = external_destination.with_name("disconnected backup")
+                external_destination.rename(offline)
+                with self.assertRaisesRegex(Blocked, "configuration path is unavailable"):
+                    binding.rebind(next_root, next_state)
+                offline.rename(external_destination)
+                fake_home = self.base / "launchd home"
+                installed = fake_home / "Library/LaunchAgents" / plist.name
+                atomic(installed, b"synthetic installed plist")
+                with patch("healdan.relocation.Path.home", return_value=fake_home):
+                    with self.assertRaisesRegex(Blocked, "Unload and remove"):
+                        binding.rebind(next_root, next_state)
             if move_state:
                 state.mkdir()
                 with self.assertRaisesRegex(Blocked, "still occupied"):
@@ -192,6 +216,16 @@ class VaultBinding(VaultTest):
             preview = binding.rebind(next_root, next_state)
             self.assertTrue(any(worktree["needs_repair"] for worktree in preview["worktrees"]))
             choose_state = next_state if move_state else None
+            if not move_state:
+                def interrupt(path, data):
+                    if path.name == binding.MARKER and path.parent != next_state:
+                        raise OSError("interrupted reassociation after updating the state")
+                    atomic(path, data)
+
+                with patch("healdan.binding.atomic", side_effect=interrupt), self.assertRaises(OSError):
+                    binding.rebind(next_root, choose_state, preview["confirmation"])
+                with self.assertRaisesRegex(Blocked, "interrupted"):
+                    Vault(next_root, next_state)
             binding.rebind(next_root, choose_state, preview["confirmation"])
             vault = Vault(next_root)
             self.assertEqual(vault.identity, self.vault.identity)

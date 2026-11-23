@@ -4,12 +4,13 @@ import csv
 import hashlib
 from io import StringIO
 from pathlib import Path
+import sys
 from unittest.mock import patch
 import zipfile
 
 from support import VaultTest
 import healdan
-from healdan import binding, build, installation, maintenance
+from healdan import binding, build, installation, maintenance, tasks
 from healdan.core import Blocked, Vault, atomic, decode, git, run
 from healdan.setup import initialize
 
@@ -70,6 +71,13 @@ class ImmutableInstallation(VaultTest):
         self.assertEqual(self.identity(b.entry_point), a.identity)
         self.assertEqual(maintenance.schedule_definitions(self.vault)[0]["ProgramArguments"][0], str(a.entry_point))
         self.assertEqual(maintenance.schedule_definitions(Vault(sibling))[0]["ProgramArguments"][0], str(b.entry_point))
+        verifier = Path(__file__).resolve().parent.parent / "scripts/release_check.py"
+        release = run([sys.executable, "-I", verifier, "--vault", sibling], cwd=verifier.parent.parent, check=False)
+        self.assertEqual(release.returncode, 5)
+        result = decode(release.stdout)
+        self.assertEqual(result["build"], b.identity)
+        self.assertTrue(result["publication_audit"])
+        self.assertFalse(result["stable_release_allowed"])
 
     def test_concurrent_repeat_reuses_verified_environment(self):
         wheel = wheel_fixture(self.base / "same wheel", "same")
@@ -159,3 +167,21 @@ class ImmutableInstallation(VaultTest):
             self.assertEqual(legacy.read_bytes(), b"existing shared controller environment")
             self.assertEqual((default / "config.json").read_bytes(), existing_config)
             self.assertFalse((default / binding.MARKER).exists())
+
+    def test_activation_from_an_older_worktree_checks_primary_and_active_tasks(self):
+        a, b = (self.stage(variant) for variant in ("compatible old", "compatible new"))
+        self.activate(a)
+        branch = self.base / "older worktree"
+        git(self.root, "worktree", "add", "--detach", str(branch))
+        task = tasks.create(self.vault, "Task with a divergent registry")
+        selection = (self.vault.control / build.SELECTION).read_bytes()
+        for target in (self.root, Path(task["worktree"])):
+            registry = target / "wiki/control/query-cases.jsonl"
+            original = registry.read_bytes()
+            atomic(registry, b'{"id":"Q-0001","format":"future-case"}\n')
+            with self.assertRaisesRegex(Blocked, "cannot read current case format"):
+                self.activate(b, Vault(branch))
+            self.assertEqual((self.vault.control / build.SELECTION).read_bytes(), selection)
+            atomic(registry, original)
+        self.activate(b, Vault(branch))
+        self.assertEqual(self.identity(a.entry_point), b.identity)

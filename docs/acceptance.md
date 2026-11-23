@@ -1,10 +1,9 @@
 # Acceptance
 
-Stable v1.0.0 is blocked until mandatory automated tests, real macOS sandbox
-checks, authenticated Claude recovery and launchd trials have passed at the
-release commit. A skipped test is not evidence of success. Trial receipts bind
-commit, platform, dependency versions, test identity and artifacts and require
-a human SSH signature. CI publishes test output separately from native trials.
+Stable v1.0.0 requires a successful CI attempt for the release commit and
+verified native trials for the active controller. CI exercises the real macOS
+sandbox. Personal trial receipts bind the vault, build, profile, measured
+environment and artifacts with a human SSH signature.
 
 | ID | Requirement | Evidence required |
 |---|---|---|
@@ -48,15 +47,28 @@ and one UTF-8 byte over it, page/context independence, resumed clocks, full
 runtime denial including subprocesses, signing socket exclusion, clone/ZIP
 setup twice, spaces in paths, and original source bytes.
 
-Run `python -m unittest discover -s tests -v`. macOS CI installs the pinned
-runtime and age and runs real integration tests. Native trials must use a
-disposable external profile, never the ordinary user profile. Required trials:
-`claude-auth`, `native-resume`, `native-cleanup`, `offline-recovery`, `launchd`.
-Record their command logs, before/after artifact hashes, actual UUID/usage,
-versions and UTC times with `maintenance attest`. Cleanup trials include two
-projects and old/recent sessions; schedules include sleep, logout and timezone
-changes. No authenticated credentials are placed in CI.
+Run `python -m unittest discover -s tests -v` for local development. CI builds
+one wheel and runs it on Windows, Linux and macOS with real Git, OpenSSH and
+age. The macOS profile uses the pinned sandbox runtime. Each profile publishes
+the outcome of every required test for the wheel, commit and attempt.
 
-Release check: `python scripts/release_check.py --vault .`.
-Publication does not imply stable acceptance. No stable tag may be created
-while a mandatory trial is missing, failed, stale, or unsigned.
+Use a disposable external profile for `claude-auth`, `native-resume` and
+`native-cleanup`. The other required trials are `offline-recovery` and
+`launchd`. Before running each trial, capture its environment with
+`maintenance trial-environment TRIAL` and add the result to the `environment`
+field of the evidence file. Save command logs, before and after artifact
+hashes, actual UUID and usage where applicable, the procedure and UTC times.
+Record time in `started_at` and `completed_at` and each artifact as `path` and
+`sha256` in `artifacts`. Set `platform` to `Darwin` and `passed` to `true`
+after a passing run. If you measured a specific `--profile`, include its path
+as `profile`.
+Use `maintenance attest TRIAL EVIDENCE.json` to compare the current environment
+to the recorded measurements and sign the evidence. Cleanup trials cover two
+projects with old and recent sessions. Schedule trials cover sleep, logout and
+timezone changes. Keep authenticated credentials in the personal environment.
+
+Activate the wheel from the successful Actions attempt for the release commit.
+Run `python scripts/release_check.py --vault PATH --ci-run RUN_ID`. Use
+`--ci-attempt ATTEMPT` to require the current attempt number explicitly. The
+check verifies the wheel, every required test outcome, the selected vault and
+its Git history. A stable tag requires `stable_release_allowed` to be `true`.

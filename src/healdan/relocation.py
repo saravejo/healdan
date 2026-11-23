@@ -1,10 +1,12 @@
 """Preflight a moved vault without rewriting signed custody or historical records."""
 import base64
+import os
 from pathlib import Path
+import platform
 import plistlib
 
 from .binding import CONFIG_PATHS, CONFIG_ROOTS, relocated_path
-from .core import atomic, digest, git, read_json, require, safe_path
+from .core import atomic, digest, executable, git, read_json, require, run, safe_path
 
 SESSION_PATHS = ("proposal", "active_profile", "recovery_profile")
 
@@ -97,10 +99,10 @@ def _references(repository, binding, worktrees):
         for value in (values or []) if name in CONFIG_ROOTS else ([values] if values else []):
             original = Path(value)
             target = relocated_path(original, binding)
-            if target != original:
+            if target != original or name in CONFIG_ROOTS:
                 target = safe_path(target.parent, target.name)
                 available = target.is_dir() if name in CONFIG_ROOTS else target.is_file()
-                require(available, "Relocated configuration path is unavailable: " + str(target), 5)
+                require(available, "Reassociation configuration path is unavailable: " + str(target), 5)
                 report("config:" + name, original, target)
 
     registered = {Path(tree["path"]) for tree in worktrees}
@@ -129,11 +131,12 @@ def _references(repository, binding, worktrees):
         for copy in record["copies"]:
             original = Path(copy["root"])
             target = relocated_path(original, binding)
-            if target == original:
+            status = copy.get("status")
+            ciphertext = status == "present" and copy["kind"] == "ciphertext"
+            if target == original and not ciphertext:
                 continue
             file = safe_path(target, copy["path"])
-            status = copy.get("status")
-            if status == "present" and copy["kind"] == "ciphertext":
+            if ciphertext:
                 require(file.is_file(), "Relocated ciphertext is unavailable: " + str(file), 5)
             if status == "present" and file.exists():
                 # A Git worktree backlink is repaired in place. Its archived bytes stay in custody.
@@ -162,8 +165,14 @@ def _plists(binding):
         args = value.get("ProgramArguments")
         require(label.startswith("org.healdan.") and path.name == label + ".plist" and isinstance(args, list) and
                 len(args) >= 6 and isinstance(args[0], str) and Path(args[0]).is_absolute() and
-                args[1] == "--vault" and args[3] == "--state" and
-                args[5:] in (["lint"], ["maintenance", "daily"]), "Unrecognized launchd definition: " + str(path), 5)
+                args[1] == "--vault" and args[3] == "--state", "Unrecognized launchd definition: " + str(path), 5)
+        command = args[5:]
+        if command[0] == "--vault-id":
+            require(command[1:2] == [binding["vault_id"]], "Launchd definition has a different vault identity", 5)
+            command = command[2:]
+        else:
+            args[5:5] = ["--vault-id", binding["vault_id"]]
+        require(command in (["lint"], ["maintenance", "daily"]), "Unrecognized launchd command: " + str(path), 5)
         args[2] = str(relocated_path(args[2], binding))
         args[4] = str(relocated_path(args[4], binding))
         require(Path(args[2]) == Path(binding["location"]["root"]) and Path(args[4]) == state,
@@ -179,12 +188,24 @@ def _plists(binding):
         updated = plistlib.dumps(value)
         if plistlib.loads(original) == value:
             continue
-        installed = Path.home() / "Library/LaunchAgents" / path.name
-        require(not installed.exists() and not installed.is_symlink(),
-                "Unload and remove the installed LaunchAgent before reassociation: " + str(installed), 5)
         plists.append({"name": path.name, "before": digest(original), "after": digest(updated),
                        "value": base64.b64encode(updated).decode("ascii")})
     return plists
+
+
+def _validate_jobs(old, new):
+    state = Path(new["location"]["state"])
+    labels = {path.stem for path in safe_path(state, "launchd").glob("org.healdan.*.plist")}
+    for job in ("lint", "daily"):
+        labels.add(f"org.healdan.{old['vault_id']}.{job}")
+        for location in [old["location"], *old["previous"]]:
+            labels.add("org.healdan." + digest(location["common"])[:12] + "." + job)
+    for label in sorted(labels):
+        installed = Path.home() / "Library/LaunchAgents" / (label + ".plist")
+        loaded = (platform.system() == "Darwin" and
+                  run([executable("launchctl"), "print", f"gui/{os.getuid()}/{label}"], check=False).returncode == 0)
+        require(not loaded and not installed.exists() and not installed.is_symlink(),
+                "Unload and remove the installed LaunchAgent before reassociation: " + label, 5)
 
 
 def _validate_move(repository, old, new):
@@ -213,6 +234,7 @@ def _validate_move(repository, old, new):
                     "External state overlaps a historical vault path: " + str(historic_git), 5)
     journal = read_json(safe_path(repository.control, "transaction.json"))
     require(not journal or journal.get("status") == "complete", "Recover the integration before reassociation", 5)
+    _validate_jobs(old, new)
 
 
 def relocation_plan(repository, old, new):

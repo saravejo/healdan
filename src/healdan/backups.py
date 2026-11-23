@@ -6,7 +6,7 @@ from uuid import uuid4
 import re
 import tempfile
 
-from .core import Blocked, atomic, canonical, decode, digest, executable, git, read_json, require, run, safe_path, stamp, utc
+from .core import Blocked, atomic, canonical, decode, digest, git, git_bytes, read_json, require, safe_path, stamp, utc
 from .custody import decrypt, encrypt, materials, retention_deadline, restore_tree, save_material
 from .signing import envelope, verify
 
@@ -22,7 +22,7 @@ def history_bundle(vault):
                 "Historical custody/secret paths require a reviewed preservation or purge plan", 5)
         if git(vault.root, "cat-file", "-t", oid) != "blob":
             continue
-        body = run([executable("git"), "-C", vault.root, "cat-file", "blob", oid]).stdout
+        body = git_bytes(vault.root, "cat-file", "blob", oid)
         require(not re.search(rb"(?m)^-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----\r?$", body),
                 "Private key material detected in history", 5)
         if name.endswith((".json", ".jsonl")) and b'"sessionId"' in body and (b'"assistant"' in body or b'"user"' in body):
@@ -59,7 +59,7 @@ def create(vault, kind, expires_at, member_ids=(), *, now=None):
                 "A backup destination is offline", 5)
         files = {}
         names = set(vault.inputs())
-        tracked = run([executable("git"), "-C", vault.root, "ls-files", "-z"]).stdout.decode("utf-8")
+        tracked = git_bytes(vault.root, "ls-files", "-z").decode("utf-8")
         names.update(p for p in tracked.split("\0") if p)
         for name in sorted(names):
             data = safe_path(vault.root, name, exists=True).read_bytes()

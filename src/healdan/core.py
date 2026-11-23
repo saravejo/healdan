@@ -183,7 +183,13 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
 
 
 def git_bytes(root, *args, check=True):
-    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], check=check).stdout
+    # The explicit vault path selects the real worktree, refs, objects and index.
+    overrides = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
+                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_GRAFT_FILE",
+                 "GIT_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
+                 "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
+    env = {key: value for key, value in os.environ.items() if key.upper() not in overrides}
+    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], env=env, check=check).stdout
 
 
 def git(root, *args, check=True):
@@ -287,13 +293,14 @@ class Vault:
         from .binding import relocated_path
         return relocated_path(path, self.binding)
 
-    def rows(self, name, *, include_bytes=False):
+    def rows(self, name, *, include_bytes=False, root=None):
         required = Path(name).as_posix() in REQUIRED_REGISTRIES
-        return read_jsonl(safe_path(self.root, name, exists=required), required=required, include_bytes=include_bytes)
+        return read_jsonl(safe_path(root if root is not None else self.root, name, exists=required),
+                          required=required, include_bytes=include_bytes)
 
-    def check_registries(self):
+    def check_registries(self, *, root=None):
         for name in REQUIRED_REGISTRIES:
-            self.rows(name)
+            self.rows(name, root=root)
 
     def head(self):
         result = git(self.root, "rev-parse", "--verify", "HEAD", check=False)
@@ -339,7 +346,7 @@ class Vault:
                 "An integration needs recovery", 5)
 
     def clean_inputs(self):
-        tracked = run([executable("git"), "-C", self.root, "ls-files", "-z"]).stdout.decode("utf-8").split("\0")
+        tracked = git_bytes(self.root, "ls-files", "-z").decode("utf-8").split("\0")
         require(set(self.inputs()) <= set(tracked), "Commit preserved sources and canonical inputs before creating a task", 5)
         changed = git(self.root, "diff", "HEAD", "--name-only", "--", "wiki", "resources/sources", "config", "templates", "control/approvals")
         require(not changed, "Canonical task inputs have uncommitted changes", 5)

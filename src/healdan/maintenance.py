@@ -5,48 +5,8 @@ import platform
 import plistlib
 
 from .build import active
-from .core import Blocked, atomic, digest, executable, read_json, require, run, stamp, utc
-from .signing import human_sign, trusted_signers, verify
-
-TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", "launchd")
-
-
-def attest(vault, name, evidence):
-    with vault.locked():
-        return _attest(vault, name, evidence)
-
-
-def _attest(vault, name, evidence):
-    require(name in TRIALS, "Unknown native acceptance trial", 2)
-    require(evidence.get("platform") == "Darwin" and evidence.get("commit") == vault.head() and
-            evidence.get("passed") is True and evidence.get("versions") and evidence.get("artifacts") and
-            evidence.get("procedure") and evidence.get("started_at") and evidence.get("completed_at"),
-            "Trial needs real macOS evidence, exact commit, procedure, times, versions and artifact hashes", 2)
-    require(utc(evidence["completed_at"]) >= utc(evidence["started_at"]), "Invalid trial times", 2)
-    for artifact in evidence["artifacts"]:
-        path = Path(artifact["path"])
-        require(path.is_file() and digest(path.read_bytes()) == artifact["sha256"], "Trial artifact mismatch")
-    payload = {"name": name, **evidence}
-    approval = human_sign(vault, payload, "trial")
-    atomic(vault.control / "trials" / (name + ".json"), approval)
-    return approval
-
-
-def trial_status(vault):
-    results = []
-    for name in TRIALS:
-        try:
-            value = read_json(vault.control / "trials" / (name + ".json"))
-            payload = verify(value, "trial", trusted_signers(vault))
-            require(payload.get("name") == name and payload.get("commit") == vault.head() and payload.get("passed") is True,
-                    "Trial is stale or failed")
-            for artifact in payload["artifacts"]:
-                require(Path(artifact["path"]).is_file() and digest(Path(artifact["path"]).read_bytes()) == artifact["sha256"],
-                        "Trial artifact is unavailable or changed")
-            results.append({"name": name, "passed": True, "reason": "Signed native evidence verified"})
-        except (Blocked, OSError, KeyError, TypeError) as exc:
-            results.append({"name": name, "passed": False, "reason": str(exc)})
-    return results
+from .core import Blocked, atomic, read_json, require, run, utc
+from .trials import TRIALS, attest, status as trial_status
 
 
 def daily(vault, now=None):
@@ -93,7 +53,7 @@ def schedule_definitions(vault, build=None):
         label = f"org.healdan.{vault.identity}.{job}"
         command = ["lint"] if job == "lint" else ["maintenance", "daily"]
         definitions.append({"Label": label, "ProgramArguments": [str(build.entry_point), "--vault", str(vault.repository.primary),
-                 "--state", str(vault.state), *command], "StartCalendarInterval": calendar,
+                 "--state", str(vault.state), "--vault-id", vault.identity, *command], "StartCalendarInterval": calendar,
                  "StandardOutPath": str(vault.state / (job + ".out")),
                  "StandardErrorPath": str(vault.state / (job + ".err"))})
     return definitions
