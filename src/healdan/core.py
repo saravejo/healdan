@@ -69,16 +69,29 @@ def read_json(path, default=None):
     return decode(Path(path).read_bytes()) if Path(path).exists() else default
 
 
-def read_jsonl(path):
-    if not Path(path).exists():
+def parse_jsonl(data, path):
+    if not data:
         return []
+    lines = data.removesuffix(b"\n").split(b"\n")
     rows = []
-    for number, line in enumerate(Path(path).read_bytes().splitlines(), 1):
+    for number, line in enumerate(lines, 1):
         require(bool(line.strip()), f"Blank JSONL row at {path}:{number}")
-        row = decode(line)
+        try:
+            row = decode(line)
+        except Blocked as exc:
+            raise Blocked(f"{path}:{number}: {exc}", exc.code) from exc
         require(isinstance(row, dict), f"JSONL row is not an object: {path}:{number}")
         rows.append(row)
     return rows
+
+
+def read_jsonl(path):
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    return parse_jsonl(data, path)
 
 
 def jsonl(rows):
@@ -154,8 +167,12 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
     return result
 
 
+def git_bytes(root, *args, check=True):
+    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], check=check).stdout
+
+
 def git(root, *args, check=True):
-    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], check=check).stdout.decode("utf-8").strip()
+    return git_bytes(root, *args, check=check).decode("utf-8").strip()
 
 
 @contextlib.contextmanager

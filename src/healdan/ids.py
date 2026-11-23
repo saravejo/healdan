@@ -2,7 +2,7 @@
 import re
 from uuid import UUID
 
-from .core import REGISTRIES, atomic, decode, git, read_json, require
+from .core import REGISTRIES, atomic, git, git_bytes, parse_jsonl, read_json, require
 from .signing import trusted_signers, verify
 
 PREFIXES = "FCDLQMS"
@@ -39,13 +39,17 @@ def published(vault):
     rows = [row for name in REGISTRIES for row in vault.rows(name)]
     current = inventory(rows)
     historic = {row["id"] for row in rows}
-    commits = git(vault.root, "log", "--all", "--format=%H", "--", *REGISTRIES, check=False).splitlines()
-    for commit in set(commits):
-        for path in REGISTRIES:
-            content = git(vault.root, "show", commit + ":" + path, check=False)
-            for line in content.splitlines():
-                if line.strip():
-                    historic.add(decode(line)["id"])
+    commits = git(vault.root, "log", "--all", "--full-history", "--format=%H", "--", *REGISTRIES).splitlines()
+    for commit in commits:
+        tree = git_bytes(vault.root, "ls-tree", "-z", "--full-tree", commit, "--", *REGISTRIES)
+        for entry in tree.split(b"\0")[:-1]:
+            info, name = entry.split(b"\t", 1)
+            mode, kind, oid = info.split()
+            path = f"{commit}:{name.decode('utf-8')}"
+            require(kind == b"blob" and mode in {b"100644", b"100755"},
+                    "Historical registry is not a regular file: " + path)
+            content = git_bytes(vault.root, "cat-file", "blob", oid.decode("ascii"))
+            historic.update(row["id"] for row in parse_jsonl(content, path))
     spellings = {}
     approved_aliases = aliases(vault)
     for value in sorted(historic):
