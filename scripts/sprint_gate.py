@@ -355,6 +355,7 @@ def qodo_anchor_hashes(body, bot_id, app_id):
 
 
 def qodo_archive(api, scope, archive, bot_id, app_id, coordinator):
+    require(archive.get("event") is None, "A Qodo archive cannot assign a GitHub deletion event to a comment")
     kind, row = archive["kind"], archive["record"]
     require(kind in ("issue", "review", "inline") and row["user"]["id"] == bot_id and row["user"]["type"] == "Bot" and
             (row.get("performed_via_github_app") or {}).get("id") == app_id, "Archived Qodo record has an unexpected identity")
@@ -367,8 +368,8 @@ def qodo_archive(api, scope, archive, bot_id, app_id, coordinator):
     require((item, body_hash) in qodo_anchor_hashes(anchor["body"], bot_id, app_id),
             "The archived Qodo body must match a durable, unedited GitHub hash record")
     record, _ = qodo_record(row, kind)
-    record["archive"] = {"anchor": anchor_id, "sha256": body_hash, "event": archive.get("event")}
-    return f"{kind}:{item}", body_hash, record, anchor["created_at"]
+    record["archive"] = {"anchor": anchor_id, "sha256": body_hash}
+    return f"{kind}:{item}", body_hash, record
 
 
 def qodo_snapshot(api, scope, bot_id, app_id, archives=(), coordinator=None):
@@ -404,19 +405,15 @@ def qodo_snapshot(api, scope, bot_id, app_id, archives=(), coordinator=None):
             from_bot = all((edit["editor"] or {}).get("databaseId") == bot_id for edit in edits if edit["editedAt"] == last_edit)
             if review and review[0] == scope.head and app is not None and from_bot:
                 completions.append(record_key)
-    events = {row["id"]: row["createdAt"] for row in api.deleted_qodo_comments(scope.pull, bot_id)}
+    require(next(api.deleted_qodo_comments(scope.pull, bot_id), None) is None,
+            "GitHub reports a Qodo deletion event without the deleted comment ID")
     for archive in archives:
-        key, body_hash, record, anchored_at = qodo_archive(api, scope, archive, bot_id, app_id, coordinator)
-        event = archive.get("event")
-        if event is not None:
-            require(event in events and anchored_at <= events[event], "Archived Qodo body is not anchored before its deletion event")
-            del events[event]
+        key, body_hash, record = qodo_archive(api, scope, archive, bot_id, app_id, coordinator)
         archived_key = f"{key}/snapshot:{body_hash}"
         require(archived_key not in records, "Duplicate archived Qodo record")
         records[archived_key] = record
         reconciled.add((number(archive["record"]["id"]), body_hash))
     require(records, "No authenticated Qodo history is available")
-    require(not events, "A Qodo comment was deleted and its history is unavailable")
     require(observed <= reconciled, "A previously recorded Qodo snapshot is missing from the reconciled history")
     require(completions, "No authenticated Qodo completion is bound to the current head")
     return records, sorted(completions)
