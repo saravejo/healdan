@@ -111,51 +111,11 @@ jobs:
             python -m unittest scripts.test_sprint_gate -v
           '
 
-  package-build:
-    name: sprint-b00 package build
-    needs: prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions: {}
-    outputs:
-      artifact: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.12'
-      - name: Install build tool
-        run: python -I -m pip install build
-      - name: Build distributions from the exact public pull request commit
-        env:
-          PR: ${{ needs.prepare.outputs.pull }}
-          HEAD_SHA: ${{ needs.prepare.outputs.head }}
-          GIT_TERMINAL_PROMPT: '0'
-          GIT_CONFIG_NOSYSTEM: '1'
-          GIT_CONFIG_GLOBAL: /dev/null
-        shell: bash
-        run: |
-          git init candidate
-          cd candidate
-          git -c credential.helper= fetch --no-tags https://github.com/saravejo/healdan.git "refs/pull/$PR/head"
-          test "$(git rev-parse FETCH_HEAD)" = "$HEAD_SHA"
-          git -c core.hooksPath=/dev/null checkout --detach "$HEAD_SHA"
-          printf '::stop-commands::%s\n' "$(cat /proc/sys/kernel/random/uuid)"
-          candidate_home=$(mktemp -d)
-          env -i PATH="$PATH" HOME="$candidate_home" bash -euo pipefail -c '
-            python -I -m build
-          '
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        id: upload
-        with:
-          name: sprint-b00-distributions-${{ github.run_attempt }}
-          path: candidate/dist
-          if-no-files-found: error
-
   package:
     name: sprint-b00 package
-    needs: [prepare, package-build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -164,12 +124,15 @@ jobs:
           ref: ${{ github.sha }}
           path: policy
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          artifact-ids: ${{ needs.package-build.outputs.artifact }}
-          path: dist
-          merge-multiple: true
-      - name: Audit candidate files and packages with protected policy
+      - name: Install public build tools in the builder image
+        shell: bash
+        run: |
+          docker build --pull --tag sprint-b00-builder - <<'DOCKERFILE'
+          FROM python:3.12-slim-bookworm
+          RUN python -m pip install --no-cache-dir build 'setuptools>=77' wheel
+          DOCKERFILE
+          docker image inspect --format '{{.Id}}' sprint-b00-builder
+      - name: Build without network or host mounts, then audit locally
         env:
           PR: ${{ needs.prepare.outputs.pull }}
           HEAD_SHA: ${{ needs.prepare.outputs.head }}
@@ -183,7 +146,23 @@ jobs:
           test "$(git -C candidate rev-parse FETCH_HEAD)" = "$HEAD_SHA"
           git -C candidate -c core.hooksPath=/dev/null checkout --detach "$HEAD_SHA"
           printf '::stop-commands::%s\n' "$(cat /proc/sys/kernel/random/uuid)"
-          python3 -I policy/scripts/audit_publication.py --root candidate --packages dist --require-distributions
+          output=$(mktemp -d "$RUNNER_TEMP/sprint-package.XXXXXXXX")
+          container=$(docker create --interactive --network none --user 65534:65534 \
+            --cap-drop ALL --security-opt no-new-privileges --env HOME=/tmp sprint-b00-builder sh -eu -c '
+              mkdir /tmp/source /tmp/dist
+              tar --extract --file - --no-same-owner --no-same-permissions --directory /tmp/source
+              python -I -m build --no-isolation --outdir /tmp/dist /tmp/source
+            ')
+          trap 'docker rm -f "$container" >/dev/null' EXIT
+          if ! tar --create --file - --exclude=./.git --directory candidate . |
+              docker start --attach --interactive "$container" > "$output/build.log" 2>&1; then
+            echo 'The isolated package build failed.' >&2
+            exit 1
+          fi
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
+          docker cp "$container:/tmp/dist/." - > "$output/distributions.tar" 2> "$output/copy.log"
+          python3 -I policy/scripts/audit_publication.py --root candidate \
+            --packages "$output/distributions.tar" --require-distributions
 
   gate:
     name: sprint-b00 gate

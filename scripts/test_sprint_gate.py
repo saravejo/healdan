@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -15,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from scripts import sprint_gate as gate
+from scripts import audit_publication, sprint_gate as gate
 
 
 HEAD = "a" * 40
@@ -33,6 +34,8 @@ AUDIT = 71
 PROOF = 72
 COMMAND = "python -m unittest scripts.test_sprint_gate -v"
 RESULT = "Reviewed regression passed in the checked-out SHA"
+DIST_WHEEL = "healdan-1.0.0.dev1-py3-none-any.whl"
+DIST_SDIST = "healdan-1.0.0.dev1.tar.gz"
 
 
 class GitHubFixture:
@@ -91,6 +94,20 @@ def qodo_review(head=HEAD, bugs=0, prefix=""):
     return (f"\n<h3>{prefix}Code Review by Qodo</h3>\n\n"
             f"<code>🐞 Bugs ({bugs})</code> <code>📘 Rule violations (0)</code> <code>{categories} (0)</code>\n\n"
             f"{findings}\n\n<!-- {gate.WEB}/commit/{head} -->\n")
+
+
+def example_distributions(root):
+    (root / "pyproject.toml").write_text('[project]\nname="healdan"\nversion="1.0.0.dev1"\n', encoding="utf-8")
+    dist = root / "dist"
+    dist.mkdir()
+    with zipfile.ZipFile(dist / DIST_WHEEL, "w") as wheel:
+        wheel.writestr("pkg/README.md", "public wheel content\n")
+    with tarfile.open(dist / DIST_SDIST, "w:gz") as source:
+        data = b"source distribution\n"
+        entry = tarfile.TarInfo("pkg/README.md")
+        entry.size = len(data)
+        source.addfile(entry, io.BytesIO(data))
+    return dist
 
 
 class SprintGateTests(unittest.TestCase):
@@ -288,8 +305,26 @@ class SprintGateTests(unittest.TestCase):
 
     def test_qodo_deleted_history_blocks(self):
         self.api.deleted = [{"id": "deletion-event", "createdAt": "2026-11-23T19:01:00Z"}]
-        with self.assertRaisesRegex(gate.Blocked, "was deleted"):
+        with self.assertRaisesRegex(gate.Blocked, "without the deleted comment ID"):
             self.snapshot()
+
+    def test_another_qodo_snapshot_cannot_discharge_an_unidentified_deletion_event(self):
+        row = qodo_row(10, "<h3>Qodo is busy working</h3>", html_url=f"{gate.WEB}/pull/{PULL}#issuecomment-10")
+        fingerprint = hashlib.sha256(row["body"].encode()).hexdigest()
+        anchor = 75
+        self.comment(anchor, f"Captured from bot GitHub {BOT}, App {QODO_APP}.\n| 10 | Progress | {fingerprint} |")
+        self.api.rows[self.issues].append(self.api.objects[f"{gate.REPO}/issues/comments/{anchor}"])
+        self.api.deleted = [{"id": "deletion-of-another-comment", "createdAt": "2026-11-23T19:01:00Z"}]
+        archive = {"kind": "issue", "record": row, "anchor": anchor, "event": "deletion-of-another-comment"}
+
+        for visible in (True, False):
+            with self.subTest(archived_comment_is_still_visible=visible):
+                if visible:
+                    self.api.rows[self.issues].append(row)
+                with self.assertRaisesRegex(gate.Blocked, "without the deleted comment ID"):
+                    gate.qodo_snapshot(self.api, SCOPE, BOT, QODO_APP, [archive], COORDINATOR)
+                if visible:
+                    self.api.rows[self.issues].remove(row)
 
     def test_item_without_acceptance_is_blocked(self):
         self.proposal[1]["aceite"] = "  "
@@ -459,16 +494,8 @@ class SprintGateTests(unittest.TestCase):
             scripts = candidate / "scripts"
             scripts.mkdir()
             (scripts / "audit_publication.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
-            dist = root / "dist"
-            dist.mkdir()
-            wheel_path = dist / "untrusted.whl"
-            with zipfile.ZipFile(wheel_path, "w") as wheel:
-                wheel.writestr("pkg/README.md", "public wheel content\n")
-            with tarfile.open(dist / "candidate.tar.gz", "w:gz") as source:
-                data = b"source distribution\n"
-                entry = tarfile.TarInfo("pkg/README.md")
-                entry.size = len(data)
-                source.addfile(entry, io.BytesIO(data))
+            dist = example_distributions(candidate)
+            wheel_path = dist / DIST_WHEEL
             subprocess.run([git, "-C", str(candidate), "init", "-q"], check=True)
             subprocess.run([git, "-C", str(candidate), "add", "scripts/audit_publication.py"], check=True)
             command = [sys.executable, "-I", str(protected_script), "--root", str(candidate),
@@ -480,6 +507,72 @@ class SprintGateTests(unittest.TestCase):
             audited = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(audited.returncode, 1, audited.stderr)
             self.assertIn("Forbidden publication path: pkg/.env", audited.stdout)
+
+    def test_publication_audit_rejects_extra_outputs_and_mismatched_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist = example_distributions(root)
+            extra = dist / "private.txt"
+            extra.write_text("discardable private output\n", encoding="utf-8")
+            failures = []
+            self.assertEqual(audit_publication.audit_packages(dist, root, True, failures, None), 0)
+            self.assertIn("Unexpected distribution entry: 'private.txt'", failures)
+            extra.unlink()
+            (dist / DIST_SDIST).rename(dist / "healdan-2.0.tar.gz")
+            failures = []
+            self.assertEqual(audit_publication.audit_packages(dist, root, True, failures, None), 0)
+            self.assertIn("Expected exactly one wheel and one source distribution", failures[0])
+
+    def test_builder_output_tar_is_audited_without_extracting_host_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist = example_distributions(root)
+            transport = root / "builder.tar"
+            with tarfile.open(transport, "w") as output:
+                output.add(dist, arcname=".")
+            failures = []
+            self.assertGreater(audit_publication.audit_packages(transport, root, True, failures, None), 0)
+            self.assertEqual(failures, [])
+            with tarfile.open(transport, "a") as output:
+                entry = tarfile.TarInfo("./local-output.whl")
+                entry.type = tarfile.SYMTYPE
+                entry.linkname = "../../outside.whl"
+                output.addfile(entry)
+            with patch.object(tarfile.TarFile, "extractfile", side_effect=AssertionError("Read unsafe transport")):
+                self.assertEqual(audit_publication.audit_packages(transport, root, True, failures, None), 0)
+            self.assertIn("Unsafe builder output entry: './local-output.whl'", failures)
+            self.assertFalse((root / "local-output.whl").exists())
+
+    def test_publication_audit_rejects_zip_and_tar_links_devices_and_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, entry_type in (("pkg/.env", stat.S_IFLNK), ("pkg/device", stat.S_IFCHR), ("../outside", stat.S_IFREG),
+                                     ("C:/outside", stat.S_IFREG)):
+                with self.subTest(format="ZIP", name=name):
+                    path = root / DIST_WHEEL
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (entry_type | 0o644) << 16
+                    with zipfile.ZipFile(path, "w") as archive:
+                        archive.writestr(info, "../../outside.key")
+                    failures = []
+                    with path.open("rb") as file, patch.object(zipfile.ZipFile, "read", side_effect=AssertionError("Read unsafe ZIP")):
+                        self.assertEqual(audit_publication.audit_zip(file, failures, None), 0)
+                    self.assertEqual(failures, [f"Unsafe ZIP entry: {name!r}"])
+            for name, entry_type in (("pkg/.env", tarfile.SYMTYPE), ("pkg/private.key", tarfile.LNKTYPE),
+                                     ("pkg/device", tarfile.CHRTYPE), ("../outside", tarfile.REGTYPE), ("/outside", tarfile.REGTYPE)):
+                with self.subTest(format="tar", name=name):
+                    path = root / DIST_SDIST
+                    info = tarfile.TarInfo(name)
+                    info.type = entry_type
+                    if info.issym() or info.islnk():
+                        info.linkname = "../../outside.key"
+                    with tarfile.open(path, "w:gz") as archive:
+                        archive.addfile(info)
+                    failures = []
+                    with path.open("rb") as file, patch.object(tarfile.TarFile, "extractfile", side_effect=AssertionError("Read unsafe tar")):
+                        self.assertEqual(audit_publication.audit_tar(file, failures, None), 0)
+                    self.assertEqual(failures, [f"Unsafe tar entry: {name!r}"])
 
     def test_untrusted_publisher_is_blocked(self):
         self.api.objects[self.status]["required_status_checks"]["checks"][0]["app_id"] = 123
