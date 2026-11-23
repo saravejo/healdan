@@ -5,11 +5,12 @@ import math
 from pathlib import Path
 
 from .core import Blocked, digest, require, safe_path, stamp, utc
-from .ids import identity, inventory
+from .ids import identity, registry_records
 from .signing import trusted_signers, verify
 
 LIVE = {"accepted", "hypothesis", "disputed"}
 STATES = LIVE | {"superseded", "rejected"}
+QUERY_FILTERS = {"entity", "property", "environment", "modality", "topic", "term"}
 
 
 def typed(value):
@@ -31,21 +32,24 @@ def claim_key(claim):
 class Knowledge:
     def __init__(self, vault, *, proposed=(), diagnostic=False):
         self.vault = vault
-        rows = vault.rows("wiki/claims.jsonl")
-        require(not inventory(rows)["collisions"], "Claim identity collision")
-        self.claims = {r["id"]: r for r in rows}
+        claims = "wiki/claims.jsonl"
+        self.claims = registry_records(claims, vault.rows(claims))
         self.by_identity = {identity(k): k for k in self.claims}
         self.sources = {}
-        source_rows = vault.rows("resources/sources/index.jsonl")
-        require(not inventory(source_rows)["collisions"], "Source identity collision")
-        for row in source_rows:
-            require(identity(row["id"])[0] == "F", "Source needs an F- ID")
+        sources = "resources/sources/index.jsonl"
+        for row in registry_records(sources, vault.rows(sources)).values():
             require(row.get("provenance") and row.get("classification"), "Missing source provenance/class")
             require(row["classification"] != "secret", "Secrets cannot be promoted as canonical sources")
             if row["classification"] != "common":
                 from .custody import validate_purpose
                 validate_purpose(row)
-            utc(row["captured_at"])
+            captured_at = row.get("captured_at")
+            message = f"Source {row['id']} captured_at requires an ISO timestamp with a UTC offset"
+            require(isinstance(captured_at, str), message)
+            try:
+                utc(captured_at)
+            except (Blocked, OverflowError, ValueError) as exc:
+                raise Blocked(message) from exc
             require(row["path"].startswith("resources/sources/"), "Source path outside source tree")
             body = safe_path(vault.root, row["path"], exists=True).read_bytes()
             require(len(body) == row["size"] and digest(body) == row["sha256"], "Source hash/size mismatch")
@@ -65,8 +69,7 @@ class Knowledge:
         for entry in vault.rows("control/approvals/packages.jsonl"):
             payload = verify(entry, "package", trusted_signers(vault))
             approved.update(payload.get("claim_digests", {}).values())
-        for row in rows:
-            require(identity(row["id"])[0] == "C", "Claim needs a C- ID")
+        for row in self.claims.values():
             require(row.get("state") in STATES, "Unknown claim state")
             required = ("statement",) if diagnostic else ("statement", "entity", "property", "environment")
             require(all(isinstance(row.get(k), str) and row[k].strip() for k in required), "Missing claim fields")
@@ -125,8 +128,7 @@ class Knowledge:
                 (not row.get("valid_to") or cutoff < utc(row["valid_to"])))
 
     def resolve(self, filters, cutoff, *, max_records=None):
-        allowed = {"entity", "property", "environment", "modality", "topic", "term"}
-        require(set(filters) <= allowed and all(isinstance(v, str) for v in filters.values()),
+        require(set(filters) <= QUERY_FILTERS and all(isinstance(v, str) for v in filters.values()),
                 "Unsupported query filter", 2)
         if max_records is not None and len(self.claims) > max_records:
             return {"code": 5, "outcome": "blocked", "ids": [], "value": None,

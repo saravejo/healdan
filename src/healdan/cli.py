@@ -146,6 +146,7 @@ def parser():
     restore.add_argument("destination", type=Path)
     migration = commands.add_parser("migration").add_subparsers(dest="action", required=True)
     migration.add_parser("inventory")
+    migration.add_parser("preview")
     migration.add_parser("purge-check")
     alias = migration.add_parser("sign-alias")
     alias.add_argument("input", type=Path)
@@ -160,7 +161,10 @@ def dispatch(args):
     from .signing import human_sign
     if args.command == "setup":
         return setup.initialize(args.vault, args.state, interactive=args.interactive)
-    vault = Vault(args.vault, args.state)
+    external_recovery = (args.command, getattr(args, "action", None)) in {
+        ("restore", None), ("backup", "verify"), ("session", "restore"), ("session", "approve-recovery")
+    }
+    vault = Vault(args.vault, args.state, operational=not external_recovery)
     if args.command == "doctor":
         result = setup.doctor(vault)
         return result, 0 if result["ready"] else 5
@@ -302,6 +306,10 @@ def dispatch(args):
     if args.command == "migration":
         if args.action == "inventory":
             return migration.inventory(vault)
+        if args.action == "preview":
+            result = migration.preview(vault)
+            pending = any(record["status"] == "pending" for record in result["cases"] + result["packages"])
+            return result, 5 if pending or result["inspection_sequence"]["status"] == "pending" else 0
         if args.action == "purge-check":
             result = migration.purge_check(vault)
             return result, 0 if result["eligible_for_review"] else 5

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from healdan.core import Vault, atomic, digest, executable, git, jsonl, run
+from healdan.core import Vault, atomic, decode, digest, executable, git, jsonl, run
 from healdan.setup import initialize
 from healdan.signing import envelope
 
@@ -40,6 +40,13 @@ class VaultTest(unittest.TestCase):
 
     def rows(self, path, rows):
         atomic(self.root / path, jsonl(rows))
+
+    def cli(self, *args):
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent / "src"))
+        result = run([sys.executable, "-m", "healdan", "--vault", self.root, "--state", self.state, *args],
+                     env=env, check=False)
+        self.assertEqual(result.stderr, b"")
+        return result.returncode, decode(result.stdout)
 
     def signed(self, payload, namespace):
         return envelope(payload, namespace, "human", self.key)

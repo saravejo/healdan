@@ -6,10 +6,8 @@ import platform
 import shutil
 import sys
 
-from .core import REGISTRIES, Blocked, Vault, atomic, executable, git, read_json, require, run
+from .core import REQUIRED_REGISTRIES, Blocked, Vault, atomic, executable, git, read_json, require, run
 
-EMPTY_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
-                    "wiki/control/aliases.jsonl", "control/approvals/packages.jsonl")
 DIRECTORIES = ("inbox", "projects", "wiki/topics", "archive", "control/tasks", "templates")
 
 
@@ -24,7 +22,7 @@ def initialize(root, state=None, *, interactive=False):
     root.mkdir(parents=True, exist_ok=True)
     if not (root / ".git").exists():
         git(root, "init", "-b", "main")
-    for name in EMPTY_REGISTRIES:
+    for name in REQUIRED_REGISTRIES:
         path = root / name
         if not path.exists():
             atomic(path, b"")

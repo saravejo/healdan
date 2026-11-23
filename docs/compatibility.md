@@ -12,6 +12,17 @@ decisions, lessons, signed payloads, and snapshots. It never repairs spelling
 or renumbers. No historical questions are invented; the 37-question inventory
 remains unavailable until supplied by the owner.
 
+`migration preview` verifies each case and package in its original SSH
+namespace. A compatible projection includes the original JSONL row bytes in
+Base64, the row and payload SHA-256 digests, and the signature envelope.
+`review regression` evaluates the same case projection. Unknown formats,
+fields, and inspection regimes remain pending.
+
+The preview preserves each claim's recorded modality and marks authority as
+undetermined. For signed CSP-1 packages it reports the inspected units and the
+units outside the sample, along with the recorded sequence. A different
+inspection regime requires its own human decision and new sequence.
+
 Preview measures complete P5 segments at 6,000, 12,000 and 20,000 UTF-8 bytes.
 Group by existing entity, then property/environment if needed, then numeric-ID
 parts preserving complete claims. Render each attempt with title, delimiters,

@@ -7,7 +7,7 @@ import unittest
 from uuid import uuid4
 
 from support import VaultTest
-from healdan.core import Blocked, Vault, atomic, decode, digest, git, read_json, safe_path, utc
+from healdan.core import Blocked, Vault, atomic, decode, digest, git, jsonl, read_json, safe_path, utc
 from healdan.ids import TEXT, aliases, format_id, identity, inventory, reserve
 
 
@@ -31,16 +31,64 @@ class IDs(VaultTest):
         self.assertEqual(reserve(self.vault, "S", 1, str(uuid4())), ["S-0001"])
 
     def test_reservation_idempotency_gaps_and_history(self):
-        self.rows("wiki/claims.jsonl", [{"id": "C-9999"}])
-        git(self.root, "add", ".")
-        git(self.root, "commit", "-m", "Old published identity")
-        self.rows("wiki/claims.jsonl", [])
+        registry = "wiki/claims.jsonl"
+        rows = [{"id": "C-9998", "statement": "First\u2028line"},
+                {"id": "C-9999", "statement": "Second\u2029paragraph"}]
+        for ending in (b"\n", b"\r\n"):
+            atomic(self.root / registry, jsonl(rows).replace(b"\n", ending))
+            self.assertEqual(self.vault.rows(registry), rows)
+            git(self.root, "add", registry)
+            git(self.root, "commit", "-m", "Old published identities")
+        self.rows(registry, [])
         operation = str(uuid4())
         self.assertEqual(reserve(self.vault, "C", 2, operation), ["C-10000", "C-10001"])
         self.assertEqual(reserve(self.vault, "C", 2, operation), ["C-10000", "C-10001"])
         self.assertEqual(reserve(self.vault, "C", 1, str(uuid4())), ["C-10002"])
         with self.assertRaises(Blocked):
             reserve(self.vault, "C", 3, operation)
+
+    def test_missing_historical_path_and_missing_historical_blob(self):
+        registry = "wiki/claims.jsonl"
+        self.rows(registry, [{"id": "C-9999"}])
+        git(self.root, "commit", "-am", "Publish historical identity")
+        oid = git(self.root, "rev-parse", "HEAD:" + registry)
+        (self.root / registry).unlink()
+        git(self.root, "commit", "-am", "Remove historical registry")
+        self.rows(registry, [])
+        self.assertEqual(reserve(self.vault, "C", 1, str(uuid4())), ["C-10000"])
+
+        blob = self.vault.common / "objects" / oid[:2] / oid[2:]
+        blob.chmod(0o600)
+        blob.unlink()
+        journal = self.vault.control / "reservations.json"
+        before = journal.read_bytes()
+        with self.assertRaises(Blocked) as raised:
+            reserve(self.vault, "C", 1, str(uuid4()))
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(journal.read_bytes(), before)
+
+    def assert_invalid_current_and_historical_registry(self, data, message):
+        registry = "wiki/claims.jsonl"
+        atomic(self.root / registry, data)
+        operation = str(uuid4())
+        with self.assertRaisesRegex(Blocked, message) as current:
+            reserve(self.vault, "C", 1, operation)
+        git(self.root, "commit", "-am", "Publish malformed registry")
+        self.rows(registry, [])
+        with self.assertRaisesRegex(Blocked, message) as historic:
+            reserve(self.vault, "C", 1, operation)
+        self.assertEqual((current.exception.code, historic.exception.code), (4, 4))
+        self.assertFalse((self.vault.control / "reservations.json").exists())
+
+    def test_blank_jsonl_row_fails_in_current_and_historical_registry(self):
+        self.assert_invalid_current_and_historical_registry(
+            b'{"id":"C-0001"}\n\n{"id":"C-0002"}\n', "Blank JSONL row"
+        )
+
+    def test_invalid_jsonl_row_fails_in_current_and_historical_registry(self):
+        self.assert_invalid_current_and_historical_registry(
+            b'{"id":"C-0001"}\r\n{\r\n', "Invalid JSON"
+        )
 
     def test_real_processes_reserve_across_worktrees(self):
         worktree = self.base / "second worktree"

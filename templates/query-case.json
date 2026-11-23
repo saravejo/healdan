@@ -1,14 +1,11 @@
 {
+  "format": "healdan-query-case-v2",
   "id": null,
   "question": null,
   "filters": {},
   "cutoff": null,
   "temporal_policy": null,
-  "expected_ids": [],
-  "expected_value": null,
-  "expected_polarity": null,
-  "outcome": null,
-  "expected_conflicts": [],
+  "expectation": {"ids": [], "value": null, "polarity": null, "outcome": null, "conflicts": []},
   "reason": null,
   "decision": {"owner": null, "at": null}
 }

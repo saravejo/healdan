@@ -1,4 +1,5 @@
 """Human SSH signatures with domain-separated payloads and immutable receipts."""
+import base64
 from pathlib import Path
 import tempfile
 
@@ -27,6 +28,15 @@ def verify(value, namespace, allowed_signers):
                       "-s", signature], data=canonical(value["payload"]), check=False)
     require(result.returncode == 0, "Invalid human SSH signature")
     return value["payload"]
+
+
+def verify_origin(original, approval, namespace, allowed_signers):
+    require(isinstance(approval, dict) and set(approval) == {"payload", "digest", "namespace", "identity", "signature"},
+            "Missing, incomplete or unknown signature envelope")
+    signed = verify(approval, namespace, allowed_signers)
+    origin = {"row_base64": base64.b64encode(original).decode("ascii"), "row_sha256": digest(original),
+              "payload_sha256": approval["digest"], "approval": approval}
+    return signed, origin
 
 
 def trusted_signers(vault):

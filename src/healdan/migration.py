@@ -1,10 +1,107 @@
-"""Read-only legacy inventory and exceptional purge prerequisites."""
+"""Read-only migration projections, legacy inventory and purge prerequisites."""
 import re
 
-from .core import REGISTRIES, digest, executable, git, read_json, require, run
-from .ids import inventory as id_inventory
-from .pages import validate_links
+from .core import Blocked, REGISTRIES, digest, executable, git, read_json, require, run
+from .ids import identity, inventory as id_inventory, registry_records
+from .regression import case_projections
+from .review import csp_state_bytes, csp_state_streak, csp_status, decode_csp_state
+from .signing import trusted_signers, verify_origin
 from .tasks import all_tasks
+
+PACKAGE_FIELDS_V1 = frozenset({"task", "base", "fingerprint", "files", "claim_digests", "cutoff",
+                               "review", "regression", "package_id", "csp"})
+PACKAGE_FORMATS = {
+    PACKAGE_FIELDS_V1: "healdan-approval-package-v1",
+    PACKAGE_FIELDS_V1 | {"input_hashes"}: "healdan-approval-package-v2",
+}
+CSP_FIELDS_V1 = {"rule", "units", "units_digest", "seed", "initial_streak", "state_digest", "inspections"}
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _project_package(vault, approval, original):
+    signed, origin = verify_origin(original, approval, "package", trusted_signers(vault))
+    require(isinstance(signed, dict), "Approval package payload requires an object")
+    version = PACKAGE_FORMATS.get(frozenset(signed))
+    require(version is not None, "Approval package fields or format are unknown")
+    content = {key: value for key, value in signed.items() if key not in {"package_id", "csp"}}
+    require(digest(content) == signed["package_id"], "Signed package identity differs from its content")
+    claims = signed["claim_digests"]
+    require(isinstance(claims, dict) and
+            all(isinstance(sha256, str) and SHA256.fullmatch(sha256) for sha256 in claims.values()),
+            "Invalid signed claim digests")
+    registry_records("wiki/claims.jsonl", [{"id": identifier} for identifier in claims])
+    plan = signed["csp"]
+    require(isinstance(plan, dict) and set(plan) == CSP_FIELDS_V1, "Inspection fields are incomplete or unknown")
+    require(plan["units"] == sorted(claims, key=identity) and plan["units_digest"] == digest(claims),
+            "Inspection units differ from signed claims")
+    require(all(isinstance(plan[key], str) and SHA256.fullmatch(plan[key]) for key in ("seed", "state_digest")) and
+            isinstance(plan["inspections"], dict), "Invalid inspection proof")
+    result = csp_status(plan)
+    require(result["complete"] and not result["defect"] and set(plan["inspections"]) == set(result["selected"]),
+            "Signed inspection proof is incomplete or inconsistent")
+    outside = [identifier for identifier in plan["units"] if identifier not in plan["inspections"]]
+    scope = "no_units"
+    if plan["units"]:
+        scope = "sampled" if outside else "all_units"
+    return {"format": "healdan-inspection-coverage-v1", "id": signed["package_id"],
+            "origin": dict(origin, format=version), "plan": plan,
+            "scope": scope,
+            "inspected": result["selected"], "outside_sample": outside, "final_streak": result["streak"]}
+
+
+def _package_projections(vault):
+    for approval, original in vault.rows("control/approvals/packages.jsonl", include_bytes=True):
+        try:
+            projection = _project_package(vault, approval, original)
+        except (Blocked, KeyError, OverflowError, TypeError, ValueError) as exc:
+            yield {"row_sha256": digest(original), "status": "pending", "reason": str(exc)}
+        else:
+            yield {"id": projection["id"], "status": "compatible", "projection": projection}
+
+
+def _sequence_preview(original):
+    result = {"new_regime": {"human_decision_required": True, "new_sequence_required": True}}
+    if original is None:
+        return dict(result, status="not_established", state=None, sha256=None)
+    result.update(state=None, sha256=digest(original))
+    try:
+        result["state"] = decode_csp_state(original)
+        csp_state_streak(result["state"])
+    except Blocked as exc:
+        return dict(result, status="pending", reason=str(exc))
+    return dict(result, status="preserved")
+
+
+def preview(vault):
+    before = vault.fingerprint()
+    sequence = csp_state_bytes(vault)
+    cases = list(case_projections(vault))
+    packages = list(_package_projections(vault))
+    reviews = {}
+    for record in packages:
+        if record["status"] != "compatible":
+            continue
+        package = record["projection"]
+        approved = package["origin"]["approval"]["payload"]["claim_digests"]
+        for identifier, sha256 in approved.items():
+            inspection = "inspected" if identifier in package["plan"]["inspections"] else "outside_sample"
+            reviews.setdefault((identifier, sha256), []).append(
+                {"package_id": package["id"], "rule": package["plan"]["rule"], "inspection": inspection}
+            )
+    claims = []
+    for row, original in vault.rows("wiki/claims.jsonl", include_bytes=True):
+        modality = row.get("modality")
+        pending = ["authority"]
+        if not isinstance(modality, str) or not modality:
+            pending.append("modality")
+        claims.append({"id": row["id"], "modality": modality, "authority_status": "undetermined",
+                       "pending_fields": pending, "row_sha256": digest(original),
+                       "approvals": reviews.get((row["id"], digest(row)), [])})
+    inspection_sequence = _sequence_preview(sequence)
+    require(vault.fingerprint() == before and csp_state_bytes(vault) == sequence,
+            "Inputs changed during migration preview", 5)
+    return {"fingerprint": before, "cases": cases, "claims": claims, "packages": packages,
+            "inspection_sequence": inspection_sequence}
 
 
 def inventory(vault):

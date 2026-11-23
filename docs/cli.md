@@ -47,6 +47,7 @@ common Git directory. All commands return JSON. `--help` lists exact arguments.
 | `backup create --kind long --expires-at UTC` | Encrypted generation to all configured destinations |
 | `backup verify ID`, `restore ID DESTINATION` | Verify every copy and restore to a fresh directory |
 | `migration inventory`, `migration purge-check` | Read-only legacy/width inventory and purge prerequisites |
+| `migration preview` | Verify signed cases and inspection records, then report compatible projections and pending fields |
 | `migration sign-alias INPUT.json --output SIGNED.json` | Same-identity alias with a human signed decision |
 
 Task agents receive only their session's proposal directory, source snapshot,
