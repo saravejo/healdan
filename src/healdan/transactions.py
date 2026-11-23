@@ -4,8 +4,8 @@ import copy
 from pathlib import Path
 import tempfile
 
-from .core import REGISTRIES, Vault, atomic, canonical, digest, git, jsonl, read_json, require, safe_path, stamp
-from .ids import aliases, identity, inventory
+from .core import REGISTRIES, atomic, digest, git, jsonl, parse_jsonl, read_json, require, safe_path, stamp
+from .ids import aliases, committed_registries, identity, registry_records
 from .knowledge import Knowledge
 from .pages import generated_pages, validate_pages
 from .regression import require_suite
@@ -17,6 +17,7 @@ EXACT = {"wiki/claims.jsonl", "wiki/control/topic-map.jsonl", "wiki/control/sele
          "wiki/control/page-policy.json", "wiki/control/query-cases.jsonl", "wiki/control/aliases.jsonl",
          "wiki/control/decisions.jsonl", "wiki/control/lessons.jsonl", "wiki/index.md",
          "resources/sources/index.jsonl"}
+LEDGER = "control/approvals/packages.jsonl"
 
 
 def allowed(path):
@@ -32,23 +33,30 @@ class Candidate:
     def __enter__(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="candidate-", dir=self.vault.state)
         root = Path(self.temporary.name)
-        for name in self.vault.inputs():
-            atomic(safe_path(root, name), safe_path(self.vault.root, name, exists=True).read_bytes())
-        for name, encoded in self.files.items():
-            require(allowed(name), "Unauthorized proposal path: " + name)
-            atomic(safe_path(root, name), base64.b64decode(encoded, validate=True))
-        self.candidate = copy.copy(self.vault)
-        self.candidate.root = root
-        self.candidate.head = self.vault.head
-        return self.candidate
+        try:
+            for name in self.vault.inputs():
+                atomic(safe_path(root, name), safe_path(self.vault.root, name, exists=True).read_bytes())
+            for name, encoded in self.files.items():
+                require(allowed(name), "Unauthorized proposal path: " + name)
+                atomic(safe_path(root, name), base64.b64decode(encoded, validate=True))
+            candidate = copy.copy(self.vault)
+            candidate.root = root
+            candidate.head = self.vault.head
+            candidate.check_registries()
+            return candidate
+        except BaseException:
+            self.temporary.cleanup()
+            raise
 
     def __exit__(self, *args):
         self.temporary.cleanup()
 
 
 def proposed_digests(vault, candidate):
-    old = {r["id"]: digest(r) for r in vault.rows("wiki/claims.jsonl")}
-    return {r["id"]: digest(r) for r in candidate.rows("wiki/claims.jsonl") if old.get(r["id"]) != digest(r)}
+    registry = "wiki/claims.jsonl"
+    old = {r["id"]: digest(r) for r in vault.rows(registry)}
+    current = {k: digest(r) for k, r in registry_records(registry, candidate.rows(registry)).items()}
+    return {k: value for k, value in current.items() if old.get(k) != value}
 
 
 def preserve_contracts(vault, candidate):
@@ -74,10 +82,8 @@ def validate_candidate(vault, candidate, cutoff):
     reservations = read_json(vault.control / "reservations.json", {})
     reserved = {i for r in reservations.values() for i in r["ids"]}
     for registry in REGISTRIES:
+        current = registry_records(registry, candidate.rows(registry))
         old = {r["id"]: r for r in vault.rows(registry)}
-        rows = candidate.rows(registry)
-        require(not inventory(rows)["collisions"], "Numeric collision in candidate registry")
-        current = {r["id"]: r for r in rows}
         require(set(old) <= set(current), "Historical records cannot be silently removed")
         for identifier in set(current) - set(old):
             require(identity(identifier, new=True)[1] > 0 and identifier in reserved,
@@ -91,6 +97,21 @@ def validate_candidate(vault, candidate, cutoff):
                if c["id"] in changes and c["state"] == "accepted"]
     regression = require_suite(candidate, proposed=changes.values(), cutoff=cutoff, factual_ids=factual)
     return changes, regression
+
+
+def validate_recovery_identities(vault, signed_files, commit=None):
+    committed = dict(committed_registries(vault, commit)) if commit else {}
+    for registry in REGISTRIES:
+        if registry in signed_files:
+            data = base64.b64decode(signed_files[registry], validate=True)
+            rows = parse_jsonl(data, registry)
+        else:
+            rows = vault.rows(registry)
+        expected = registry_records(registry, rows)
+        if commit:
+            require(registry in committed, "Committed registry is missing: " + registry)
+            actual = registry_records(registry, committed[registry])
+            require(actual.keys() == expected.keys(), "Committed identities differ from the signed candidate: " + registry)
 
 
 def package_path(vault, identifier):
@@ -221,14 +242,19 @@ def apply(vault, identifier=None, *, recover=False):
             require(digest(read_json(vault.control / "csp.json", {"streak": 0})) == record["csp"]["state_digest"],
                     "CSP state changed", 5)
             files = dict(signed["files"])
-            ledger = "control/approvals/packages.jsonl"
-            entries = vault.rows(ledger) + [record["approval"]]
-            files[ledger] = base64.b64encode(jsonl(entries)).decode("ascii")
+            entries = vault.rows(LEDGER) + [record["approval"]]
+            files[LEDGER] = base64.b64encode(jsonl(entries)).decode("ascii")
             journal = {"package_id": identifier, "status": "writing", "base": vault.head(), "files": files,
                        "before": {p: digest(safe_path(vault.root, p).read_bytes())
                                   if safe_path(vault.root, p).exists() else None for p in files}, "written": []}
             atomic(journal_path, journal)
-        require(vault.head() == journal["base"] or
+        else:
+            require(journal["base"] == signed["base"], "Recovery journal base differs from the signed package")
+            require(LEDGER in journal["files"] and
+                    {name: data for name, data in journal["files"].items() if name != LEDGER} == signed["files"],
+                    "Recovery journal files differ from the signed package")
+        head = vault.head()
+        require(head == journal["base"] or
                 f"Healdan-Package: {identifier}" in git(vault.root, "log", "-1", "--format=%B"),
                 "Git changed during recovery", 5)
         current_inputs = vault.inputs()
@@ -236,6 +262,8 @@ def apply(vault, identifier=None, *, recover=False):
         for name in untouched - set(journal["files"]):
             require(current_inputs.get(name) == signed["input_hashes"].get(name),
                     "An unsigned input changed during integration: " + name, 5)
+        if recover:
+            validate_recovery_identities(vault, signed["files"], head if head != journal["base"] else None)
         for name, encoded in journal["files"].items():
             path = safe_path(vault.root, name)
             body = base64.b64decode(encoded, validate=True)

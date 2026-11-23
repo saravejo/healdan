@@ -1,5 +1,6 @@
 import base64
 import copy
+import copy
 from pathlib import Path
 from unittest.mock import patch
 import unittest
@@ -7,7 +8,7 @@ from uuid import uuid4
 
 from support import VaultTest
 from healdan import ids, review, tasks, transactions
-from healdan.core import Blocked, atomic, digest, git, jsonl, read_json
+from healdan.core import Blocked, REQUIRED_REGISTRIES, atomic, digest, git, jsonl, read_json
 from healdan.knowledge import query
 
 
@@ -127,6 +128,153 @@ class Transactions(VaultTest):
         files = {"wiki/control/decisions.jsonl": base64.b64encode(jsonl([{"id": "D-0001", "signed_payload": "changed"}])).decode()}
         with transactions.Candidate(self.vault, files) as candidate, self.assertRaises(Blocked):
             transactions.preserve_contracts(self.vault, candidate)
+
+    def prepare_identity_fixture(self):
+        decisions, lessons = "wiki/control/decisions.jsonl", "wiki/control/lessons.jsonl"
+        decision, = ids.reserve(self.vault, "D", 1, str(uuid4()))
+        lesson, = ids.reserve(self.vault, "L", 1, str(uuid4()))
+        task = tasks.create(self.vault, "Identity registry fixture")
+        proposal = self.state / "tasks" / task["id"] / "proposals/editor"
+        atomic(proposal / decisions, jsonl([*self.vault.rows(decisions), {"id": decision}]))
+        atomic(proposal / lessons, jsonl([*self.vault.rows(lessons), {"id": lesson}]))
+        return task, proposal, transactions.prepare(self.vault, task["id"])
+
+    def legacy_package(self, package, registry, body):
+        record = copy.deepcopy(package)
+        record["payload"]["files"][registry] = base64.b64encode(body).decode("ascii")
+        record["id"] = digest(record["payload"])
+        path = transactions.package_path(self.vault, record["id"])
+        atomic(path, record)
+        return record, path
+
+    def interrupt_apply(self, record, failure_path):
+        def interrupted(path, data):
+            if Path(path) == failure_path:
+                raise OSError("Injected integration interruption")
+            return atomic(path, data)
+
+        with patch("healdan.transactions.atomic", side_effect=interrupted), self.assertRaises(OSError):
+            transactions.apply(self.vault, record["id"])
+        return self.vault.control / "transaction.json"
+
+    def test_all_identity_registries_bind_the_prefix_and_keep_legacy_spelling(self):
+        for registry, prefix in (
+            ("wiki/claims.jsonl", "C"),
+            ("resources/sources/index.jsonl", "F"),
+            ("wiki/control/decisions.jsonl", "D"),
+            ("wiki/control/lessons.jsonl", "L"),
+            ("wiki/control/query-cases.jsonl", "Q"),
+        ):
+            with self.subTest(registry=registry):
+                original = prefix + "-1"
+                row = {"id": original}
+                self.assertEqual(ids.registry_records(registry, [row]), {original: row})
+                invalid = "D-0001" if prefix != "D" else "L-0001"
+                with self.assertRaisesRegex(Blocked, f"Expected a {prefix}- identity"):
+                    ids.registry_records(registry, [{"id": invalid}])
+                with self.assertRaisesRegex(Blocked, "Numeric identity collision"):
+                    ids.registry_records(registry, [row, {"id": prefix + "-0001"}])
+
+    def test_candidate_identities_block_prepare_approve_and_apply(self):
+        task, proposal, valid = self.prepare_identity_fixture()
+        versions = (
+            ("wiki/control/lessons.jsonl", [{"id": "D-0001"}], "Expected a L- identity"),
+            ("wiki/control/decisions.jsonl", [{"id": "D-1"}, {"id": "D-0001"}], "Numeric identity collision"),
+        )
+        receipts = set((self.vault.control / "receipts").glob("*.json"))
+        for registry, rows, message in versions:
+            with self.subTest(registry=registry):
+                body = jsonl(rows)
+                original = (proposal / registry).read_bytes()
+                atomic(proposal / registry, body)
+                with self.assertRaisesRegex(Blocked, message):
+                    transactions.prepare(self.vault, task["id"])
+                atomic(proposal / registry, original)
+
+                record, path = self.legacy_package(valid, registry, body)
+                with self.assertRaisesRegex(Blocked, message):
+                    transactions.approve(self.vault, record["id"])
+                self.assertIsNone(read_json(path)["approval"])
+                self.assertEqual(set((self.vault.control / "receipts").glob("*.json")), receipts)
+
+                record["approval"] = self.signed(transactions.approval_payload(record), "package")
+                atomic(path, record)
+                with self.assertRaisesRegex(Blocked, message):
+                    transactions.apply(self.vault, record["id"])
+                self.assertEqual(self.vault.head(), task["base"])
+                self.assertFalse((self.vault.control / "transaction.json").exists())
+
+        transactions.approve(self.vault, valid["id"])
+        transactions.apply(self.vault, valid["id"])
+        self.assertEqual(self.vault.rows("wiki/control/decisions.jsonl"), [{"id": "D-0001"}])
+        self.assertEqual(self.vault.rows("wiki/control/lessons.jsonl"), [{"id": "L-0001"}])
+        self.assertEqual(ids.reserve(self.vault, "D", 1, str(uuid4())), ["D-0002"])
+        self.assertEqual(ids.reserve(self.vault, "L", 1, str(uuid4())), ["L-0002"])
+
+    def test_valid_legacy_decision_and_signed_bytes_survive_integration(self):
+        registry = "wiki/control/decisions.jsonl"
+        payload = {"id": "D-1", "decision": "Preserve original approval"}
+        signed_row = dict(payload, approval=self.signed(payload, "decision"))
+        self.rows(registry, [signed_row])
+        before = (self.root / registry).read_bytes()
+        git(self.root, "commit", "-am", "Preserve legacy decision")
+        _, _, package = self.prepare_identity_fixture()
+        transactions.approve(self.vault, package["id"])
+        transactions.apply(self.vault, package["id"])
+        self.assertTrue((self.root / registry).read_bytes().startswith(before))
+        self.assertEqual(self.vault.rows(registry), [signed_row, {"id": "D-0002"}])
+
+    def test_recovery_revalidates_signed_identities_before_writes(self):
+        task, _, package = self.prepare_identity_fixture()
+        registry = "wiki/control/decisions.jsonl"
+        record, path = self.legacy_package(package, registry, jsonl([{"id": "D-1"}, {"id": "D-0001"}]))
+        record["approval"] = self.signed(transactions.approval_payload(record), "package")
+        atomic(path, record)
+        with patch("healdan.transactions.validate_candidate"):
+            journal = self.interrupt_apply(record, self.root / registry)
+        before = journal.read_bytes()
+        with self.assertRaisesRegex(Blocked, "Numeric identity collision"):
+            transactions.apply(self.vault, recover=True)
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertEqual(self.vault.head(), task["base"])
+        self.assertEqual(self.vault.rows(registry), [])
+
+    def test_recovery_revalidates_identities_of_partially_recorded_commit(self):
+        task, _, package = self.prepare_identity_fixture()
+        transactions.approve(self.vault, package["id"])
+        journal = self.interrupt_apply(package, self.vault.control / "csp.json")
+        committed = self.vault.head()
+        self.assertNotEqual(committed, task["base"])
+        before = journal.read_bytes()
+        registry = "wiki/control/decisions.jsonl"
+        frozen = (self.root / registry).read_bytes()
+        self.rows(registry, [{"id": "D-0002"}])
+        git(self.root, "commit", "-am", f"Divergent fixture\n\nHealdan-Package: {package['id']}")
+        divergent = self.vault.head()
+
+        with self.assertRaisesRegex(Blocked, "Committed identities differ from the signed candidate"):
+            transactions.apply(self.vault, recover=True)
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertEqual(self.vault.head(), divergent)
+        self.assertEqual(self.vault.rows(registry), [{"id": "D-0002"}])
+
+        git(self.root, "update-ref", "HEAD", committed, divergent)
+        atomic(self.root / registry, frozen)
+        git(self.root, "add", "--", registry)
+        result = transactions.apply(self.vault, recover=True)
+        self.assertEqual((result["status"], result["commit"]), ("complete", committed))
+
+    def test_candidate_copy_requires_every_registry(self):
+        inputs = self.vault.inputs()
+        for registry in REQUIRED_REGISTRIES:
+            with self.subTest(registry=registry):
+                incomplete = {name: sha for name, sha in inputs.items() if name != registry}
+                with patch.object(self.vault, "inputs", return_value=incomplete):
+                    with self.assertRaisesRegex(Blocked, registry) as raised:
+                        with transactions.Candidate(self.vault, {}):
+                            self.fail("Candidate accepted an absent registry")
+                self.assertEqual(raised.exception.code, 4)
+        self.assertEqual(list(self.state.glob("candidate-*")), [])
 
 
 if __name__ == "__main__":

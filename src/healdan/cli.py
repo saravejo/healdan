@@ -160,7 +160,7 @@ def dispatch(args):
     from .signing import human_sign
     if args.command == "setup":
         return setup.initialize(args.vault, args.state, interactive=args.interactive)
-    vault = Vault(args.vault, args.state)
+    vault = Vault(args.vault, args.state, operational=args.command != "restore")
     if args.command == "doctor":
         result = setup.doctor(vault)
         return result, 0 if result["ready"] else 5

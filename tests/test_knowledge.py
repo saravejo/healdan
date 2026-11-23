@@ -1,19 +1,91 @@
 import copy
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from support import VaultTest
-from healdan.core import Blocked, atomic, digest
+from healdan.core import Blocked, REQUIRED_REGISTRIES, Vault, atomic, digest
 from healdan.knowledge import Knowledge, query, typed
 from healdan.pages import preview, render_current, split_preview, validate_pages
 from healdan.regression import sign_case, suite, require_suite
+from healdan.setup import initialize
 from healdan.signing import verify
 
 
 class Query(VaultTest):
     def test_empty_abstention_and_integrity_failure_are_distinct(self):
-        self.assertEqual(query(self.vault, {})["code"], 20)
+        claim = self.claim()
+        self.knowledge([claim])
+        self.rows("wiki/control/decisions.jsonl", [{"id": "D-0001"}])
+        self.assertEqual(self.cli("query", "--entity", "instrument")[0], 0)
+        self.rows("wiki/control/decisions.jsonl", [])
+        self.assertEqual(self.cli("query", "--entity", "instrument")[0], 0)
+        self.rows("wiki/claims.jsonl", [])
+        self.assertEqual(self.cli("query", "--entity", "instrument")[0], 20)
         atomic(self.root / "wiki/claims.jsonl", b'{"broken":\n')
-        self.assertEqual(query(self.vault, {})["code"], 4)
+        self.assertEqual(self.cli("query", "--entity", "instrument")[0], 4)
+
+    def test_missing_registries_block_new_and_already_open_vaults(self):
+        self.assertEqual(len(REQUIRED_REGISTRIES), 9)
+        self.knowledge([self.claim()])
+        for name in REQUIRED_REGISTRIES:
+            path = self.root / name
+            before = path.read_bytes()
+            with self.subTest(registry=name):
+                try:
+                    path.unlink()
+                    code, result = self.cli("query", "--entity", "instrument")
+                    self.assertEqual(code, 4)
+                    self.assertIn(name, result["error"])
+                    opened = query(self.vault, {"entity": "instrument"})
+                    self.assertEqual(opened["code"], 4)
+                    self.assertIn(name, opened["diagnostics"][0])
+                finally:
+                    atomic(path, before)
+
+    def test_unreadable_registry_is_a_technical_failure(self):
+        path = self.root / "wiki/control/decisions.jsonl"
+        read_bytes = Path.read_bytes
+
+        def unreadable(target):
+            if target == path:
+                raise PermissionError("Injected read failure")
+            return read_bytes(target)
+
+        with patch.object(Path, "read_bytes", unreadable):
+            result = query(self.vault, {})
+        self.assertEqual(result["code"], 1)
+        self.assertIn("Injected read failure", result["diagnostics"][0])
+
+    def test_unborn_vault_and_optional_page_policy(self):
+        root, state = self.base / "unborn vault", self.base / "unborn state"
+        initialize(root, state)
+        vault = Vault(root, state)
+        self.assertIsNone(vault.head())
+        self.assertFalse((root / "wiki/control/page-policy.json").exists())
+        self.assertEqual(vault.rows("wiki/control/selectors.jsonl"), [])
+        validate_pages(vault)
+        self.assertEqual(query(vault, {})["code"], 20)
+
+    def test_source_capture_timestamp_errors_are_distinct_from_cutoff_arguments(self):
+        self.knowledge([self.claim(valid_from="2026-01-01T00:00:00Z")])
+        registry = "resources/sources/index.jsonl"
+        row, = self.vault.rows(registry)
+        row["captured_at"] = "2026-01-01T01:30:00+01:30"
+        self.rows(registry, [row])
+        code, result = self.cli("query", "--cutoff", "2026-01-01T01:00:00+01:00")
+        self.assertEqual((code, result["cutoff"]), (0, "2026-01-01T00:00:00Z"))
+        self.assertEqual(self.cli("query")[0], 0)
+        self.assertEqual(self.cli("query", "--cutoff", "2026-01-01T00:00:00")[0], 2)
+        without_capture = {name: value for name, value in row.items() if name != "captured_at"}
+        invalid = [without_capture, *(dict(row, captured_at=value) for value in
+                    (None, 123, "2026-02-30T00:00:00Z", "2026-01-01T00:00:00"))]
+        for source in invalid:
+            with self.subTest(captured_at=source.get("captured_at", "missing")):
+                self.rows(registry, [source])
+                code, result = self.cli("query")
+                self.assertEqual(code, 4)
+                self.assertIn("F-0001 captured_at", result["diagnostics"][0])
 
     def test_real_answer_and_missing_promotion(self):
         claim = self.claim()

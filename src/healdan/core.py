@@ -9,6 +9,7 @@ import os
 import platform
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -85,11 +86,12 @@ def parse_jsonl(data, path):
     return rows
 
 
-def read_jsonl(path):
+def read_jsonl(path, *, required=False):
     path = Path(path)
     try:
         data = path.read_bytes()
     except FileNotFoundError:
+        require(not required, "Required JSONL registry is missing: " + str(path))
         return []
     return parse_jsonl(data, path)
 
@@ -139,10 +141,14 @@ def safe_path(root, relative, *, exists=False):
             break
         current = current.parent
     require(candidate.resolve().is_relative_to(root.resolve()), "Path escapes root")
-    if exists:
-        require(candidate.is_file(), "Required regular file is missing: " + str(relative))
-    if candidate.is_file():
-        require(candidate.stat().st_nlink == 1, "Hard-linked files are forbidden")
+    try:
+        metadata = candidate.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        metadata = None
+    regular = metadata is not None and stat.S_ISREG(metadata.st_mode)
+    require(not exists or regular, "Required regular file is missing: " + str(relative))
+    if regular:
+        require(metadata.st_nlink == 1, "Hard-linked files are forbidden")
     return candidate
 
 
@@ -214,13 +220,20 @@ def lock(path, timeout=15):
         stream.close()
 
 
-REGISTRIES = ("wiki/claims.jsonl", "resources/sources/index.jsonl",
-              "wiki/control/decisions.jsonl", "wiki/control/lessons.jsonl",
-              "wiki/control/query-cases.jsonl")
+REGISTRY_PREFIXES = {
+    "wiki/claims.jsonl": "C",
+    "resources/sources/index.jsonl": "F",
+    "wiki/control/decisions.jsonl": "D",
+    "wiki/control/lessons.jsonl": "L",
+    "wiki/control/query-cases.jsonl": "Q",
+}
+REGISTRIES = tuple(REGISTRY_PREFIXES)
+REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
+                       "wiki/control/aliases.jsonl", "control/approvals/packages.jsonl")
 
 
 class Vault:
-    def __init__(self, root, state=None):
+    def __init__(self, root, state=None, *, operational=True):
         self.root = Path(root).resolve()
         common = Path(git(self.root, "rev-parse", "--git-common-dir"))
         self.common = (self.root / common).resolve() if not common.is_absolute() else common.resolve()
@@ -236,18 +249,26 @@ class Vault:
             require(set(limits) == set(self.policy["context_bytes"]) and
                     all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
             self.policy["context_bytes"] = limits
+        if operational:
+            self.check_registries()
 
     def locked(self):
         return lock(self.control / "controller.lock")
 
     def rows(self, name):
-        return read_jsonl(safe_path(self.root, name))
+        required = Path(name).as_posix() in REQUIRED_REGISTRIES
+        return read_jsonl(safe_path(self.root, name, exists=required), required=required)
+
+    def check_registries(self):
+        for name in REQUIRED_REGISTRIES:
+            safe_path(self.root, name, exists=True)
 
     def head(self):
         result = git(self.root, "rev-parse", "--verify", "HEAD", check=False)
         return result or None
 
     def inputs(self):
+        self.check_registries()
         result = {}
         for folder in ("wiki", "resources/sources", "templates", "config", "control/approvals"):
             base = self.root / folder
@@ -256,6 +277,8 @@ class Vault:
                     if path.is_file() or path.is_symlink():
                         rel = path.relative_to(self.root).as_posix()
                         result[rel] = digest(safe_path(self.root, rel, exists=True).read_bytes())
+        for name in REQUIRED_REGISTRIES:
+            require(name in result, "Required JSONL registry is missing: " + name)
         return result
 
     def fingerprint(self):

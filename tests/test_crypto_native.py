@@ -36,7 +36,9 @@ class RealAge(VaultTest):
         self.assertEqual(record["status"], "complete")
         self.assertEqual(len(backups.verify_backup(self.vault, record["id"])["copies"]), 1)
         restored = self.base / "restored vault"
-        backups.restore(self.vault, record["id"], restored)
+        (self.root / "wiki/claims.jsonl").unlink()
+        code, result = self.cli("restore", record["id"], restored)
+        self.assertEqual(code, 0, result)
         self.assertEqual((restored / "wiki/claims.jsonl").read_bytes(), b"")
         cipher = (destination / record["copies"][0]["path"]).read_bytes()
         data = decode(custody.decrypt(self.vault, cipher))
