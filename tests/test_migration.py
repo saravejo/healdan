@@ -189,3 +189,45 @@ class Migration(VaultTest):
         self.assertEqual(result["inspection_sequence"]["status"], "pending")
         self.assertEqual(result["inspection_sequence"]["state"], state)
         self.assertEqual(sequence.read_bytes(), before)
+
+    def test_corrupt_inspection_state_keeps_compatible_cli_projections(self):
+        claims = [self.claim(f"C-{number:04d}") for number in range(1, 4)]
+        approved = self.sampled_package(claims)
+        case = self.case(id="Q-1", expected_ids=[claim["id"] for claim in claims])
+        self.rows("wiki/claims.jsonl", claims)
+        self.rows("control/approvals/packages.jsonl", [approved])
+        self.rows(regression.CASE_REGISTRY, [case])
+        sequence_path = self.vault.control / "csp.json"
+        known = {"streak": 111, "package": approved["payload"]["package_id"]}
+        atomic(sequence_path, b"\xef\xbb\xbf" + canonical(known) + b"\r\n")
+        code, baseline = self.cli("migration", "preview")
+        self.assertEqual(code, 0, baseline)
+        self.assertEqual(baseline["cases"][0]["status"], "compatible")
+        self.assertEqual(baseline["packages"][0]["status"], "compatible")
+        self.assertEqual(baseline["inspection_sequence"]["state"], known)
+        self.assertEqual(review.read_csp_state(self.vault), known)
+        before = self.vault.inputs()
+
+        for description, original, diagnostic in (
+            ("truncated JSON", b'{"streak":111,\r\n', "Expecting property name"),
+            ("invalid UTF-8", b'{"streak":111,"package":"\xff"}', "utf-8"),
+            ("UTF-8 surrogate", b'{"streak":111,"package":"\xed\xa0\x80"}', "utf-8"),
+            ("unpaired escaped surrogate", b'{"streak":111,"package":"\\ud800"}', "surrogates not allowed"),
+        ):
+            with self.subTest(state=description):
+                atomic(sequence_path, original)
+                code, result = self.cli("migration", "preview")
+                self.assertEqual(code, 5, result.get("error"))
+                state = result["inspection_sequence"]
+                self.assertEqual(state["status"], "pending")
+                self.assertIsNone(state["state"])
+                self.assertEqual(state["sha256"], digest(original))
+                self.assertIn("Invalid JSON", state["reason"])
+                self.assertIn(diagnostic, state["reason"])
+                for key in ("cases", "packages", "claims"):
+                    self.assertEqual(result[key], baseline[key])
+                with self.assertRaisesRegex(Blocked, "Invalid JSON") as raised:
+                    review.read_csp_state(self.vault)
+                self.assertEqual(raised.exception.code, 4)
+                self.assertEqual(sequence_path.read_bytes(), original)
+                self.assertEqual(self.vault.inputs(), before)

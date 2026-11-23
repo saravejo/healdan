@@ -1,10 +1,10 @@
 """Read-only migration projections, legacy inventory and purge prerequisites."""
 import re
 
-from .core import Blocked, REGISTRIES, decode, digest, executable, git, read_json, require, run
+from .core import Blocked, REGISTRIES, digest, executable, git, read_json, require, run
 from .ids import identity, inventory as id_inventory, registry_records
 from .regression import case_projections
-from .review import csp_state_bytes, csp_state_streak, csp_status
+from .review import csp_state_bytes, csp_state_streak, csp_status, decode_csp_state
 from .signing import trusted_signers, verify_origin
 from .tasks import all_tasks
 
@@ -63,10 +63,10 @@ def _sequence_preview(original):
     result = {"new_regime": {"human_decision_required": True, "new_sequence_required": True}}
     if original is None:
         return dict(result, status="not_established", state=None, sha256=None)
-    state = decode(original)
-    result.update(state=state, sha256=digest(original))
+    result.update(state=None, sha256=digest(original))
     try:
-        csp_state_streak(state)
+        result["state"] = decode_csp_state(original)
+        csp_state_streak(result["state"])
     except Blocked as exc:
         return dict(result, status="pending", reason=str(exc))
     return dict(result, status="preserved")

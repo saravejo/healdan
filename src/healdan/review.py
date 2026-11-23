@@ -3,7 +3,7 @@ import hmac
 import secrets
 from pathlib import Path
 
-from .core import atomic, decode, digest, read_json, require, safe_path, stamp
+from .core import Blocked, atomic, canonical, decode, digest, read_json, require, safe_path, stamp
 from .ids import identity
 from .tasks import get_session, get_task, require_active, validate_evidence
 
@@ -84,9 +84,19 @@ def csp_state_bytes(vault):
         return None
 
 
+def decode_csp_state(original):
+    try:
+        state = decode(original.decode("utf-8-sig"))
+        # Escaped surrogate code points can be parsed but cannot be emitted as UTF-8 JSON.
+        canonical(state)
+    except ValueError as exc:
+        raise Blocked("Invalid JSON: " + str(exc)) from exc
+    return state
+
+
 def read_csp_state(vault):
     original = csp_state_bytes(vault)
-    state = {"streak": 0} if original is None else decode(original)
+    state = {"streak": 0} if original is None else decode_csp_state(original)
     csp_state_streak(state)
     return state
 
