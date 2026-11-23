@@ -35,7 +35,7 @@ jobs:
     if: >-
       github.repository == 'saravejo/healdan' && github.ref_protected &&
       (github.ref == 'refs/heads/main' ||
-       (github.ref == 'refs/heads/sprint-gate-bootstrap' && github.sha == vars.SPRINT_B00_BOOTSTRAP_SHA))
+       (github.ref == 'refs/heads/sprint-gate-bootstrap-v2' && github.sha == vars.SPRINT_B00_BOOTSTRAP_SHA))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -23,7 +23,7 @@ REPO = "/repos/" + REPOSITORY
 WEB = "https://github.com/" + REPOSITORY
 BASE = "main"
 WORKFLOW = ".github/workflows/sprint-b00.yml"
-BOOTSTRAP_BRANCH = "sprint-gate-bootstrap"
+BOOTSTRAP_BRANCH = "sprint-gate-bootstrap-v2"
 BOOTSTRAP_WORKFLOW = ".github/workflows/ci.yml"
 CHECK = "sprint/b00"
 ACTIONS_APP = 15368
@@ -769,13 +769,22 @@ def sprint_check(api, scope, allow_previous_merge=False):
     return check
 
 
-def publish(api, scope, conclusion, summary, run_id):
+def matches_check_details_url(check, run_id):
+    # GitHub Actions may replace the requested workflow link with its check page.
+    return check.get("details_url") in (f"{WEB}/actions/runs/{run_id}", f"{WEB}/runs/{number(check['id'])}")
+
+
+def run_summary(summary, run_id, attempt):
+    return f"Workflow run {run_id}, attempt {attempt}\n{summary}"
+
+
+def publish(api, scope, conclusion, summary, run_id, attempt):
     existing = sprint_check(api, scope, allow_previous_merge=True)
     external_id = f"sprint-b00:{scope.pull}:{scope.base}:{scope.head}:{scope.merge}"
-    output = {"title": f"Sprint {scope.lot} / PR #{scope.pull}", "summary": summary}
+    output = {"title": f"Sprint {scope.lot} / PR #{scope.pull}", "summary": run_summary(summary, run_id, attempt)}
     run_url = f"{WEB}/actions/runs/{run_id}"
     if (existing.get("status") == "completed" and existing.get("conclusion") == conclusion and
-            existing.get("details_url") == run_url and existing.get("external_id") == external_id and
+            matches_check_details_url(existing, run_id) and existing.get("external_id") == external_id and
             all(existing["output"].get(key) == value for key, value in output.items())):
         return existing["id"]
     payload = {
@@ -811,13 +820,13 @@ def verify_evidence(api, scope, args, coordinator, expected):
     return fingerprint
 
 
-def verify_published(api, scope, summary, run_id, gate_job):
+def verify_published(api, scope, summary, run_id, attempt, gate_job):
     log = api.job_log(number(gate_job["id"]))
     published = re.findall(r"(?m)^(?:[0-9T:.+\-Z]+ )?Published sprint check run ([0-9]+)\r?$", log)
     check = sprint_check(api, scope)
     require(len(published) == 1 and check.get("id") == number(published[0]) and
             check["status"] == "completed" and check["conclusion"] == "success" and
-            check["details_url"] == f"{WEB}/actions/runs/{run_id}" and check["output"]["summary"] == summary,
+            matches_check_details_url(check, run_id) and check["output"]["summary"] == run_summary(summary, run_id, attempt),
             "The sprint check does not match the protected job's published result")
     return check["id"]
 
@@ -921,19 +930,19 @@ def main():
             fingerprint = verify_evidence(api, scope, args, coordinator, expected)
         except (Blocked, KeyError, AttributeError, IndexError, OSError, TypeError, ValueError):
             if publishing and pr_scope(api, scope.pull, scope.head, scope.base) == scope:
-                publish(api, scope, "failure", "CI or evidence verification blocked this pull request.", run_id)
+                publish(api, scope, "failure", "CI or evidence verification blocked this pull request.", run_id, attempt)
             raise
         require(pr_scope(api, scope.pull, scope.head, scope.base) == scope, "Pull request changed during verification")
         require(policy_for(api, scope, args.bootstrap) == policy, "Policy ref changed during verification")
-        summary = (f"PR #{scope.pull}\nHead `{scope.head}`\nBase `{scope.base}`\nTest merge `{scope.merge}`\nWorkflow attempt {attempt}\n"
+        summary = (f"PR #{scope.pull}\nHead `{scope.head}`\nBase `{scope.base}`\nTest merge `{scope.merge}`\n"
                    f"Evidence comment {args.comment}, SHA-256 `{fingerprint}`\n"
                    "Test, package, independent audit, matrix acceptance and Qodo passed.")
         if publishing:
-            print(f"Published sprint check run {publish(api, scope, 'success', summary, run_id)}")
+            print(f"Published sprint check run {publish(api, scope, 'success', summary, run_id, attempt)}")
         if preflight:
-            check_id = verify_published(api, scope, summary, run_id, gate_job)
+            check_id = verify_published(api, scope, summary, run_id, attempt, gate_job)
             print(f"Verified sprint check run {check_id}")
-        print(summary)
+        print(run_summary(summary, run_id, attempt))
         return 0
     except (Blocked, KeyError, AttributeError, IndexError, OSError, TypeError, ValueError) as exc:
         print(f"Sprint blocked: {exc if isinstance(exc, Blocked) else 'Malformed or unavailable evidence'}", file=sys.stderr)

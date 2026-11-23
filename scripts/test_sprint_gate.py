@@ -25,7 +25,9 @@ MERGE = "c" * 40
 BOT = 42
 QODO_APP = 43
 COORDINATOR = 45
-RUN = 46
+RUN = 45261818774
+GATE_JOB = 138002065311
+CHECK_RUN = 138002493034
 PULL = 47
 SCOPE = gate.Scope(PULL, HEAD, BASE, MERGE, "B01")
 POLICY = gate.Policy(gate.BASE, gate.WORKFLOW, BASE)
@@ -46,7 +48,7 @@ class GitHubFixture:
         self.edit_history = {}
         self.deleted = []
         self.writes = []
-        self.log = "2026-11-23T19:22:07.0000000Z Published sprint check run 9\n"
+        self.logs = {}
 
     def get(self, route):
         if route not in self.objects:
@@ -67,15 +69,16 @@ class GitHubFixture:
         yield from self.deleted
 
     def job_log(self, job):
-        return self.log
+        return self.logs[job]
 
     def request(self, route, method, payload):
         self.writes.append((route, method, payload))
         rows = self.rows.setdefault(f"{gate.REPO}/commits/{HEAD}/check-runs", [])
+        record = payload | {"details_url": f"{gate.WEB}/runs/{CHECK_RUN}"}
         if method == "POST":
-            rows.append(payload | {"id": 9, "app": {"id": gate.ACTIONS_APP}})
+            rows.append(record | {"id": CHECK_RUN, "app": {"id": gate.ACTIONS_APP}})
         else:
-            rows[0].update(payload)
+            rows[0].update(record)
         return rows[0], ""
 
 
@@ -157,12 +160,8 @@ class SprintGateTests(unittest.TestCase):
                            qodo_row(2, "Current review complete", commit_id=HEAD, state="COMMENTED", submitted_at="new")],
             self.inline: [qodo_row(3, "Inline finding", commit_id=HEAD)],
             self.issues: [qodo_row(4, "Finding in summary"), qodo_row(5, qodo_review())],
-            self.jobs: [
-                {"name": f"sprint-b00 {job}", "id": 8, "head_sha": BASE, "run_id": RUN,
-                 "status": "completed", "conclusion": "success"}
-                for job in ("test", "package", "gate")
-            ],
         })
+        self.register_attempt(RUN, 1, GATE_JOB)
         self.api.edit_history["4"] = [{"id": "prior-summary", "diff": "Finding removed from current summary",
                                       "editor": {"databaseId": BOT}, "editedAt": "now"}]
         self.matrix = [{"id": item, "lote": "B01" if item == 1 else "B02", "aceite": "Acceptance criterion", "dependencias": [],
@@ -177,6 +176,20 @@ class SprintGateTests(unittest.TestCase):
         self.api.files[HEAD, "docs/sprint-autonoma/B01.md"] = self.api.files[BASE, "docs/sprint-autonoma/B01.md"]
         self.proof = [{"url": f"{gate.WEB}/pull/{PULL}#issuecomment-{PROOF}", "detail": "Executed a regression on the reviewed head."}]
         self.comment(PROOF, f"Tested {HEAD}\n{COMMAND}\n{RESULT}\n")
+
+    def register_attempt(self, run_id, attempt, gate_job):
+        run = self.api.objects[f"{gate.REPO}/actions/runs/{RUN}"]
+        self.api.objects[f"{gate.REPO}/actions/runs/{run_id}"] = run | {"id": run_id, "run_attempt": attempt}
+        self.api.rows[f"{gate.REPO}/actions/runs/{run_id}/attempts/{attempt}/jobs"] = [
+            {"name": f"sprint-b00 {name}", "id": job, "head_sha": BASE, "run_id": run_id,
+             "status": "completed", "conclusion": "success"}
+            for name, job in zip(("test", "package", "gate"), range(gate_job - 2, gate_job + 1))
+        ]
+        self.api.logs[gate_job] = f"2026-11-23T19:22:07.0000000Z Published sprint check run {CHECK_RUN}\n"
+
+    def checked_job(self, run_id, attempt):
+        gate.verify_run(self.api, POLICY, run_id, attempt, COORDINATOR)
+        return gate.verify_jobs(self.api, POLICY, run_id, attempt, include_gate=True)
 
     def comment(self, item, body, pull=PULL):
         if isinstance(body, dict):
@@ -232,21 +245,58 @@ class SprintGateTests(unittest.TestCase):
     def test_complete_evidence_passes_and_publishes_to_head(self):
         self.assertEqual(gate.pr_scope(self.api, PULL, HEAD, BASE), SCOPE)
         gate.verify_protection(self.api)
-        gate.verify_run(self.api, POLICY, RUN, 1, COORDINATOR)
-        job = gate.verify_jobs(self.api, POLICY, RUN, 1, include_gate=True)
+        job = self.checked_job(RUN, 1)
         records, completions = self.snapshot()
         manifest = self.manifest(records)
         self.verify_posted(manifest, self.audit(manifest))
-        self.assertEqual(gate.publish(self.api, SCOPE, "success", "Passed", RUN), 9)
+        self.assertEqual(gate.publish(self.api, SCOPE, "success", "Passed", RUN, 1), CHECK_RUN)
         self.assertEqual(self.api.writes[0][2]["head_sha"], HEAD)
-        self.assertEqual(gate.verify_published(self.api, SCOPE, "Passed", RUN, job), 9)
+        self.assertEqual(self.api.writes[0][2]["details_url"], f"{gate.WEB}/actions/runs/{RUN}")
+        self.assertEqual(gate.sprint_check(self.api, SCOPE)["details_url"], f"{gate.WEB}/runs/{CHECK_RUN}")
+        self.assertEqual(gate.verify_published(self.api, SCOPE, "Passed", RUN, 1, job), CHECK_RUN)
+
+    def test_check_url_must_identify_the_exact_check_or_workflow_run(self):
+        job = self.checked_job(RUN, 1)
+        gate.publish(self.api, SCOPE, "success", "Passed", RUN, 1)
+        check = gate.sprint_check(self.api, SCOPE)
+        check["details_url"] = f"{gate.WEB}/actions/runs/{RUN}"
+        self.assertEqual(gate.verify_published(self.api, SCOPE, "Passed", RUN, 1, job), CHECK_RUN)
+        for wrong_url in (f"{gate.WEB}/runs/{CHECK_RUN + 1}", f"{gate.WEB}/actions/runs/{RUN + 1}",
+                          f"{gate.WEB}/runs/{CHECK_RUN}?ref=main", f"https://example.invalid/runs/{CHECK_RUN}"):
+            with self.subTest(url=wrong_url):
+                check["details_url"] = wrong_url
+                with self.assertRaisesRegex(gate.Blocked, "protected job's published result"):
+                    gate.verify_published(self.api, SCOPE, "Passed", RUN, 1, job)
+
+    def test_runs_with_identical_attempt_and_evidence_require_their_own_result(self):
+        first_job = self.checked_job(RUN, 1)
+        self.assertEqual(gate.publish(self.api, SCOPE, "success", "Passed", RUN, 1), CHECK_RUN)
+        second_run = RUN + 1
+        self.register_attempt(second_run, 1, GATE_JOB + 3)
+        second_job = self.checked_job(second_run, 1)
+        with self.assertRaisesRegex(gate.Blocked, "protected job's published result"):
+            gate.verify_published(self.api, SCOPE, "Passed", second_run, 1, second_job)
+        for _ in range(2):
+            self.assertEqual(gate.publish(self.api, SCOPE, "success", "Passed", second_run, 1), CHECK_RUN)
+        self.assertEqual([row[1] for row in self.api.writes], ["POST", "PATCH"])
+        self.assertEqual(gate.verify_published(self.api, SCOPE, "Passed", second_run, 1, second_job), CHECK_RUN)
+        with self.assertRaisesRegex(gate.Blocked, "protected job's published result"):
+            gate.verify_published(self.api, SCOPE, "Passed", RUN, 1, first_job)
 
     def test_retry_recovers_existing_check_and_updates_a_failed_result(self):
-        gate.publish(self.api, SCOPE, "failure", "Blocked", RUN)
-        gate.publish(self.api, SCOPE, "failure", "Blocked", RUN)
-        gate.publish(self.api, SCOPE, "success", "Passed", RUN)
-        gate.publish(self.api, SCOPE, "success", "Passed", RUN)
+        gate.publish(self.api, SCOPE, "failure", "Blocked", RUN, 1)
+        gate.publish(self.api, SCOPE, "failure", "Blocked", RUN, 1)
+        gate.publish(self.api, SCOPE, "success", "Passed", RUN, 1)
+        gate.publish(self.api, SCOPE, "success", "Passed", RUN, 1)
         self.assertEqual([row[1] for row in self.api.writes], ["POST", "PATCH"])
+        self.register_attempt(RUN, 2, GATE_JOB + 3)
+        job = self.checked_job(RUN, 2)
+        with self.assertRaisesRegex(gate.Blocked, "protected job's published result"):
+            gate.verify_published(self.api, SCOPE, "Passed", RUN, 2, job)
+        for _ in range(2):
+            self.assertEqual(gate.publish(self.api, SCOPE, "success", "Passed", RUN, 2), CHECK_RUN)
+        self.assertEqual([row[1] for row in self.api.writes], ["POST", "PATCH", "PATCH"])
+        self.assertEqual(gate.verify_published(self.api, SCOPE, "Passed", RUN, 2, job), CHECK_RUN)
 
     def test_old_sha_and_foreign_workflow_are_blocked(self):
         with self.assertRaisesRegex(gate.Blocked, "SHA has changed"):
@@ -474,14 +524,14 @@ class SprintGateTests(unittest.TestCase):
                 list(api.edits("node-id", "issue"))
 
     def test_retry_rebinds_a_new_test_merge_only_with_identical_pr_base_head_and_app(self):
-        gate.publish(self.api, SCOPE, "success", "First result", RUN)
+        gate.publish(self.api, SCOPE, "success", "First result", RUN, 1)
         refreshed = gate.Scope(PULL, HEAD, BASE, "f" * 40, "B01")
-        gate.publish(self.api, refreshed, "success", "Refreshed result", RUN + 1)
+        gate.publish(self.api, refreshed, "success", "Refreshed result", RUN + 1, 1)
         self.assertEqual([row[1] for row in self.api.writes], ["POST", "PATCH"])
-        self.assertEqual(gate.sprint_check(self.api, refreshed)["id"], 9)
+        self.assertEqual(gate.sprint_check(self.api, refreshed)["id"], CHECK_RUN)
         conflicting_base = gate.Scope(PULL, HEAD, "e" * 40, MERGE, "B01")
         with self.assertRaisesRegex(gate.Blocked, "Unexpected sprint check issuer"):
-            gate.publish(self.api, conflicting_base, "success", "Unrelated result", RUN + 2)
+            gate.publish(self.api, conflicting_base, "success", "Unrelated result", RUN + 2, 1)
 
     def test_publication_audit_reads_candidate_without_loading_its_code(self):
         git = shutil.which("git")
@@ -580,21 +630,30 @@ class SprintGateTests(unittest.TestCase):
             gate.verify_protection(self.api)
 
     def test_check_homonym_without_matching_gate_log_is_blocked(self):
-        gate.publish(self.api, SCOPE, "success", "Passed", RUN)
-        self.api.log = "Published sprint check run 10\n"
+        job = self.checked_job(RUN, 1)
+        gate.publish(self.api, SCOPE, "success", "Passed", RUN, 1)
+        self.api.logs[GATE_JOB] = f"Published sprint check run {CHECK_RUN + 1}\n"
         with self.assertRaisesRegex(gate.Blocked, "protected job's published result"):
-            gate.verify_published(self.api, SCOPE, "Passed", RUN, {"id": 8})
+            gate.verify_published(self.api, SCOPE, "Passed", RUN, 1, job)
 
     def test_bootstrap_requires_pr_one_pinned_sha_and_absent_main_workflow(self):
         commit = "e" * 40
         route = f"{gate.REPO}/contents/.github/workflows?ref={BASE}"
-        self.api.objects[f"{gate.REPO}/branches/{gate.BOOTSTRAP_BRANCH}"] = {"protected": True, "commit": {"sha": commit}}
+        branch = {"protected": True, "commit": {"sha": commit}}
+        self.api.objects[f"{gate.REPO}/branches/sprint-gate-bootstrap"] = branch
         self.api.objects[route] = [{"path": gate.BOOTSTRAP_WORKFLOW}]
         with patch.dict("os.environ", {"SPRINT_BOOTSTRAP_SHA": commit}):
             with self.assertRaisesRegex(gate.Blocked, "first B00"):
                 gate.policy_for(self.api, SCOPE, True)
             bootstrap = gate.Scope(1, HEAD, BASE, MERGE, "B00")
-            self.assertEqual(gate.policy_for(self.api, bootstrap, True), gate.Policy(gate.BOOTSTRAP_BRANCH, gate.BOOTSTRAP_WORKFLOW, commit))
+            with self.assertRaisesRegex(gate.Blocked, "evidence record is unavailable"):
+                gate.policy_for(self.api, bootstrap, True)
+            self.api.objects[f"{gate.REPO}/branches/sprint-gate-bootstrap-v2"] = branch
+            expected = gate.Policy("sprint-gate-bootstrap-v2", gate.BOOTSTRAP_WORKFLOW, commit)
+            self.assertEqual(gate.policy_for(self.api, bootstrap, True), expected)
+            with patch.dict("os.environ", {"SPRINT_BOOTSTRAP_SHA": "f" * 40}):
+                with self.assertRaisesRegex(gate.Blocked, "protected bootstrap ref changed"):
+                    gate.policy_for(self.api, bootstrap, True)
             self.api.objects[route].append({"path": gate.WORKFLOW})
             with self.assertRaisesRegex(gate.Blocked, "Bootstrap ended"):
                 gate.policy_for(self.api, bootstrap, True)
