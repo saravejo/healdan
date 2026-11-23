@@ -7,6 +7,8 @@ from .core import atomic, digest, read_json, require, safe_path, stamp
 from .ids import identity
 from .tasks import get_session, get_task, require_active, validate_evidence
 
+CSP_RULE_V1 = "CSP-1/i111/f0.1/numeric-v1"
+
 
 def freeze_review(vault, task_id, extractor, reviewer):
     with vault.locked():
@@ -65,15 +67,21 @@ def validate_review(vault, task_id, units):
 
 
 def freeze_csp(units, state, seed=None):
+    require(state.get("rule", CSP_RULE_V1) == CSP_RULE_V1,
+            "A different inspection regime requires a separate human decision and a new sequence", 5)
+    streak = state.get("streak", 0)
+    require(type(streak) is int and 0 <= streak <= 111, "Invalid inspection sequence")
     ordered = sorted(units, key=identity)
     require(len({identity(i) for i in ordered}) == len(ordered), "CSP identity collision")
-    return {"rule": "CSP-1/i111/f0.1/numeric-v1", "units": ordered, "units_digest": digest(units),
-            "seed": seed or secrets.token_hex(32), "initial_streak": state.get("streak", 0),
+    return {"rule": CSP_RULE_V1, "units": ordered, "units_digest": digest(units),
+            "seed": seed or secrets.token_hex(32), "initial_streak": streak,
             "state_digest": digest(state), "inspections": {}}
 
 
 def csp_status(plan):
+    require(plan.get("rule") == CSP_RULE_V1, "Unknown inspection regime")
     streak, selected, pending, defect = plan["initial_streak"], [], [], False
+    require(type(streak) is int and 0 <= streak <= 111, "Invalid inspection sequence")
     for index, unit in enumerate(plan["units"]):
         counter = 0
         while True:

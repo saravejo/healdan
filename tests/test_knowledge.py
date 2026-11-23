@@ -57,6 +57,23 @@ class Query(VaultTest):
         self.assertEqual(result["code"], 1)
         self.assertIn("Injected read failure", result["diagnostics"][0])
 
+    def test_corruption_in_any_required_registry_is_an_integrity_failure(self):
+        self.knowledge([self.claim()])
+        for name in REQUIRED_REGISTRIES:
+            path = self.root / name
+            before = path.read_bytes()
+            with self.subTest(registry=name):
+                try:
+                    atomic(path, b'{"broken":\r\n')
+                    code, result = self.cli("query", "--entity", "instrument")
+                    self.assertEqual(code, 4)
+                    self.assertIn(name, result["error"].replace("\\", "/"))
+                    opened = query(self.vault, {"entity": "instrument"})
+                    self.assertEqual(opened["code"], 4)
+                    self.assertIn(name, opened["diagnostics"][0].replace("\\", "/"))
+                finally:
+                    atomic(path, before)
+
     def test_unborn_vault_and_optional_page_policy(self):
         root, state = self.base / "unborn vault", self.base / "unborn state"
         initialize(root, state)

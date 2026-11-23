@@ -90,9 +90,17 @@ class Transactions(VaultTest):
             return atomic(path, data)
         with patch("healdan.transactions.atomic", side_effect=fail_once), self.assertRaises(OSError):
             transactions.apply(self.vault, package["id"])
-        self.assertEqual(read_json(self.vault.control / "transaction.json")["status"], "writing")
+        journal_path = self.vault.control / "transaction.json"
+        original = journal_path.read_bytes()
+        journal = read_json(journal_path)
+        self.assertEqual(journal["status"], "writing")
         with self.assertRaises(Blocked):
             ids.reserve(self.vault, "S", 1, str(uuid4()))
+        journal["files"]["wiki/claims.jsonl"] = base64.b64encode(jsonl([{"id": "D-0001"}])).decode("ascii")
+        atomic(journal_path, journal)
+        with self.assertRaisesRegex(Blocked, "Recovery journal files differ from the signed package"):
+            transactions.apply(self.vault, recover=True)
+        atomic(journal_path, original)
         recovered = transactions.apply(self.vault, recover=True)
         self.assertEqual(recovered["status"], "complete")
         self.assertEqual(query(self.vault, {"entity": "instrument"})["code"], 0)
@@ -265,15 +273,23 @@ class Transactions(VaultTest):
         self.assertEqual((result["status"], result["commit"]), ("complete", committed))
 
     def test_candidate_copy_requires_every_registry(self):
-        inputs = self.vault.inputs()
+        inputs = dict(self.vault.input_files())
         for registry in REQUIRED_REGISTRIES:
             with self.subTest(registry=registry):
-                incomplete = {name: sha for name, sha in inputs.items() if name != registry}
-                with patch.object(self.vault, "inputs", return_value=incomplete):
+                incomplete = [(name, body) for name, body in inputs.items() if name != registry]
+                with patch.object(self.vault, "input_files", return_value=incomplete):
                     with self.assertRaisesRegex(Blocked, registry) as raised:
                         with transactions.Candidate(self.vault, {}):
                             self.fail("Candidate accepted an absent registry")
                 self.assertEqual(raised.exception.code, 4)
+        self.assertEqual(list(self.state.glob("candidate-*")), [])
+
+    def test_candidate_copy_rejects_corrupted_unused_registry(self):
+        body = base64.b64encode(b'{"broken":\n').decode("ascii")
+        with self.assertRaisesRegex(Blocked, "Invalid JSON") as raised:
+            with transactions.Candidate(self.vault, {"wiki/control/decisions.jsonl": body}):
+                self.fail("Candidate accepted malformed decisions")
+        self.assertEqual(raised.exception.code, 4)
         self.assertEqual(list(self.state.glob("candidate-*")), [])
 
 

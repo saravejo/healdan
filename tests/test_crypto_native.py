@@ -22,10 +22,17 @@ class RealAge(VaultTest):
         self.assertNotIn(b"synthetic", cipher)
         self.assertEqual(digest(custody.decrypt(self.vault, cipher, identities[1])), record["plain_sha256"])
         restored = self.state / "reconstructed"
-        custody.restore_capture(self.vault, identifier, restored)
+        (self.root / "wiki/claims.jsonl").unlink()
+        code, result = self.cli("session", "restore", identifier, restored)
+        self.assertEqual(code, 0, result)
         self.assertEqual((restored / "session.jsonl").read_bytes(), (origin / "session.jsonl").read_bytes())
         self.assertTrue(any(c["root"] == str(restored.resolve()) for c in custody.materials(self.vault)[identifier]["copies"]))
-        self.assertNotIn("native_recovery", record)
+        proof = self.state / "incomplete-recovery.json"
+        atomic(proof, {})
+        code, result = self.cli("session", "approve-recovery", identifier, proof)
+        self.assertEqual(code, 5)
+        self.assertIn("Recovery proof does not match the captured archive", result["error"])
+        self.assertNotIn("native_recovery", custody.materials(self.vault)[identifier])
 
     def test_real_backup_roundtrip_and_manifest_only_long_generation(self):
         self.age()
@@ -37,6 +44,9 @@ class RealAge(VaultTest):
         self.assertEqual(len(backups.verify_backup(self.vault, record["id"])["copies"]), 1)
         restored = self.base / "restored vault"
         (self.root / "wiki/claims.jsonl").unlink()
+        code, result = self.cli("backup", "verify", record["id"])
+        self.assertEqual(code, 0, result)
+        self.assertEqual([copy["verified"] for copy in result["copies"]], [True])
         code, result = self.cli("restore", record["id"], restored)
         self.assertEqual(code, 0, result)
         self.assertEqual((restored / "wiki/claims.jsonl").read_bytes(), b"")

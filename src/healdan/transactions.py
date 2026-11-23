@@ -4,7 +4,7 @@ import copy
 from pathlib import Path
 import tempfile
 
-from .core import REGISTRIES, atomic, digest, git, jsonl, parse_jsonl, read_json, require, safe_path, stamp
+from .core import REGISTRIES, atomic, digest, git, jsonl, read_json, require, safe_path, stamp
 from .ids import aliases, committed_registries, identity, registry_records
 from .knowledge import Knowledge
 from .pages import generated_pages, validate_pages
@@ -34,8 +34,8 @@ class Candidate:
         self.temporary = tempfile.TemporaryDirectory(prefix="candidate-", dir=self.vault.state)
         root = Path(self.temporary.name)
         try:
-            for name in self.vault.inputs():
-                atomic(safe_path(root, name), safe_path(self.vault.root, name, exists=True).read_bytes())
+            for name, data in self.vault.input_files():
+                atomic(safe_path(root, name), data)
             for name, encoded in self.files.items():
                 require(allowed(name), "Unauthorized proposal path: " + name)
                 atomic(safe_path(root, name), base64.b64decode(encoded, validate=True))
@@ -101,17 +101,13 @@ def validate_candidate(vault, candidate, cutoff):
 
 def validate_recovery_identities(vault, signed_files, commit=None):
     committed = dict(committed_registries(vault, commit)) if commit else {}
-    for registry in REGISTRIES:
-        if registry in signed_files:
-            data = base64.b64decode(signed_files[registry], validate=True)
-            rows = parse_jsonl(data, registry)
-        else:
-            rows = vault.rows(registry)
-        expected = registry_records(registry, rows)
-        if commit:
-            require(registry in committed, "Committed registry is missing: " + registry)
-            actual = registry_records(registry, committed[registry])
-            require(actual.keys() == expected.keys(), "Committed identities differ from the signed candidate: " + registry)
+    with Candidate(vault, signed_files) as candidate:
+        for registry in REGISTRIES:
+            expected = registry_records(registry, candidate.rows(registry))
+            if commit:
+                require(registry in committed, "Committed registry is missing: " + registry)
+                actual = registry_records(registry, committed[registry])
+                require(actual.keys() == expected.keys(), "Committed identities differ from the signed candidate: " + registry)
 
 
 def package_path(vault, identifier):
@@ -186,7 +182,7 @@ def inspect_package(vault, identifier, results):
         require(record and not record["approval"], "Unknown or already signed package", 2)
         status = inspect(record["csp"], results)
         if status["defect"]:
-            atomic(vault.control / "csp.json", {"streak": 0, "defect_package": identifier})
+            atomic(vault.control / "csp.json", {"rule": record["csp"]["rule"], "streak": 0, "defect_package": identifier})
         atomic(path, record)
         return csp_status(record["csp"])
 
@@ -281,7 +277,8 @@ def apply(vault, identifier=None, *, recover=False):
             git(vault.root, "add", "--", *journal["files"])
             git(vault.root, "-c", "commit.gpgsign=false", "commit", "-m",
                 f"Apply approved knowledge package\n\nHealdan-Package: {identifier}", "--", *journal["files"])
-        atomic(vault.control / "csp.json", {"streak": csp_status(record["csp"])["streak"], "package": identifier})
+        atomic(vault.control / "csp.json", {"rule": record["csp"]["rule"],
+                                           "streak": csp_status(record["csp"])["streak"], "package": identifier})
         journal.update(status="complete", commit=vault.head(), completed_at=stamp())
         atomic(journal_path, journal)
         vault.receipt("integration", {"package": identifier, "commit": vault.head()})

@@ -4,6 +4,10 @@ All distributed names, messages, fields, and configuration are English.
 JSON is UTF-8, finite, and rejects duplicate keys. JSONL starts empty.
 Timestamps must have an offset and are normalized to UTC.
 
+Setup initializes the nine required JSONL registries. An empty registry is
+valid. A missing or malformed registry produces integrity error 4 during
+operational use. A read failure produces technical error 1.
+
 Identifiers use F/C/D/L/Q/M/S followed by ASCII digits. New fields require
 four digits or a larger integer without extra leading zeros. Identity and
 order are `(prefix, numeric_suffix)`; reservation starts at one, never zero.
@@ -40,10 +44,13 @@ state, and diagnostics. Exit codes: 0 answer; 1 technical failure; 2 invalid
 input; 3 conflict; 4 integrity failure; 5 incomplete/blocked research;
 20 abstention. A failure never counts as abstention.
 
-Cases in `wiki/control/query-cases.jsonl` contain id, question, filters,
-cutoff or temporal policy, expected IDs/value/polarity/outcome/conflicts,
-reason, and a human decision with an individual SSH signature. Signatures
-use separate namespaces for cases, packages, aliases, and trial evidence.
+Cases in `wiki/control/query-cases.jsonl` contain an ID, question, filters,
+cutoff or temporal policy, reason, and a human decision with an individual
+SSH signature. Cases with `format` set to `healdan-query-case-v2` group the
+expected IDs, value, polarity, outcome, and conflicts in `expectation`.
+The controller verifies legacy cases with flat expectation fields before
+projecting their fields into this shape for regression. Signatures use
+separate namespaces for cases, packages, aliases, and trial evidence.
 Previous signed decisions remain in immutable receipt history.
 
 Tasks and sessions are controller state. A session has S-, UUID, task/action,

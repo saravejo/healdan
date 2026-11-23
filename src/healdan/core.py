@@ -70,9 +70,10 @@ def read_json(path, default=None):
     return decode(Path(path).read_bytes()) if Path(path).exists() else default
 
 
-def parse_jsonl(data, path):
+def parse_jsonl(data, path, *, include_bytes=False):
     if not data:
         return []
+    terminated = data.endswith(b"\n")
     lines = data.removesuffix(b"\n").split(b"\n")
     rows = []
     for number, line in enumerate(lines, 1):
@@ -82,18 +83,25 @@ def parse_jsonl(data, path):
         except Blocked as exc:
             raise Blocked(f"{path}:{number}: {exc}", exc.code) from exc
         require(isinstance(row, dict), f"JSONL row is not an object: {path}:{number}")
+        if include_bytes:
+            original = line + b"\n" if terminated or number < len(lines) else line
+            rows.append((row, original))
+            continue
         rows.append(row)
     return rows
 
 
-def read_jsonl(path, *, required=False):
-    path = Path(path)
+def _read_jsonl_bytes(path, *, required):
     try:
-        data = path.read_bytes()
+        return path.read_bytes()
     except FileNotFoundError:
         require(not required, "Required JSONL registry is missing: " + str(path))
-        return []
-    return parse_jsonl(data, path)
+        return b""
+
+
+def read_jsonl(path, *, required=False, include_bytes=False):
+    path = Path(path)
+    return parse_jsonl(_read_jsonl_bytes(path, required=required), path, include_bytes=include_bytes)
 
 
 def jsonl(rows):
@@ -255,31 +263,35 @@ class Vault:
     def locked(self):
         return lock(self.control / "controller.lock")
 
-    def rows(self, name):
+    def rows(self, name, *, include_bytes=False):
         required = Path(name).as_posix() in REQUIRED_REGISTRIES
-        return read_jsonl(safe_path(self.root, name, exists=required), required=required)
+        return read_jsonl(safe_path(self.root, name, exists=required), required=required, include_bytes=include_bytes)
 
     def check_registries(self):
         for name in REQUIRED_REGISTRIES:
-            safe_path(self.root, name, exists=True)
+            self.rows(name)
 
     def head(self):
         result = git(self.root, "rev-parse", "--verify", "HEAD", check=False)
         return result or None
 
-    def inputs(self):
-        self.check_registries()
-        result = {}
+    def input_files(self):
+        for name in REQUIRED_REGISTRIES:
+            path = safe_path(self.root, name, exists=True)
+            data = _read_jsonl_bytes(path, required=True)
+            parse_jsonl(data, path)
+            yield name, data
         for folder in ("wiki", "resources/sources", "templates", "config", "control/approvals"):
             base = self.root / folder
             if base.exists():
                 for path in sorted(base.rglob("*")):
                     if path.is_file() or path.is_symlink():
                         rel = path.relative_to(self.root).as_posix()
-                        result[rel] = digest(safe_path(self.root, rel, exists=True).read_bytes())
-        for name in REQUIRED_REGISTRIES:
-            require(name in result, "Required JSONL registry is missing: " + name)
-        return result
+                        if rel not in REQUIRED_REGISTRIES:
+                            yield rel, safe_path(self.root, rel, exists=True).read_bytes()
+
+    def inputs(self):
+        return {name: digest(data) for name, data in self.input_files()}
 
     def fingerprint(self):
         signers = self.config.get("allowed_signers")

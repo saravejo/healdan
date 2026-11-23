@@ -10,6 +10,7 @@ from .signing import trusted_signers, verify
 
 LIVE = {"accepted", "hypothesis", "disputed"}
 STATES = LIVE | {"superseded", "rejected"}
+QUERY_FILTERS = {"entity", "property", "environment", "modality", "topic", "term"}
 
 
 def typed(value):
@@ -127,8 +128,7 @@ class Knowledge:
                 (not row.get("valid_to") or cutoff < utc(row["valid_to"])))
 
     def resolve(self, filters, cutoff, *, max_records=None):
-        allowed = {"entity", "property", "environment", "modality", "topic", "term"}
-        require(set(filters) <= allowed and all(isinstance(v, str) for v in filters.values()),
+        require(set(filters) <= QUERY_FILTERS and all(isinstance(v, str) for v in filters.values()),
                 "Unsupported query filter", 2)
         if max_records is not None and len(self.claims) > max_records:
             return {"code": 5, "outcome": "blocked", "ids": [], "value": None,
