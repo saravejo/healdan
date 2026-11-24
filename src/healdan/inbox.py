@@ -16,26 +16,65 @@ def ordinary(path):
     return path.startswith("inbox/") and path not in EXCLUDED and not path.startswith("inbox/tasks/") and not path.endswith("/.gitkeep")
 
 
-def ordinary_paths(root):
-    for path in sorted((root / "inbox").rglob("*")):
-        relative = path.relative_to(root).as_posix()
-        if ordinary(relative):
+def junction(metadata):
+    tag = getattr(metadata, "st_reparse_tag", 0)
+    return bool(tag) and tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+def ordinary_paths(root, on_error):
+    try:
+        (root / "inbox").lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        on_error("inbox", exc)
+        return
+    pending = [("inbox", True)]
+    while pending:
+        relative, directory = pending.pop()
+        if not directory:
             yield relative
+            continue
+        try:
+            path = safe_path(root, relative)
+            metadata = path.lstat()
+            require(stat.S_ISDIR(metadata.st_mode) and not junction(metadata),
+                    "Inbox directory is unsafe: " + relative, 5)
+            with os.scandir(path) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name, reverse=True)
+        except (Blocked, OSError) as exc:
+            on_error(relative, exc)
+            continue
+        for entry in entries:
+            name = f"{relative}/{entry.name}"
+            if name == "inbox/tasks" or not ordinary(name):
+                continue
+            try:
+                pending.append((name, entry.is_dir(follow_symlinks=False)))
+            except OSError as exc:
+                on_error(name, exc)
 
 
 def read_ordinary_file(root, relative):
-    mode = (root / relative).lstat().st_mode
-    if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
-        return safe_path(root, relative, exists=True).read_bytes()
-    return None
+    path = safe_path(root, relative)
+    metadata = path.lstat()
+    require(not stat.S_ISLNK(metadata.st_mode) and not junction(metadata), "Inbox entry is unsafe: " + relative, 5)
+    return path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
 
 
 def inventory(vault):
+    def on_error(_relative, error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
     with vault.locked():
         journal_path = vault.control / "inbox.json"
         items = read_json(journal_path, {})
-        for relative in ordinary_paths(vault.root):
-            data = read_ordinary_file(vault.root, relative)
+        for relative in ordinary_paths(vault.root, on_error):
+            try:
+                data = read_ordinary_file(vault.root, relative)
+            except FileNotFoundError:
+                continue
             if data is None:
                 continue
             key = digest(data)
@@ -135,17 +174,17 @@ def worktree_inbox_digests(vault):
         roots = {vault.root}
         errors.append({"category": "inbox", "error": str(exc)})
     for root in sorted(roots):
-        try:
-            for relative in ordinary_paths(root):
-                try:
-                    body = read_ordinary_file(root, relative)
-                except (Blocked, OSError) as exc:
-                    errors.append({"category": "inbox", "worktree": str(root), "path": relative, "error": str(exc)})
-                    continue
-                if body is not None:
-                    observed.add((relative, digest(body)))
-        except (Blocked, OSError) as exc:
-            errors.append({"category": "inbox", "worktree": str(root), "error": str(exc)})
+        def on_error(relative, error):
+            errors.append({"category": "inbox", "worktree": str(root), "path": relative, "error": str(error)})
+
+        for relative in ordinary_paths(root, on_error):
+            try:
+                body = read_ordinary_file(root, relative)
+            except (Blocked, OSError) as exc:
+                on_error(relative, exc)
+                continue
+            if body is not None:
+                observed.add((relative, digest(body)))
     return observed, errors
 
 

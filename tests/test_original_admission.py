@@ -2,6 +2,7 @@ from datetime import timedelta
 import os
 from pathlib import Path
 import shlex
+import stat
 import sys
 from unittest.mock import patch
 from uuid import uuid4
@@ -601,6 +602,168 @@ class OriginalAdmission(VaultTest):
         complete = linting.lint(self.vault, now)
         self.assertEqual(complete["status"], "complete")
         self.assertEqual(read_json(followups)["inbox"]["state"], "resolved")
+
+    def test_inventory_preserves_siblings_when_listed_entries_disappear(self):
+        folder = self.root / "inbox"
+        (folder / ".gitkeep").unlink()
+        folder.rmdir()
+        self.assertEqual(inbox.inventory(self.vault), [])
+        self.assertEqual(linting.lint(self.vault)["status"], "complete")
+
+        early = folder / "first.txt"
+        late = folder / "later.txt"
+        vanishing = folder / "vanishing-folder"
+        excluded = folder / "tasks"
+        kept = folder / "welcome" / "sibling.txt"
+        for path in (early, late, kept, excluded / "task.txt"):
+            atomic(path, b"Inventory fixture")
+        vanishing.mkdir()
+        lstat, read, scandir = Path.lstat, Path.read_bytes, os.scandir
+        removed = set()
+        scans = []
+
+        def disappear_at_lstat(path, *args, **kwargs):
+            if path == early and path not in removed:
+                removed.add(path)
+                path.unlink()
+            return lstat(path, *args, **kwargs)
+
+        def disappear_at_read(path):
+            if path == late and path not in removed:
+                removed.add(path)
+                path.unlink()
+            return read(path)
+
+        def disappear_at_scan(path):
+            path = Path(path)
+            scans.append(path)
+            if path == vanishing and path not in removed:
+                removed.add(path)
+                path.rmdir()
+            return scandir(path)
+
+        with (
+            patch.object(Path, "lstat", disappear_at_lstat),
+            patch.object(Path, "read_bytes", disappear_at_read),
+            patch("healdan.inbox.os.scandir", side_effect=disappear_at_scan),
+        ):
+            rows = inbox.inventory(self.vault)
+        self.assertEqual(removed, {early, late, vanishing})
+        self.assertNotIn(excluded, scans)
+        self.assertEqual([row["paths"] for row in rows], [["inbox/welcome/sibling.txt"]])
+        self.assertEqual(read_json(self.vault.control / "inbox.json")[digest(kept.read_bytes())]["paths"],
+                         ["inbox/welcome/sibling.txt"])
+
+    def test_inventory_keeps_permission_and_path_guard_failures_explicit(self):
+        old = self.root / "inbox" / "old.txt"
+        atomic(old, b"Prior fixture capture")
+        inbox.inventory(self.vault)
+        state = self.vault.control / "inbox.json"
+        saved = state.read_bytes()
+        denied = self.root / "inbox" / "denied"
+        existing = denied / "fixture.txt"
+        atomic(existing, b"Unobserved fixture capture")
+        scandir = os.scandir
+
+        def deny(path):
+            if Path(path) == denied:
+                raise PermissionError("Fixture denied directory")
+            return scandir(path)
+
+        with patch("healdan.inbox.os.scandir", side_effect=deny), self.assertRaisesRegex(PermissionError, "Fixture denied"):
+            inbox.inventory(self.vault)
+        self.assertEqual(state.read_bytes(), saved)
+        safe = inbox.safe_path
+
+        def block(root, relative, **kwargs):
+            if root == self.root and relative == "inbox/denied/fixture.txt":
+                raise Blocked("Fixture strict file guard", 5)
+            return safe(root, relative, **kwargs)
+
+        with patch("healdan.inbox.safe_path", side_effect=block), self.assertRaisesRegex(Blocked, "Fixture strict"):
+            inbox.inventory(self.vault)
+        self.assertEqual(state.read_bytes(), saved)
+        self.assertEqual(existing.read_bytes(), b"Unobserved fixture capture")
+
+    def test_inbox_special_metadata_is_ignored_without_reading_content(self):
+        special = self.root / "inbox" / "special.txt"
+        atomic(special, b"A regular fixture with synthetic special-file metadata")
+        lstat, read = Path.lstat, Path.read_bytes
+
+        def special_metadata(path, *args, **kwargs):
+            info = lstat(path, *args, **kwargs)
+            return os.stat_result((stat.S_IFIFO, *info[1:])) if path == special else info
+
+        def read_regular(path):
+            self.assertNotEqual(path, special)
+            return read(path)
+
+        with patch.object(Path, "lstat", special_metadata), patch.object(Path, "read_bytes", read_regular):
+            self.assertEqual(inbox.inventory(self.vault), [])
+            run = linting.lint(self.vault)
+        self.assertEqual(run["status"], "complete", run["errors"])
+        self.assertNotIn("inbox", run["categories"])
+
+    def test_lint_reports_directory_failures_and_keeps_readable_inbox_branches(self):
+        retired = "inbox/old.txt"
+        sha = self.defer_empty(retired)["sha256"]
+        inbox.archive_empty(self.vault, sha)
+        linked = self.base / "linked vault"
+        git(self.root, "worktree", "add", "--detach", linked, "HEAD")
+        denied = linked / "inbox" / "denied"
+        disappearing = linked / "inbox" / "disappearing"
+        excluded = linked / "inbox" / "tasks"
+        hidden = denied / "empty.txt"
+        atomic(hidden, b"")
+        atomic(excluded / "task.txt", b"Excluded operational fixture")
+        now = utc() + timedelta(days=8)
+        baseline = linting.lint(self.vault, now)
+        self.assertEqual(baseline["status"], "complete")
+        self.assertIn(f"inbox:{sha}:deferral_due", baseline["findings"])
+        state = self.vault.control / "lint-state.json"
+        saved = state.read_bytes()
+        followups = self.vault.control / "followups.json"
+        prior_id = read_json(followups)["inbox"]["id"]
+
+        disappearing.mkdir()
+        late = linked / "inbox" / "lost.txt"
+        good = linked / "inbox" / "readable" / "sibling.txt"
+        atomic(late, b"Vanishing fixture")
+        atomic(good, b"Readable sibling fixture")
+        scandir, read = os.scandir, Path.read_bytes
+        scans = []
+
+        def trouble(path):
+            path = Path(path)
+            scans.append(path)
+            if path == denied:
+                raise PermissionError("Fixture denied directory")
+            if path == disappearing:
+                path.rmdir()
+            return scandir(path)
+
+        def disappear_at_read(path):
+            if path == late:
+                path.unlink()
+            return read(path)
+
+        with patch("healdan.inbox.os.scandir", side_effect=trouble), patch.object(Path, "read_bytes", disappear_at_read):
+            partial = linting.lint(self.vault, now)
+        self.assertEqual(partial["status"], "partial")
+        self.assertCountEqual([(error["category"], error["worktree"], error["path"]) for error in partial["errors"]],
+                              [("inbox", str(linked), path) for path in ("inbox/denied", "inbox/disappearing", "inbox/lost.txt")])
+        self.assertNotIn(excluded, scans)
+        self.assertIn("inbox:inbox/readable/sibling.txt", partial["findings"])
+        self.assertIn(f"inbox:{sha}:deferral_due", partial["findings"])
+        self.assertIn("backup", partial["categories"])
+        self.assertEqual(partial["delta"]["resolved"], [])
+        self.assertEqual(state.read_bytes(), saved)
+        self.assertEqual(read_json(followups)["inbox"]["id"], prior_id)
+        self.assertEqual(read_json(followups)["inbox"]["state"], "open")
+        self.assertEqual(hidden.read_bytes(), b"")
+        complete = linting.lint(self.vault, now)
+        self.assertEqual(complete["status"], "complete")
+        self.assertIn("inbox:inbox/denied/empty.txt", complete["findings"])
 
     def test_shared_archive_deletion_recovers_all_verified_custody_slots(self):
         first, second = "inbox/a/shared.txt", "inbox/b/shared.txt"
