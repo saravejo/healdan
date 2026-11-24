@@ -9,8 +9,8 @@ from support import VaultTest
 import test_source_policy
 import test_transactions
 from healdan import integration_effects as effects, integration_git as integration, integration_journal as journals
-from healdan import transactions
-from healdan.core import Blocked, Vault, atomic, canonical, digest, extend_jsonl, git, git_bytes, jsonl, parse_jsonl, read_json, run, stamp
+from healdan import integration_files, originals, tasks, transactions
+from healdan.core import Blocked, Vault, atomic, canonical, digest, executable, extend_jsonl, git, git_bytes, jsonl, parse_jsonl, read_json, run, stamp
 from healdan.ids import reserve
 
 
@@ -58,7 +58,18 @@ class IntegrationB06(VaultTest):
             (self.root / registry).chmod(0o755)
             (self.root / "unchanged.sh").chmod(0o755)
         git(self.root, "commit", "-m", "Fixture base with modes and separators")
-        base = self.vault.head()
+        prior = self.vault.head()
+        empty = git_bytes(self.root, "mktree", data=b"").decode("ascii").strip()
+        child, object_id = b"unaffected-empty", empty
+        for parent in ("wiki/control", "wiki", ""):
+            tree = prior + ":" + parent if parent else prior
+            before = git_bytes(self.root, "ls-tree", "-z", tree).split(b"\0")[:-1]
+            rows = [entry for entry in before if entry.split(b"\t", 1)[1] != child]
+            rows.append(b"040000 tree " + object_id.encode("ascii") + b"\t" + child)
+            object_id = git_bytes(self.root, "mktree", "-z", data=b"\0".join(rows) + b"\0").decode("ascii").strip()
+            child = parent.rsplit("/", 1)[-1].encode("ascii")
+        base = git(self.root, "commit-tree", object_id, "-p", prior, "-m", "Retain an untouched empty Git entry")
+        git(self.root, "update-ref", "HEAD", base, prior)
         body = b"\x00\xffa\r\nb\n"
         row = test_source_policy.SourcePolicy.proposal(self, body)
         editor = self.state / "tasks" / self.source_task["id"] / "proposals/editor"
@@ -83,6 +94,9 @@ class IntegrationB06(VaultTest):
             self.assertEqual(after[path][0], before[path][0] if path in before else "100644")
         self.assertEqual({k: v for k, v in after.items() if k not in expected},
                          {k: v for k, v in before.items() if k not in expected})
+        empty_path = "wiki/control/unaffected-empty"
+        self.assertEqual(integration.entries(self.root, commit, scopes=[empty_path])[empty_path],
+                         ("040000", "tree", empty))
         self.assertEqual(integration.index_entries(self.root, expected),
                          {k: [[after[k][0], after[k][2], 0, 0]] for k in expected})
         self.assertIsNotNone(read_json(self.vault.control / "csp.json").get("rule"))
@@ -213,6 +227,205 @@ class IntegrationB06(VaultTest):
         self.assertEqual(copy_path.read_bytes(), external)
         self.assert_once(record, published)
 
+    def test_affected_stage_after_index_record_keeps_integration_pending(self):
+        record = self.package()
+        name, unrelated = "wiki/control/decisions.jsonl", "unrelated staged.txt"
+        target = self.root / name
+        approved = journals.decode_bytes(record["payload"]["files"][name])
+        external = b'{"id":"D-0123"}\n'
+        csp = read_json(self.vault.control / "csp.json")
+        receipts = {path.name: path.read_bytes() for path in (self.vault.control / "receipts").glob("*.json")}
+        persist = journals.persist
+
+        def stage_after_index(path, journal):
+            persist(path, journal)
+            if journal["phase"] == "indexed":
+                self.assertEqual(target.read_bytes(), approved)
+                self.write_external(target, external)
+                self.write_external(self.root / unrelated, b"Unrelated stage\n")
+                git(self.root, "add", "--", name, unrelated)
+                self.write_external(target, approved)
+
+        with patch("healdan.integration_journal.persist", side_effect=stage_after_index):
+            with self.assertRaisesRegex(Blocked, "Integration index differs: " + name) as conflict:
+                transactions.apply(self.vault, record["id"])
+        self.assertEqual(conflict.exception.code, 5)
+        pending = read_json(self.journal)
+        self.assertEqual((pending["phase"], pending["status"]), ("indexed", "writing"))
+        commit = pending["expected_commit"]
+        self.assertEqual(git_bytes(self.root, "cat-file", "blob", commit + ":" + name), approved)
+        self.assertEqual(git_bytes(self.root, "cat-file", "blob", ":" + name), external)
+        self.assertEqual(target.read_bytes(), approved)
+        self.assertEqual(read_json(self.vault.control / "csp.json"), csp)
+        self.assertEqual({path.name: path.read_bytes() for path in (self.vault.control / "receipts").glob("*.json")}, receipts)
+        unrelated_stage = git_bytes(self.root, "ls-files", "--stage", "-z", "--", unrelated)
+        code, problem = self.cli("apply", "--recover")
+        self.assertEqual(code, 5, problem)
+        self.assertIn(name, problem["error"])
+        mode, _, oid = integration.entries(self.root, commit, scopes=[name])[name]
+        git(self.root, "update-index", "--cacheinfo", mode, oid, name)
+        result = transactions.apply(self.vault, recover=True)
+        self.assertEqual(result["commit"], commit)
+        self.assertEqual(git_bytes(self.root, "ls-files", "--stage", "-z", "--", unrelated), unrelated_stage)
+        self.assert_once(record, commit)
+
+    def test_unrelated_stage_survives_and_git_lock_protects_terminal_effects(self):
+        record = self.package()
+        name, unrelated = "wiki/control/decisions.jsonl", "unrelated staged.txt"
+        target = self.root / name
+        approved = journals.decode_bytes(record["payload"]["files"][name])
+        persist, release = journals.persist, effects.release_index_lock
+        git_attempts = []
+        stages = []
+
+        def contend(path, journal):
+            persist(path, journal)
+            if journal["phase"] == "indexed":
+                self.write_external(self.root / unrelated, b"Unrelated stage\n")
+                git(self.root, "add", "--", unrelated)
+                stages.append(git_bytes(self.root, "ls-files", "--stage", "-z", "--", unrelated))
+            if journal["phase"] in {"admitted", "csp", "receipt"}:
+                self.write_external(target, b'{"id":"D-0123"}\n')
+                result = run([executable("git"), "-C", self.root, "add", "--", name], check=False)
+                self.write_external(target, approved)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"index.lock", result.stderr)
+                git_attempts.append(journal["phase"])
+
+        def leave_completed_lock(lock_path, owner):
+            if read_json(self.journal)["status"] != "complete":
+                release(lock_path, owner)
+
+        with patch("healdan.integration_journal.persist", side_effect=contend), \
+                patch("healdan.integration_effects.release_index_lock", side_effect=leave_completed_lock):
+            result = transactions.apply(self.vault, record["id"])
+        self.assertEqual(git_attempts, ["admitted", "csp", "receipt", "receipt"])
+        self.assertEqual(stages, [git_bytes(self.root, "ls-files", "--stage", "-z", "--", unrelated)])
+        lock_path = integration.admin_dir(self.root) / "index.lock"
+        self.assertTrue(lock_path.is_file())
+        self.assert_once(record, result["commit"])
+        self.assertFalse(lock_path.exists())
+        self.assertFalse((integration.admin_dir(self.root) / "healdan-integration" /
+                          read_json(self.journal)["operation"]).exists())
+        atomic(lock_path, b"foreign lock")
+        code, error = self.cli("apply", "--recover")
+        self.assertEqual(code, 2, error)
+        self.assertEqual(lock_path.read_bytes(), b"foreign lock")
+
+    def test_unsigned_input_checked_before_cas_and_preserved_after_publication(self):
+        record = self.package()
+        name = "wiki/index.md"
+        target = self.root / name
+        approved_base = target.read_bytes()
+        edit = b"Independent worktree edit\n"
+        persist = journals.persist
+
+        def edit_after_intent(path, journal):
+            persist(path, journal)
+            if journal["phase"] == "intent":
+                self.write_external(target, edit)
+
+        with patch("healdan.integration_journal.persist", side_effect=edit_after_intent):
+            with self.assertRaisesRegex(Blocked, "unsigned input changed.*wiki/index.md") as conflict:
+                transactions.apply(self.vault, record["id"])
+        self.assertEqual(conflict.exception.code, 5)
+        base = record["payload"]["base"]
+        self.assertEqual(self.vault.head(), base)
+        self.assertEqual(target.read_bytes(), edit)
+        self.assertEqual(read_json(self.journal)["phase"], "intent")
+        code, pending = self.cli("apply", "--recover")
+        self.assertEqual(code, 5, pending)
+        self.write_external(target, approved_base)
+        publish = integration.publish
+
+        def edit_after_cas(*args):
+            publish(*args)
+            self.write_external(target, edit)
+            git(self.root, "add", "--", name)
+
+        with patch("healdan.integration_git.publish", side_effect=edit_after_cas):
+            result = transactions.apply(self.vault, recover=True)
+        self.assertEqual(target.read_bytes(), edit)
+        self.assertEqual(git_bytes(self.root, "cat-file", "blob", ":" + name), edit)
+        self.assertEqual(git_bytes(self.root, "cat-file", "blob", result["commit"] + ":" + name),
+                         git_bytes(self.root, "cat-file", "blob", base + ":" + name))
+        self.assert_once(record, result["commit"])
+
+    def test_signed_historical_original_rechecks_attributes_without_manifest_change(self):
+        name = "resources/sources/F-0001/original.txt"
+        body = b"Historical source bytes\r\n"
+        atomic(self.root / name, body)
+        self.rows(originals.REGISTRY, [{"id": "F-0001", "path": name, "sha256": digest(body), "size": len(body),
+                                        "classification": "common", "captured_at": stamp(), "provenance": "Fixture"}])
+        git(self.root, "add", "--", "resources/sources")
+        git(self.root, "commit", "-m", "Preserve a historical original")
+        task = tasks.create(self.vault, "Retain the existing source")
+        atomic(self.state / "tasks" / task["id"] / "proposals/editor" / name, body)
+        frozen = transactions.prepare(self.vault, task["id"])
+        transactions.approve(self.vault, frozen["id"])
+        record = read_json(transactions.package_path(self.vault, frozen["id"]))
+        persisted_base = self.vault.head()
+        attribute = integration.admin_dir(self.root) / "info/attributes"
+        atomic(attribute, (name + " text eol=lf\n").encode("ascii"))
+        code, blocked = self.cli("apply", frozen["id"])
+        self.assertEqual(code, 5, blocked)
+        self.assertIn("effective Git text", blocked["error"])
+        self.assertFalse(self.journal.exists())
+        self.assertEqual(self.vault.head(), persisted_base)
+        attribute.unlink()
+        self.interrupt_before_cas(record)
+        atomic(attribute, (name + " text eol=lf\n").encode("ascii"))
+        code, blocked = self.cli("apply", "--recover")
+        self.assertEqual(code, 5, blocked)
+        self.assertIn("effective Git text", blocked["error"])
+        self.assertEqual(self.vault.head(), persisted_base)
+        self.assertEqual((self.root / name).read_bytes(), body)
+        attribute.unlink()
+        code, result = self.cli("apply", "--recover")
+        self.assertEqual(code, 0, result)
+        self.assertEqual(git_bytes(self.root, "cat-file", "blob", result["commit"] + ":" + name), body)
+        self.assert_once(record, result["commit"])
+
+    def test_confined_file_operations_refuse_non_directory_component(self):
+        directory = self.root / "wiki/topics/private fixture"
+        final = directory / "nested" / "verified"
+        integration_files.prepare_file(final, b"Confined approved bytes", 0o644)
+        self.assertEqual(integration_files.snapshot(final)[0], digest(b"Confined approved bytes"))
+        moved = final.with_name("committed")
+        integration_files.rename_exclusive(final, moved)
+        self.assertEqual(moved.read_bytes(), b"Confined approved bytes")
+        blocked = self.root / "wiki/topics/ordinary-file"
+        atomic(blocked, b"Unrelated file")
+        with self.assertRaisesRegex(Blocked, "directory path changed"):
+            integration_files.prepare_file(blocked / "impossible", b"Proposed bytes", 0o644)
+        self.assertEqual(blocked.read_bytes(), b"Unrelated file")
+
+    def test_inert_sources_with_executable_extensions_integrate_as_regular_blobs(self):
+        task = tasks.create(self.vault, "Preserve filename extension fixtures")
+        editor = self.state / "tasks" / task["id"] / "proposals/editor"
+        manifest, bodies = [], {}
+        identifiers = reserve(self.vault, "F", 4, str(uuid4()))
+        for identifier, extension in zip(identifiers, ("bat", "exe", "cmd", "com"), strict=True):
+            name = f"resources/sources/{identifier}/fixture.{extension}"
+            body = b"\x00Inert data-only fixture: " + extension.encode("ascii") + b"\r\n"
+            bodies[name] = body
+            atomic(editor / name, body)
+            manifest.append({"id": identifier, "path": name, "sha256": digest(body), "size": len(body),
+                             "classification": "common", "captured_at": stamp(), "provenance": "Fixture"})
+        atomic(editor / originals.REGISTRY, jsonl(manifest))
+        frozen = transactions.prepare(self.vault, task["id"])
+        transactions.approve(self.vault, frozen["id"])
+        record = read_json(transactions.package_path(self.vault, frozen["id"]))
+        code, result = self.cli("apply", frozen["id"])
+        self.assertEqual(code, 0, result)
+        commit = result["commit"]
+        entries = integration.entries(self.root, commit, scopes=bodies)
+        for name, body in bodies.items():
+            self.assertEqual((self.root / name).read_bytes(), body)
+            self.assertEqual(git_bytes(self.root, "cat-file", "blob", commit + ":" + name), body)
+            self.assertEqual(entries[name][:2], ("100644", "blob"))
+        self.assert_once(record, commit)
+
     def test_journal_and_approval_changes_preserve_all_pending_effects(self):
         record = self.package()
         journal = self.interrupt_before_cas(record)
@@ -249,17 +462,19 @@ class IntegrationB06(VaultTest):
         result = transactions.apply(self.vault, recover=True)
         self.assert_once(record, result["commit"])
 
-    def legacy_intent(self, record, *, published):
+    def legacy_intent(self, record, *, published, version=2):
         envelope, signed = record["approval"], record["approval"]["payload"]
         base = signed["base"]
         with self.vault.locked():
             bodies, _ = transactions.exact_files(self.vault, envelope, signed)
             files = {name: journals.encode(body) for name, body in bodies.items()}
             before = {name: signed["input_hashes"].get(name) for name in files}
-            original = {"format": "healdan-transaction-v2", "status": "writing", "package_id": record["id"], "base": base,
-                        "files": files, "before": before, "written": [], "publication_at": stamp(),
-                        "before_files": {name: journals.encode((self.root / name).read_bytes())
-                                         for name, sha in before.items() if sha is not None}}
+            original = {"status": "writing", "package_id": record["id"], "base": base,
+                        "files": files, "before": before, "written": []}
+            if version == 2:
+                original.update(format="healdan-transaction-v2", publication_at=stamp(), before_files={
+                    name: journals.encode((self.root / name).read_bytes())
+                    for name, sha in before.items() if sha is not None})
             atomic(self.journal, original)
             commit = None
             if published:
@@ -277,6 +492,56 @@ class IntegrationB06(VaultTest):
                                  "destination": integration.destination(self.vault), "package": record["id"],
                                  "approval": digest(envelope), "base": base, "commit": commit}, "integration-origin")
             return source, proof, commit
+
+    def legacy_crlf_preimage(self):
+        name = "wiki/control/decisions.jsonl"
+        path = self.root / name
+        body = canonical({"id": "D-27"}) + b"\r\n"
+        atomic(path, body)
+        attrs = self.root / ".gitattributes"
+        atomic(attrs, attrs.read_bytes() + ("\n" + name + " text eol=lf\n").encode("ascii"))
+        git(self.root, "add", "--", ".gitattributes", name)
+        git(self.root, "commit", "-m", "Preserve a normalized historic decision blob")
+        record = self.package()
+        base = record["payload"]["base"]
+        self.assertEqual(git_bytes(self.root, "cat-file", "blob", base + ":" + name), body.replace(b"\r\n", b"\n"))
+        self.assertEqual(path.read_bytes(), body)
+        self.assertEqual(record["approval"]["payload"]["input_hashes"][name], digest(body))
+        source, proof, _ = self.legacy_intent(record, published=False, version=1)
+        atomic(self.state / "integration-origins" / (digest(source) + ".json"), proof)
+        return record, source, path, body
+
+    def test_legacy_v1_recovers_with_signed_crlf_preimage_in_attested_worktree(self):
+        record, source, path, body = self.legacy_crlf_preimage()
+        name = path.relative_to(self.root).as_posix()
+        code, result = self.cli("apply", "--recover")
+        self.assertEqual(code, 0, result)
+        journal = read_json(self.journal)
+        self.assertEqual(journals.decode_bytes(journal["legacy"]["original"]), source)
+        self.assertEqual(journals.decode_bytes(journal["before_files"][name]), body)
+        self.assert_once(record, result["commit"])
+
+    def test_legacy_v1_keeps_pending_without_a_signed_preimage(self):
+        record, source, path, _ = self.legacy_crlf_preimage()
+        index = integration.admin_dir(self.root) / "index"
+        original_index = index.read_bytes()
+        ref = record["payload"]["base"]
+        receipts = {receipt.name: receipt.read_bytes() for receipt in (self.vault.control / "receipts").glob("*.json")}
+        for external in (b'{"id":"D-27","external":true}\r\n', None):
+            with self.subTest(external=external):
+                if external is None:
+                    path.unlink()
+                else:
+                    self.write_external(path, external)
+                code, result = self.cli("apply", "--recover")
+                self.assertEqual(code, 4, result)
+                self.assertIn("Legacy integration pre-image bytes differ", result["error"])
+                self.assertEqual(self.journal.read_bytes(), source)
+                self.assertEqual(self.vault.head(), ref)
+                self.assertEqual(index.read_bytes(), original_index)
+                self.assertEqual(path.read_bytes() if path.exists() else None, external)
+                self.assertEqual({receipt.name: receipt.read_bytes()
+                                  for receipt in (self.vault.control / "receipts").glob("*.json")}, receipts)
 
     def test_legacy_pending_requires_the_original_observation(self):
         record = self.package()

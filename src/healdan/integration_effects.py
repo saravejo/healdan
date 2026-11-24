@@ -1,32 +1,15 @@
 """Reconcile the worktree and its index after publishing an integration."""
-from contextlib import ExitStack, contextmanager
-import ctypes
-import errno
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import shutil
 import stat
-import sys
 
-from .core import Blocked, atomic, digest, require, safe_path, sync_directory
+from .core import Blocked, atomic, digest, file_digest, require, safe_path, sync_directory
 from .integration_git import admin_dir, index_entries, index_settings, line, update_index
-from .integration_journal import encode, persist
-
-
-def snapshot(path):
-    try:
-        metadata = path.lstat()
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        return ["non-regular", None]
-    try:
-        with path.open("rb") as stream:
-            current = os.fstat(stream.fileno())
-            require(os.path.samestat(current, metadata), "Concurrent file replacement: " + str(path), 5)
-            return [digest(stream.read()), 0o755 if current.st_mode & stat.S_IXUSR else 0o644]
-    except FileNotFoundError:
-        return None
+from .integration_files import (directory_handle, prepare_file, read_integration_file, remove_empty_directory,
+                                remove_verified, rename_exclusive, snapshot)
+from .integration_journal import decode_bytes, encode, persist, sha
 
 
 def modification(path):
@@ -35,46 +18,6 @@ def modification(path):
     except FileNotFoundError:
         return None
     return [metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns]
-
-
-@contextmanager
-def parent_fd(path):
-    if os.name == "nt":
-        yield None
-        return
-    with ExitStack() as stack:
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        parts = path.absolute().parts
-        descriptor = os.open(parts[0], flags)
-        stack.callback(os.close, descriptor)
-        for part in parts[1:]:
-            descriptor = os.open(part, flags, dir_fd=descriptor)
-            stack.callback(os.close, descriptor)
-        yield descriptor
-
-
-def rename_exclusive(source, destination):
-    """Consume source atomically, only if the destination name is unoccupied."""
-    if os.name == "nt":
-        os.rename(source, destination)
-    else:
-        library = ctypes.CDLL(None, use_errno=True)
-        if sys.platform.startswith("linux"):
-            rename, flag = getattr(library, "renameat2", None), 1  # RENAME_NOREPLACE
-        elif sys.platform == "darwin":
-            rename, flag = getattr(library, "renameatx_np", None), 4  # RENAME_EXCL
-        else:
-            rename, flag = None, 0
-        require(rename is not None, "Exclusive integration rename is unavailable", 5)
-        with parent_fd(source.parent) as src, parent_fd(destination.parent) as dst:
-            if rename(src, os.fsencode(source.name), dst, os.fsencode(destination.name), flag):
-                code = ctypes.get_errno()
-                if code in {errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL, errno.EXDEV}:
-                    raise Blocked("Exclusive integration rename is unavailable on this volume", 5)
-                raise OSError(code, os.strerror(code), str(destination))
-    sync_directory(source.parent)
-    if destination.parent != source.parent:
-        sync_directory(destination.parent)
 
 
 def secure_target(root, name):
@@ -89,6 +32,20 @@ def secure_target(root, name):
     return target
 
 
+def scratch_directories(vault, operation):
+    admin = admin_dir(vault.root)
+    index_directory = secure_target(admin, "healdan-integration/" + operation)
+    directory = index_directory
+    if admin.stat().st_dev != vault.root.stat().st_dev:
+        directory = secure_target(vault.root, ".healdan-integration/" + operation)
+    return directory, index_directory
+
+
+def file_scratch(directory, name):
+    key = digest(name.encode("utf-8"))
+    return directory / (key + ".next"), directory / (key + ".before")
+
+
 class WorktreeEffects:
     def __init__(self, vault, path, journal, bodies, overlay):
         self.vault = vault
@@ -96,21 +53,14 @@ class WorktreeEffects:
         self.journal = journal
         self.bodies = bodies
         self.overlay = overlay
-        admin = admin_dir(vault.root)
-        self.index_directory = safe_path(admin, "healdan-integration/" + journal["operation"])
-        if admin.stat().st_dev == vault.root.stat().st_dev:
-            self.directory = self.index_directory
-        else:
-            self.directory = secure_target(vault.root, ".healdan-integration/" + journal["operation"])
+        self.directory, self.index_directory = scratch_directories(vault, journal["operation"])
 
     def change(self, name, phase):
         self.journal["written"][name] = phase
         persist(self.path, self.journal)
 
     def known_paths(self, name):
-        key = digest(name.encode("utf-8"))
-        return (secure_target(self.vault.root, name), self.directory / (key + ".next"),
-                self.directory / (key + ".before"))
+        return secure_target(self.vault.root, name), *file_scratch(self.directory, name)
 
     def previous(self, name):
         checksum = self.journal["before"][name]
@@ -129,8 +79,8 @@ class WorktreeEffects:
             return recorded
         evidence = {"name": displaced.name, "observed": actual, "target": modification(target)}
         if actual and actual[0] != "non-regular":
-            body = displaced.read_bytes()
-            require(digest(body) == actual[0], "Integration displaced copy is changing: " + name, 5)
+            observed, body = read_integration_file(displaced)
+            require(observed == actual, "Integration displaced copy is changing: " + name, 5)
             evidence["body"] = encode(body)
         self.journal["reconciliation"][name] = evidence
         persist(self.path, self.journal)
@@ -190,14 +140,13 @@ class WorktreeEffects:
             self.change(name, "preparing")
             phase = "preparing"
         if phase == "preparing":
-            self.directory.mkdir(parents=True, exist_ok=True)
             if ready is None:
-                atomic(prepared, self.bodies[name], mode=expected[1])
-                os.chmod(prepared, expected[1])
+                prepare_file(prepared, self.bodies[name], expected[1])
             require(snapshot(prepared) == expected, "Prepared integration bytes differ: " + name)
             self.change(name, "prepared")
             phase = "prepared"
-        target.parent.mkdir(parents=True, exist_ok=True)
+        with directory_handle(target.parent, create=True):
+            pass
         if self.previous(name) is not None:
             if phase == "prepared":
                 self.examine(name)
@@ -225,29 +174,60 @@ class WorktreeEffects:
             self.examine(name)
 
 
-def reconcile_index(vault, directory, before, proposed, *, verify_ref, completed=False):
+def index_paths(vault, directory):
     index = Path(line(vault.root, "rev-parse", "--path-format=absolute", "--git-path", "index"))
     require(index.parent == admin_dir(vault.root), "Git index is outside the integration worktree", 5)
-    lock_path = index.with_name("index.lock")
-    directory.mkdir(parents=True, exist_ok=True)
-    owner = directory / "index-owner"
+    return index, index.with_name("index.lock"), directory / "index-owner"
+
+
+def owns_index_lock(lock_path, owner):
+    try:
+        return not lock_path.is_symlink() and not owner.is_symlink() and lock_path.samefile(owner)
+    except FileNotFoundError:
+        return False
+
+
+def release_index_lock(lock_path, owner):
+    if owns_index_lock(lock_path, owner):
+        lock_path.unlink()
+
+
+@contextmanager
+def locked_index(vault, directory):
+    index, lock_path, owner = index_paths(vault, directory)
+    with directory_handle(directory, create=True):
+        pass
     if owner.exists() and index.exists() and index.samefile(owner):
         owner.unlink()  # The previous attempt published this inode before it could unlink the token.
     if not owner.exists():
-        atomic(owner, b"")
+        prepare_file(owner, b"", 0o600)
     try:
-        verify_ref()
         os.link(owner, lock_path)
     except FileExistsError:
-        require(not lock_path.is_symlink() and lock_path.samefile(owner), "Git index is locked by another process", 5)
+        require(owns_index_lock(lock_path, owner), "Git index is locked by another process", 5)
     try:
-        after = {name: [[mode, object_id, 0, 0]] for name, (mode, object_id) in proposed.items()}
+        yield index, lock_path, owner
+    finally:
+        release_index_lock(lock_path, owner)
+
+
+def expected_index(proposed):
+    return {name: [[mode, object_id, 0, 0]] for name, (mode, object_id) in proposed.items()}
+
+
+def check_index(current, expected):
+    names = [name for name in expected if current[name] != expected[name]]
+    require(not names, "Integration index differs: " + ", ".join(names), 5)
+
+
+def reconcile_index(vault, directory, before, proposed, *, verify_ref):
+    with locked_index(vault, directory) as (index, lock_path, owner):
+        verify_ref()
+        after = expected_index(proposed)
         current = index_entries(vault.root, before, settings={"GIT_OPTIONAL_LOCKS": "0"})
         if current == after:
             return
-        if current != before or completed:
-            names = [name for name in before if current[name] != (after if completed else before)[name]]
-            raise Blocked("Integration index differs: " + ", ".join(names), 5)
+        check_index(current, before)
         private = directory / "index-next"
         private_lock = private.with_name("index-next.lock")
         # These are scratch files for a Git subprocess within an owned index lock.
@@ -261,6 +241,7 @@ def reconcile_index(vault, directory, before, proposed, *, verify_ref, completed
         update_index(vault.root, proposed, settings)
         require(index_entries(vault.root, before, settings=settings) == after,
                 "Prepared integration index differs", 5)
+        atomic(directory / "index-next.sha256", file_digest(private).encode("ascii"))
         with private.open("rb") as source, owner.open("r+b") as staged:
             staged.seek(0)
             shutil.copyfileobj(source, staged)
@@ -268,11 +249,42 @@ def reconcile_index(vault, directory, before, proposed, *, verify_ref, completed
             staged.flush()
             os.fsync(staged.fileno())
         verify_ref()
-        require(lock_path.exists() and not lock_path.is_symlink() and lock_path.samefile(owner),
-                "Git index lock changed during integration", 5)
+        require(owns_index_lock(lock_path, owner), "Git index lock changed during integration", 5)
         os.replace(lock_path, index)
         sync_directory(index.parent)
         owner.unlink()
-    finally:
-        if owner.exists() and lock_path.exists() and not lock_path.is_symlink() and lock_path.samefile(owner):
-            lock_path.unlink()
+
+
+@contextmanager
+def confirmed_index(vault, directory, proposed):
+    """Hold Git's writer lock from the last index check through completion."""
+    with locked_index(vault, directory) as (_, lock_path, owner):
+        check_index(index_entries(vault.root, proposed, settings={"GIT_OPTIONAL_LOCKS": "0"}),
+                    expected_index(proposed))
+        yield
+        require(owns_index_lock(lock_path, owner), "Git index lock changed during integration", 5)
+
+
+def cleanup_completed(vault, journal):
+    directory, index_directory = scratch_directories(vault, journal["operation"])
+    index, lock_path, owner = index_paths(vault, index_directory)
+    release_index_lock(lock_path, owner)
+    for name, encoded in journal["files"].items():
+        prepared, displaced = file_scratch(directory, name)
+        remove_verified(prepared, digest(decode_bytes(encoded)))
+        if name not in journal["reconciliation"] and journal["before"][name] is not None:
+            remove_verified(displaced, journal["before"][name])
+    proof = index_directory / "index-next.sha256"
+    _, declared = read_integration_file(proof)
+    private = index_directory / "index-next"
+    if declared is not None:
+        checksum = declared.decode("ascii", errors="replace")
+        if sha(checksum) and remove_verified(private, checksum):
+            remove_verified(proof, digest(declared))
+    elif private.is_file() and index.is_file():
+        # R1 recorded no separate checksum for the private index.
+        remove_verified(private, file_digest(index))
+    remove_verified(owner, digest(b""))
+    for scratch in {directory, index_directory}:
+        remove_empty_directory(scratch)
+        remove_empty_directory(scratch.parent)

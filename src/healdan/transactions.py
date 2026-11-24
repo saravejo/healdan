@@ -6,10 +6,11 @@ from pathlib import Path
 from secrets import token_hex
 import tempfile
 
-from .core import REQUIRED_REGISTRIES, REGISTRIES, atomic, decode, digest, extend_jsonl, git, parse_jsonl, read_json, require, safe_path, stamp, utc
+from .core import Blocked, REQUIRED_REGISTRIES, REGISTRIES, atomic, decode, digest, extend_jsonl, file_digest, git, parse_jsonl, read_json, require, safe_path, stamp, utc
 from . import admission, integration_git as git_tx, integration_journal as journal_store, originals
 from .ids import aliases, identity, registry_records
-from .integration_effects import WorktreeEffects, reconcile_index, secure_target, snapshot
+from .integration_effects import WorktreeEffects, cleanup_completed, confirmed_index, reconcile_index, secure_target
+from .integration_files import read_integration_file
 from .knowledge import Knowledge
 from .lineage import CLAIMS, PageHistory, page_revision
 from .pages import generated_pages, validate_pages
@@ -284,6 +285,21 @@ def exact_files(vault, approval, signed):
     return bodies, modes
 
 
+def verify_untouched_inputs(vault, signed, bodies):
+    for name, expected in signed["input_hashes"].items():
+        if name in bodies:
+            continue
+        path = safe_path(vault.root, name)
+        require(path.is_file() and file_digest(path) == expected,
+                "An unsigned input changed during integration: " + name, 5)
+
+
+def verify_signed_originals(vault, bodies):
+    for name, body in bodies.items():
+        if originals.source_path(name):
+            originals.verify_storage(vault.root, name, body)
+
+
 def staged_before(modes):
     return {name: [[*entry, 0, 0]] if entry is not None else [] for name, entry in modes.items()}
 
@@ -295,15 +311,13 @@ def starting_journal(vault, signed, approval, bodies, modes):
     before, originals, worktree_modes = {}, {}, {}
     for name in bodies:
         path = secure_target(vault.root, name)
-        observed = snapshot(path)
+        observed, body = read_integration_file(path)
         expected = signed["input_hashes"].get(name)
         require((observed[0] if observed else None) == expected,
                 "Integration pre-image changed: " + name, 5)
         before[name] = expected
         worktree_modes[name] = observed[1] if observed else None
         if observed:
-            body = path.read_bytes()
-            require(digest(body) == expected, "Integration pre-image changed: " + name, 5)
             originals[name] = journal_store.encode(body)
     index_before = staged_before(modes)
     require(git_tx.index_entries(vault.root, bodies) == index_before,
@@ -368,14 +382,22 @@ def migrate_legacy(vault, path, old, signed, approval, bodies, modes, next_csp):
         if body_hash is None:
             worktree_modes[name] = None
             continue
+        mode = 0o755 if os.name != "nt" and modes[name] and modes[name][0] == "100755" else 0o644
         frozen = old.get("before_files", {}).get(name)
         if frozen is None:
             require(modes[name], "Legacy integration lacks pre-image proof: " + name, 5)
-            frozen = journal_store.encode(git_tx.blob(vault.root, modes[name][1]))
+            body = git_tx.blob(vault.root, modes[name][1])
+            if digest(body) != body_hash:
+                # V1 signed the original worktree bytes, which may differ from a normalized Git blob.
+                observed, body = read_integration_file(secure_target(vault.root, name))
+                require(observed is not None and observed[0] == body_hash,
+                        "Legacy integration pre-image bytes differ: " + name)
+                mode = observed[1]
+            frozen = journal_store.encode(body)
         require(digest(journal_store.decode_bytes(frozen)) == body_hash,
                 "Legacy integration pre-image bytes differ: " + name)
         originals[name] = frozen
-        worktree_modes[name] = 0o755 if os.name != "nt" and modes[name] and modes[name][0] == "100755" else 0o644
+        worktree_modes[name] = mode
     csp = read_csp_state(vault)
     if not legacy_csp(attestation["commit"], csp, next_csp):
         require_csp_state(signed["csp"], csp)
@@ -466,12 +488,14 @@ def apply(vault, identifier=None, *, recover=False):
         journal = None
         if recover:
             journal = journal_store.read(vault.control)
+            clear_completed_effects(vault, journal)
             require(journal and journal["status"] not in ("complete", "aborted"), "No pending transaction", 2)
             identifier = journal["package_id"]
             if journal.get("format") == journal_store.FORMAT:
                 git_tx.verify_destination(vault, journal["destination"])
         else:
             terminal = vault.no_transaction()
+            clear_completed_effects(vault, terminal)
         approval, signed = approved_package(vault, identifier, recover=recover)
         if not recover:
             require(vault.head() == signed["base"], "Approval invalidated by changed Git base", 5)
@@ -490,6 +514,7 @@ def apply(vault, identifier=None, *, recover=False):
             require(not git(vault.root, "diff", "--cached", "--name-only"), "Index contains unrelated staged work", 5)
             with Candidate(vault, signed["files"]) as candidate:
                 validate_candidate(vault, candidate, signed["cutoff"])
+            verify_signed_originals(vault, bodies)
             journal = starting_journal(vault, signed, approval, bodies, modes)
             if terminal is not None:
                 journal_store.preserve_history(vault.control, path)
@@ -498,6 +523,17 @@ def apply(vault, identifier=None, *, recover=False):
             journal = migrate_legacy(vault, path, journal, signed, approval, bodies, modes, next_csp)
         validate_intent(vault, journal, signed, approval, bodies, modes)
         return continue_apply(vault, path, journal, signed, next_csp, bodies, modes)
+
+
+def clear_completed_effects(vault, journal):
+    if not journal or journal.get("format") != journal_store.FORMAT or journal["status"] != "complete":
+        return
+    try:
+        git_tx.verify_destination(vault, journal["destination"], verify_head=False)
+        cleanup_completed(vault, journal)
+    except (Blocked, OSError):
+        # Terminal evidence remains available if scratch cannot be verified or removed.
+        pass
 
 
 def continue_apply(vault, path, journal, signed, next_csp, bodies, modes):
@@ -514,6 +550,8 @@ def continue_apply(vault, path, journal, signed, next_csp, bodies, modes):
             rows = vault.rows(registry)
             if registry in REGISTRIES:
                 registry_records(registry, rows)
+    if current == base:
+        verify_untouched_inputs(vault, signed, bodies)
     csp = read_csp_state(vault)
     legacy_commit = (journal.get("legacy") or {}).get("proof", {}).get("payload", {}).get("commit")
     if phase in ("csp", "receipt"):
@@ -539,6 +577,8 @@ def continue_apply(vault, path, journal, signed, next_csp, bodies, modes):
         require(not git_tx.was_published(vault.root, binding["ref"], journal["operation"], expected),
                 "Integration ref returned to the base after publication", 5)
         require_csp_state(signed["csp"], read_csp_state(vault))
+        verify_signed_originals(vault, bodies)
+        verify_untouched_inputs(vault, signed, bodies)
         git_tx.publish(vault, binding, base, expected, journal["operation"])
     def verify_ref():
         require(git_tx.ref_value(vault, binding) == expected, "Integration published ref changed", 5)
@@ -553,14 +593,21 @@ def continue_apply(vault, path, journal, signed, next_csp, bodies, modes):
     if journal["phase"] == "published":
         journal["phase"] = "indexing"
         journal_store.persist(path, journal)
-    reconcile_index(vault, effects.index_directory, journal["index_before"], overlay, verify_ref=verify_ref,
-                    completed=journal["phase"] != "indexing")
     if journal["phase"] == "indexing":
+        reconcile_index(vault, effects.index_directory, journal["index_before"], overlay, verify_ref=verify_ref)
         journal["phase"] = "indexed"
         journal_store.persist(path, journal)
+    with confirmed_index(vault, effects.index_directory, overlay):
+        finish_apply(vault, path, journal, signed, legacy_commit, next_csp, effects, verify_ref)
+    clear_completed_effects(vault, journal)
+    return {"package": journal["package_id"], "commit": expected, "status": "complete"}
+
+
+def finish_apply(vault, path, journal, signed, legacy_commit, next_csp, effects, verify_ref):
+    expected, base, tree = journal["expected_commit"], journal["base"], journal["tree"]
     effects.verify()
     verify_ref()
-    git_tx.verify_commit(vault.root, expected, base, tree, overlay, bodies)
+    git_tx.verify_commit(vault.root, expected, base, tree, effects.overlay, effects.bodies)
     if journal["phase"] == "indexed":
         check_admission(vault, journal, isolated_validation(vault, journal, tree, signed))
         admission.publication(vault, journal["admissions"], "present", at=journal["git_identity"]["at"],
@@ -587,4 +634,3 @@ def continue_apply(vault, path, journal, signed, next_csp, bodies, modes):
     effects.verify()
     journal.update(status="complete", commit=expected, completed_at=stamp())
     journal_store.persist(path, journal)
-    return {"package": journal["package_id"], "commit": expected, "status": "complete"}

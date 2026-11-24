@@ -2,7 +2,6 @@
 from pathlib import Path
 import re
 import subprocess
-import tempfile
 
 from .binding import Repository
 from .core import Blocked, git_bytes, git_process, require, safe_path, stamp, utc
@@ -55,8 +54,10 @@ def destination(vault):
             "mode": "branch" if ref else "detached", "ref": ref or "HEAD"}
 
 
-def verify_destination(vault, frozen):
+def verify_destination(vault, frozen, *, verify_head=True):
     actual = destination(vault)
+    if not verify_head:
+        actual.update(mode=frozen["mode"], ref=frozen["ref"])
     if actual == frozen:
         return
     if frozen["binding"] in vault.binding["previous"]:
@@ -114,19 +115,52 @@ def entries(root, tree, *, scopes=(), recurse=False):
 
 
 def overlay_modes(root, base, files):
+    inventories = {}
+
+    def record(tree, part):
+        if tree is None:
+            return None
+        if tree not in inventories:
+            inventories[tree] = tree_records(root, tree)
+        row = inventories[tree].get(part.encode("utf-8"))
+        return row.decode("ascii").split() if row else None
+
     modes = {}
     for name in files:
-        parents = Path(name).parents
-        scopes = [name, *(p.as_posix() for p in parents if p != Path("."))]
-        before = entries(root, base, scopes=scopes)
-        for ancestor in scopes[1:]:
-            require(ancestor not in before or before[ancestor][1] == "tree",
-                    "Integration path has a non-directory Git ancestor: " + ancestor)
-        entry = before.get(name)
+        *parents, filename = name.split("/")
+        tree = base
+        for part in parents:
+            ancestor = record(tree, part)
+            require(ancestor is None or ancestor[1] == "tree",
+                    "Integration path has a non-directory Git ancestor: " + name)
+            tree = ancestor[2] if ancestor else None
+        entry = record(tree, filename)
         require(entry is None or entry[0] in REGULAR and entry[1] == "blob",
                 "Integration destination is not a regular Git file: " + name)
         modes[name] = [entry[0], entry[2]] if entry else None
     return modes
+
+
+def tree_records(root, tree):
+    """Read immediate children without interpreting their filename bytes."""
+    entries = {}
+    for row in raw(root, "ls-tree", "-z", tree).split(b"\0")[:-1]:
+        metadata, name = row.split(b"\t", 1)
+        entries[name] = metadata
+    return entries
+
+
+def replace_tree_paths(root, tree, changes):
+    entries = tree_records(root, tree) if tree else {}
+    for name, entry in changes.items():
+        if isinstance(entry, dict):
+            old = entries.get(name)
+            require(old is None or old.split()[1] == b"tree", "Integration path replaces a non-directory Git entry")
+            result = replace_tree_paths(root, old.split()[2].decode("ascii") if old else None, entry)
+            entry = b"040000 tree " + result.encode("ascii")
+        entries[name] = entry
+    content = b"".join(metadata + b"\t" + name + b"\0" for name, metadata in entries.items())
+    return line(root, "mktree", "-z", "--missing", data=content)
 
 
 def blob(root, object_id):
@@ -164,11 +198,16 @@ def prepare_tree(vault, base, modes, files):
     proposed = {name: [(modes[name] or ["100644"])[0],
                        raw(vault.root, "hash-object", "-w", "--no-filters", "--stdin",
                            data=body).decode("ascii").strip()] for name, body in files.items()}
-    with tempfile.TemporaryDirectory(prefix="git-integration-", dir=vault.state) as temp:
-        settings = index_settings(Path(temp) / "index")
-        raw(vault.root, "-c", "core.sparseCheckout=false", "read-tree", base, settings=settings)
-        update_index(vault.root, proposed, settings)
-        return line(vault.root, "write-tree", settings=settings), proposed
+    changes = {}
+    for name, (mode, object_id) in proposed.items():
+        *parents, filename = name.encode("utf-8").split(b"/")
+        subtree = changes
+        for part in parents:
+            subtree = subtree.setdefault(part, {})
+            require(isinstance(subtree, dict), "Integration overlay has a file/directory collision: " + name)
+        require(filename not in subtree, "Integration overlay has a file/directory collision: " + name)
+        subtree[filename] = f"{mode} blob {object_id}".encode("ascii")
+    return replace_tree_paths(vault.root, base, changes), proposed
 
 
 def commit_identity(root):

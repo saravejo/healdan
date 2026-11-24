@@ -112,6 +112,20 @@ class BackupPortable(VaultTest):
         with self.assertRaisesRegex(Blocked, "No pending transaction") as failure:
             transactions.apply(restored, recover=True)
         self.assertEqual(failure.exception.code, 2)
+        replica = self.base / "journal-recaptured-replica"
+        replica.mkdir()
+        restored.config.update({key: self.vault.config[key] for key in ("age_recipients", "offline_recipients",
+                                "backup_signing_key", "backup_signing_identity")})
+        restored.config["backup_destinations"] = [str(replica)]
+        atomic(restored.config_path, restored.config)
+        recaptured = backups.create(restored, "long", utc() + timedelta(days=2))
+        paths = tuple(replica / recaptured["copies"][0][name] for name in ("manifest", "path"))
+        second, second_state = self.base / "journal-recaptured", self.base / "journal-recaptured-state"
+        self.restore(recaptured, second, second_state, paths=paths)
+        recovered = Vault(second, second_state)
+        self.assertEqual((recovered.control / "historical" / archived).read_bytes(), prior)
+        self.assertEqual((recovered.control / "historical" / integration_journal.JOURNAL).read_bytes(), current)
+        self.assertFalse((recovered.control / integration_journal.JOURNAL).exists())
 
     def conversation(self, name, *, classification="common", closed_at=None):
         origin = self.state / name

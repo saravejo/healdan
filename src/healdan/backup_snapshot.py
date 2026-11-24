@@ -249,7 +249,7 @@ def historical_record(name):
             return None, "manifest"
     if len(parts) == 2 and parts[0] in HISTORICAL_FOLDERS and parts[1].endswith(".json"):
         stem = parts[1].removesuffix(".json")
-        valid = sha256(stem) if parts[0] == "restorations" else identifier(stem)
+        valid = sha256(stem) if parts[0] in {"restorations", "integration-history"} else identifier(stem)
         if valid:
             return generation, "/".join(parts)
     return None
