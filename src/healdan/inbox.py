@@ -16,18 +16,28 @@ def ordinary(path):
     return path.startswith("inbox/") and path not in EXCLUDED and not path.startswith("inbox/tasks/") and not path.endswith("/.gitkeep")
 
 
-def ordinary_files(root):
+def ordinary_paths(root):
     for path in sorted((root / "inbox").rglob("*")):
         relative = path.relative_to(root).as_posix()
-        if ordinary(relative) and (path.is_file() or path.is_symlink()):
-            yield relative, safe_path(root, relative, exists=True).read_bytes()
+        if ordinary(relative):
+            yield relative
+
+
+def read_ordinary_file(root, relative):
+    mode = (root / relative).lstat().st_mode
+    if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+        return safe_path(root, relative, exists=True).read_bytes()
+    return None
 
 
 def inventory(vault):
     with vault.locked():
         journal_path = vault.control / "inbox.json"
         items = read_json(journal_path, {})
-        for relative, data in ordinary_files(vault.root):
+        for relative in ordinary_paths(vault.root):
+            data = read_ordinary_file(vault.root, relative)
+            if data is None:
+                continue
             key = digest(data)
             # Hash identifies copied/renamed bytes. New bytes link to earlier versions at this path.
             if key not in items:
@@ -118,7 +128,25 @@ def worktree_roots(vault):
 
 
 def worktree_inbox_digests(vault):
-    return {(relative, digest(body)) for root in worktree_roots(vault) for relative, body in ordinary_files(root)}
+    observed, errors = set(), []
+    try:
+        roots = worktree_roots(vault)
+    except (Blocked, OSError) as exc:
+        roots = {vault.root}
+        errors.append({"category": "inbox", "error": str(exc)})
+    for root in sorted(roots):
+        try:
+            for relative in ordinary_paths(root):
+                try:
+                    body = read_ordinary_file(root, relative)
+                except (Blocked, OSError) as exc:
+                    errors.append({"category": "inbox", "worktree": str(root), "path": relative, "error": str(exc)})
+                    continue
+                if body is not None:
+                    observed.add((relative, digest(body)))
+        except (Blocked, OSError) as exc:
+            errors.append({"category": "inbox", "worktree": str(root), "error": str(exc)})
+    return observed, errors
 
 
 def archive_destination_verified(vault, root, destination, records, sha):
@@ -138,9 +166,8 @@ def archive_complete(vault, item, *, observed=None):
     if paths & read_json(safe_path(vault.control, ARCHIVE_JOURNAL), {}).keys():
         return False
     if observed is None:
-        try:
-            observed = worktree_inbox_digests(vault)
-        except (Blocked, OSError):
+        observed, errors = worktree_inbox_digests(vault)
+        if errors:
             return False
     if any(content == sha for _, content in observed):
         return False
@@ -230,7 +257,15 @@ def archive_empty(vault, sha256):
             if move and "worktree" in move:
                 require(vault.relocated_path(move["worktree"]) == vault.root,
                         "Retry the pending archive move in its original worktree: " + relative, 5)
-            if not source.exists() and not move:
+            present = source.exists()
+            if present:
+                message = "Inbox item changed: " + relative
+                require(source.is_file(), message, 5)
+                body = source.read_bytes()
+                if body:
+                    require(not move and relative in items.get(digest(body), {}).get("paths", []), message, 5)
+                    continue
+            elif not move:
                 continue
             target_name = f"archive/{sha256}/{Path(relative).name}"
             plans = deletions.get(canonical_storage_path(source), set()) | deletions.get(
@@ -240,9 +275,7 @@ def archive_empty(vault, sha256):
                 blocked.append(f"{relative} -> {target_name} ({commands})")
                 continue
             target = empty_archive_target(vault, relative, target_name)
-            if source.exists():
-                require(source.is_file() and source.read_bytes() == b"", "Inbox item changed: " + relative, 5)
-            else:
+            if not present:
                 require(target.is_file(), f"Incomplete archive lost both {relative} and {target_name}", 5)
             moves.append((relative, source, target_name))
         for relative, source, target_name in moves:

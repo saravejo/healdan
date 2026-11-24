@@ -112,6 +112,68 @@ class OriginalAdmission(VaultTest):
         self.assertEqual((self.vault.control / "inbox.json").read_bytes(), before)
         self.assertEqual(len(self.archive_receipts()), 1)
 
+    def test_archive_skips_confirmed_reuse_and_moves_independent_empty_file(self):
+        retired, fresh = "inbox/retired.txt", "inbox/independent.txt"
+        sha = self.defer_empty(retired)["sha256"]
+        old = inbox.archive_empty(self.vault, sha)["archive_moves"][0]
+        old_receipt = self.vault.control / "receipts" / (old["receipt"] + ".json")
+        old_bytes = old_receipt.read_bytes()
+        atomic(self.root / fresh, b"")
+        inbox.inventory(self.vault)
+        incoming = b"A different capture using the previous relative path"
+        atomic(self.root / retired, incoming)
+        code, result = self.cli("inbox", "archive-empty", sha)
+        self.assertEqual(code, 5, result)
+        self.assertIn("Inbox item changed: " + retired, result["error"])
+        self.assertEqual((self.root / fresh).read_bytes(), b"")
+        inbox.inventory(self.vault)
+        replacement = inbox.decide(self.vault, digest(incoming), "resource", owner="human", classification="common",
+                                   destination="fixture")
+
+        code, item = self.cli("inbox", "archive-empty", sha)
+        self.assertEqual(code, 0, item)
+        self.assertEqual([move["payload"]["source"] for move in item["archive_moves"]], [retired, fresh])
+        self.assertEqual((self.root / retired).read_bytes(), incoming)
+        self.assertFalse((self.root / fresh).exists())
+        for name in (retired, fresh):
+            self.assertEqual((self.root / "archive" / sha / Path(name).name).read_bytes(), b"")
+        self.assertEqual(old_receipt.read_bytes(), old_bytes)
+        self.assertEqual(read_json(self.vault.control / "inbox.json")[digest(incoming)], replacement)
+        self.assertTrue(inbox.archive_complete(self.vault, item))
+
+    def test_archive_rejects_confirmed_reuse_of_an_active_move_origin(self):
+        interrupted, fresh = "inbox/interrupted.txt", "inbox/independent.txt"
+        sha = self.triage_empty(interrupted)
+        unlink = Path.unlink
+
+        def stop_before_unlink(path, *args, **kwargs):
+            if path == self.root / interrupted:
+                raise OSError("Interrupted with a reserved origin")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", stop_before_unlink), self.assertRaisesRegex(OSError, "Interrupted"):
+            inbox.archive_empty(self.vault, sha)
+        journal = self.vault.control / inbox.ARCHIVE_JOURNAL
+        pending = journal.read_bytes()
+        atomic(self.root / fresh, b"")
+        incoming = b"A different capture at an active origin"
+        atomic(self.root / interrupted, incoming)
+        inbox.inventory(self.vault)
+        inbox.decide(self.vault, digest(incoming), "resource", owner="human", classification="common", destination="fixture")
+
+        code, result = self.cli("inbox", "archive-empty", sha)
+        self.assertEqual(code, 5, result)
+        self.assertIn("Inbox item changed: " + interrupted, result["error"])
+        self.assertEqual(journal.read_bytes(), pending)
+        self.assertEqual((self.root / interrupted).read_bytes(), incoming)
+        self.assertEqual((self.root / fresh).read_bytes(), b"")
+        self.assertFalse((self.root / "archive" / sha / Path(fresh).name).exists())
+
+        atomic(self.root / interrupted, b"")
+        resumed = inbox.archive_empty(self.vault, sha)
+        self.assertEqual(len(resumed["archive_moves"]), 2)
+        self.assertEqual(read_json(journal), {})
+
     def test_archive_competing_creation_and_resume_after_destination(self):
         name = "inbox/nota.txt"
         key = self.triage_empty(name)
@@ -482,6 +544,63 @@ class OriginalAdmission(VaultTest):
         atomic(linked / relative, b"")
         self.assertEqual(findings(), ({f"inbox:{empty}:{message}": message for message in
                                       ("original_triage_overdue", "deferral_due")}, "open"))
+
+    def test_partial_linked_inbox_read_keeps_other_findings_and_followups(self):
+        relative = "inbox/old.txt"
+        sha = self.defer_empty(relative)["sha256"]
+        linked = self.base / "linked vault"
+        git(self.root, "worktree", "add", "--detach", linked, "HEAD")
+        now = utc() + timedelta(days=8)
+        baseline = linting.lint(self.vault, now)
+        self.assertEqual(baseline["status"], "complete")
+        state = self.vault.control / "lint-state.json"
+        prior_state = state.read_bytes()
+        followups = self.vault.control / "followups.json"
+        prior_id = read_json(followups)["inbox"]["id"]
+        inbox.archive_empty(self.vault, sha)
+
+        paths = {"inbox/blocked.txt": b"Blocked fixture", "inbox/unreadable.txt": b"Unreadable fixture",
+                 "inbox/other.txt": b"Readable fixture"}
+        for name, body in paths.items():
+            atomic(linked / name, body)
+        held = self.state / "custody" / "held.age"
+        atomic(held, b"Fixture custody bytes")
+        self.expiring_export("held-export", (held.parent, held.name, "ciphertext"))
+        hold = custody.hold(self.vault, "held-export", "Fixture retention hold", "human")
+        safe = inbox.safe_path
+        read = Path.read_bytes
+
+        def block(root, name, **kwargs):
+            if root == linked and name == "inbox/blocked.txt":
+                raise Blocked("Fixture path guard rejected this regular entry", 5)
+            return safe(root, name, **kwargs)
+
+        def unreadable(path):
+            if path == linked / "inbox/unreadable.txt":
+                raise OSError("Fixture read interrupted")
+            return read(path)
+
+        with patch("healdan.inbox.safe_path", side_effect=block), patch.object(Path, "read_bytes", unreadable):
+            partial = linting.lint(self.vault, now)
+        self.assertEqual(partial["status"], "partial")
+        self.assertCountEqual([(entry["category"], entry["worktree"], entry["path"]) for entry in partial["errors"]],
+                              [("inbox", str(linked), "inbox/blocked.txt"), ("inbox", str(linked), "inbox/unreadable.txt")])
+        self.assertIn("inbox:inbox/other.txt", partial["findings"])
+        self.assertIn(f"inbox:{sha}:original_triage_overdue", partial["findings"])
+        self.assertIn(f"inbox:{sha}:deferral_due", partial["findings"])
+        self.assertIn("holds:" + hold["id"], partial["findings"])
+        self.assertIn("retention:held-export", partial["findings"])
+        self.assertIn("backup", partial["categories"])
+        self.assertEqual(partial["delta"]["resolved"], [])
+        self.assertEqual(state.read_bytes(), prior_state)
+        self.assertEqual(read_json(followups)["inbox"]["state"], "open")
+        self.assertEqual(read_json(followups)["inbox"]["id"], prior_id)
+        for name, body in paths.items():
+            self.assertEqual((linked / name).read_bytes(), body)
+            (linked / name).unlink()
+        complete = linting.lint(self.vault, now)
+        self.assertEqual(complete["status"], "complete")
+        self.assertEqual(read_json(followups)["inbox"]["state"], "resolved")
 
     def test_shared_archive_deletion_recovers_all_verified_custody_slots(self):
         first, second = "inbox/a/shared.txt", "inbox/b/shared.txt"

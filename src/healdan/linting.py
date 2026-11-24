@@ -41,9 +41,10 @@ def collect(vault, now=None):
     except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
         errors.append({"category": "query", "error": str(exc)})
     items = read_json(vault.control / "inbox.json", {})
-    observed = worktree_inbox_digests(vault)
+    observed, inbox_errors = worktree_inbox_digests(vault)
+    errors.extend(inbox_errors)
     for item in items.values():
-        for message in inbox_findings(item, now, vault=vault, observed=observed):
+        for message in inbox_findings(item, now, vault=None if inbox_errors else vault, observed=observed):
             add("inbox", item["sha256"] + ":" + message, message)
     known = {(path, item["sha256"]) for item in items.values() for path in item["paths"]}
     for relative, _ in sorted(observed - known):
