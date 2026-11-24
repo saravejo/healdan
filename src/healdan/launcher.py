@@ -126,6 +126,7 @@ def profile(vault, operation):
 
 def _profile(vault, operation):
     session = get_session(vault, operation)
+    require(not session.get("reconciliation"), "Restored session requires an explicit recovery reconstruction", 5)
     directory = vault.state / "tasks" / session["task"] / "temporary" / session["role"] / session["uuid"] / "native"
     directory.mkdir(parents=True, exist_ok=True)
     config = directory / "settings.json"

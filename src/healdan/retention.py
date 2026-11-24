@@ -63,10 +63,13 @@ def recovery_hold(hold):
 
 
 def copy_path(vault, copy):
+    require(copy.get("status") != "unavailable", "Origin custody location is unavailable", 5)
     return canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"])
 
 
 def shares_path(vault, copy, target):
+    if copy.get("status") == "unavailable":
+        return False
     try:
         return copy_path(vault, copy) == target
     except (Blocked, OSError, ValueError, KeyError, TypeError) as original:
@@ -82,7 +85,7 @@ def shares_path(vault, copy, target):
 
 def copy_identity(copy):
     state = {"status", "deleted_at", "moved_at", "move_receipt", "archive_copy_index", "verified_archive_sha256",
-             "deletion_receipt", "absent_at", "absence_receipt"}
+             "deletion_receipt", "absent_at", "absence_receipt", "origin_status", "published_at", "publication_receipt"}
     return {key: value for key, value in copy.items() if key not in state}
 
 
@@ -211,6 +214,8 @@ def pending_deletion_paths(vault, *, target=None, exclude=None):
                 continue
             copies = inventory.get(entry["material"], {}).get("copies", [])
             index = entry["copy_index"]
+            if 0 <= index < len(copies) and copies[index]["status"] == "unavailable":
+                continue
             if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
                     copy_identity(copies[index]) == copy_identity(entry["copy"]) and
                     deletion_reconciled(vault, inventory, entry)):
@@ -278,11 +283,23 @@ def material_guard(vault, record, now, policy):
 def authorized_target(vault, record, copy):
     from .backups import writing_generation
 
+    require(copy.get("status") != "unavailable", "Origin custody location is awaiting reconciliation", 5)
     roots = [Path(p).resolve() for p in vault.config.get("storage_roots", [])]
     roots.append((vault.state / "custody").resolve())
     if record.get("kind") == "export" and copy.get("kind") == "export":
         roots.append((vault.root / "inbox").resolve())
-    if record.get("kind") == "export" and copy.get("kind") == "archive":
+    if copy.get("recovery_receipt"):
+        from .lineage import sha256
+
+        receipt_id = copy["recovery_receipt"]
+        require(sha256(receipt_id), "Invalid backup copy recovery receipt", 5)
+        receipt = read_json(safe_path(vault.control, f"receipts/{receipt_id}.json"), {})
+        payload = receipt.get("payload", {})
+        require(digest(receipt) == receipt_id and receipt.get("kind") == "backup-copy-recovered" and
+                payload.get("material") == record["id"] and
+                all(payload.get(field) == copy[field] for field in ("path", "root", "sha256")),
+                "Backup copy recovery receipt does not match the local copy", 5)
+    elif record.get("kind") == "export" and copy.get("kind") == "archive":
         require(Path(copy["path"]).parts[:1] == (copy["sha256"],), "Archived custody path does not match its digest", 5)
         roots.append((vault.root / "archive").resolve())
     roots.extend(Path(p).resolve() for p in vault.config.get("backup_destinations", []))

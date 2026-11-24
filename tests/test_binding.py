@@ -304,9 +304,9 @@ class VaultBinding(VaultTest):
             self.assertEqual(schedule["StandardOutPath"], str(next_state / "lint.out"))
             root, state = next_root, next_state
         restored = self.base / "restored vault"
-        backups.restore(vault, backup["id"], restored)
         isolated = self.base / "restored state"
+        backups.restore(vault, backup["id"], restored, state=isolated)
         adoption = binding.adopt(restored, isolated)
-        self.assertEqual(adoption["provenance"][0]["kind"], "restored-backup")
-        binding.adopt(restored, isolated, adoption["confirmation"])
-        self.assertNotEqual(Vault(restored).identity, vault.identity)
+        self.assertEqual(adoption["status"], "already-bound")
+        self.assertEqual(Vault(restored).identity, vault.identity)
+        self.assertEqual(Vault(restored).state, isolated)

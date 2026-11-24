@@ -1,37 +1,18 @@
 """Encrypted backup generations with immutable expiry and verified copies."""
-import base64
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from uuid import UUID, uuid4
 import re
-import tempfile
 
-from . import storage_policy
-from .core import Blocked, atomic, canonical, decode, digest, file_digest, git, git_bytes, json_paths, read_json, require, safe_path, stamp, utc
-from .custody import decrypt, encrypt, materials, restore_tree, save_material, validate_purpose, verified_capture
+from . import backup_snapshot as snapshot, storage_policy
+from .core import Blocked, canonical, decode, digest, file_digest, json_paths, read_json, require, safe_path, stamp, utc, atomic
+from .custody import archive_members, decrypt, encrypt, materials, save_material, validate_purpose, verified_capture
+from .lineage import sha256
 from .signing import envelope, verify
 
 
 def history_bundle(vault):
-    """Reject known custody/secret paths and native transcript objects before bundling."""
-    require(vault.head(), "History backup needs an initial commit", 5)
-    for line in git(vault.root, "rev-list", "--objects", "--all").splitlines():
-        oid, _, name = line.partition(" ")
-        if not name:
-            continue
-        require(not re.search(r"(^|/)(wiki-1\.4\.md|transcripts|\.env|S-[0-9]+\.jsonl)(/|$)|\.(age|key|pem)$", name),
-                "Historical custody/secret paths require a reviewed preservation or purge plan", 5)
-        if git(vault.root, "cat-file", "-t", oid) != "blob":
-            continue
-        body = git_bytes(vault.root, "cat-file", "blob", oid)
-        require(not re.search(rb"(?m)^-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----\r?$", body),
-                "Private key material detected in history", 5)
-        if name.endswith((".json", ".jsonl")) and b'"sessionId"' in body and (b'"assistant"' in body or b'"user"' in body):
-            raise Blocked("Native conversation object detected in Git history", 5)
-    with tempfile.TemporaryDirectory(prefix="bundle-", dir=vault.state) as directory:
-        bundle = Path(directory) / "repository.bundle"
-        git(vault.root, "bundle", "create", str(bundle), "--all")
-        git(vault.root, "bundle", "verify", str(bundle))
-        return bundle.read_bytes()
+    """Bundle history from refs fixed before inspecting their reachable paths."""
+    return snapshot.frozen_bundle(vault, snapshot.git_identity(vault.root))
 
 
 def validate_generation(kind, members, expires_at, now=None, *, policy=None):
@@ -50,81 +31,178 @@ def validate_generation(kind, members, expires_at, now=None, *, policy=None):
 def create(vault, kind, expires_at, member_ids=(), *, now=None, scheduled=False):
     with vault.locked():
         vault.no_transaction()
+        now = stamp(now)
+        records = snapshot.control_records(vault)
         policy = storage_policy.effective(vault)
+        policy_history = decode(records.get("storage-policy.json", b"[]"))
+        require(policy_history[-1]["payload"] == policy if policy_history else policy["version"] == 0,
+                "Backup policy changed during snapshot capture; retry backup", 5)
         status, detail = storage_policy.backup_status(vault, policy, scheduled=scheduled)
         require(status == "configured", detail, 5)
         require(not scheduled or policy["backup"]["mode"] == "scheduled", "Scheduled backup is disabled by policy", 5)
-        records = materials(vault)
-        require(len(set(member_ids)) == len(member_ids) and all(i in records for i in member_ids),
+        known = decode(records.get("materials.json", b"{}"))
+        require(len(set(member_ids)) == len(member_ids) and all(i in known for i in member_ids),
                 "Short backup members must be unique and inventoried", 5)
-        members = [records[i] for i in member_ids]
+        members = [known[i] for i in member_ids]
         validate_generation(kind, members, expires_at, now, policy=policy)
         member_files = {}
         for member in members:
-            require(member.get("kind") == "conversation" and member.get("classification") != "secret",
+            require(snapshot.identifier(member["id"]) and member.get("kind") == "conversation" and
+                    member.get("classification") != "secret",
                     "Only eligible conversation captures can be copied into a short backup", 5)
             validate_purpose(member)
-            data, _ = verified_capture(vault, member)
-            member_files["custody/" + member["id"] + ".age"] = {
-                "sha256": digest(data), "size": len(data), "body": base64.b64encode(data).decode("ascii")}
-        destinations = vault.config.get("backup_destinations", [])
-        require(destinations, "No backup destinations configured", 5)
-        require(all(Path(p).is_dir() and not Path(p).is_symlink() for p in destinations),
-                "A backup destination is offline", 5)
-        files = dict(member_files)
-        names = set(vault.inputs())
-        tracked = git_bytes(vault.root, "ls-files", "-z").decode("utf-8")
-        names.update(p for p in tracked.split("\0") if p)
-        for name in sorted(names):
-            data = safe_path(vault.root, name, exists=True).read_bytes()
-            files[name] = {"sha256": digest(data), "size": len(data), "body": base64.b64encode(data).decode("ascii")}
-        bundle = history_bundle(vault)
-        files["control/repository.bundle"] = {"sha256": digest(bundle), "size": len(bundle),
-                                                "body": base64.b64encode(bundle).decode("ascii")}
-        manifest_data = canonical({i: {k: v for k, v in m.items() if k != "copies"} for i, m in records.items()})
-        files["control/custody-manifests.json"] = {"sha256": digest(manifest_data), "size": len(manifest_data),
-                                                   "body": base64.b64encode(manifest_data).decode("ascii")}
-        checkpoints = {"reservations": read_json(vault.control / "reservations.json", {}),
-                       "csp": read_json(vault.control / "csp.json", {"streak": 0}),
-                       "sessions": [read_json(p) for p in (vault.control / "sessions").glob("*.json")]}
-        checkpoint_data = canonical(checkpoints)
-        files["control/controller-checkpoints.json"] = {"sha256": digest(checkpoint_data), "size": len(checkpoint_data),
-                                                         "body": base64.b64encode(checkpoint_data).decode("ascii")}
-        archive = {"format": "healdan-tree-v1", "files": files}
+            member_files[member["id"]], plain_member = verified_capture(vault, member)
+            verify_conversation(member, plain_member)
+
+        destinations = vault.config["backup_destinations"]
+        require(len(destinations) == len(set(map(Path, destinations))) and all(
+            Path(p).is_dir() and not Path(p).is_symlink() and not Path(p).is_junction() for p in destinations),
+            "A backup destination is offline, duplicated or unsafe", 5)
         key = Path(vault.config.get("backup_signing_key") or "")
-        signers = Path(vault.config.get("backup_allowed_signers") or "")
-        require(key.is_absolute() and key.is_file() and signers.is_file() and
+        signers = external_file(vault.config.get("backup_allowed_signers"), "Backup allowed signers", vault.root)
+        require(key.is_absolute() and key.is_file() and
                 not key.resolve().is_relative_to(vault.root) and key.resolve() != Path(vault.config.get("signing_key") or "").resolve(),
                 "A separate external backup signing key and policy are required", 5)
-        identity = vault.config.get("backup_signing_identity")
-        require(identity, "Backup signing identity missing", 5)
-        cipher = encrypt(vault, canonical(archive))
+        git_state = snapshot.git_identity(vault.root)
+        require(snapshot.git_identity(vault.root) == git_state, "Git references changed during snapshot capture; retry backup", 5)
+        bundle = snapshot.frozen_bundle(vault, git_state)
+        archive = snapshot.assemble(vault, git_state, records, member_files, bundle)
+        plain = canonical(archive)
         identifier = str(uuid4())
-        record = {"id": identifier, "kind": "backup", "generation": kind, "created_at": stamp(now),
-                  "expires_at": None if expires_at == "permanent" else stamp(expires_at),
-                  "members": list(member_ids), "commit": vault.head(),
-                  "plain_sha256": digest(archive), "cipher_sha256": digest(cipher), "holds": [],
-                  "dependencies": [], "copies": [], "status": "writing"}
+        manifest = {"format": snapshot.MANIFEST, "id": identifier, "source_vault": vault.identity,
+                    "generation": kind, "created_at": now, "expires_at": None if expires_at == "permanent" else stamp(expires_at),
+                    "members": list(member_ids), "commit": git_state["head"], "git_sha256": digest(git_state),
+                    "inventory_sha256": digest(snapshot.inventory(archive)), "plain_sha256": digest(plain)}
         if expires_at == "permanent":
-            record["expiry"] = "permanent"
-        # Register every target before the first effect so partial copies remain inventoried.
+            manifest["expiry"] = "permanent"
+        human_signers = vault.config.get("allowed_signers") or ""
+        snapshot.check_snapshot(plain, manifest, human_signers, signers, temporary_root=vault.state)
+        require(snapshot.control_records(vault) == records,
+                "Controller records changed during snapshot capture; retry backup", 5)
+        cipher = encrypt(vault, plain)
+        manifest["cipher_sha256"] = digest(cipher)
+        approval = envelope(manifest, "backup", vault.config["backup_signing_identity"], key)
+        verify_portable_manifest(identifier, approval, signers)
+        manifest_bytes = canonical(approval) + b"\n"
+        record = {**manifest, "kind": "backup", "holds": [], "dependencies": [], "copies": [],
+                  "status": "writing", "publication": approval}
         for destination in destinations:
             record["copies"].append({"root": str(Path(destination).resolve()), "path": identifier + ".age",
-                                     "sha256": digest(cipher), "kind": "ciphertext", "status": "planned"})
+                                     "sha256": manifest["cipher_sha256"], "kind": "ciphertext", "status": "planned",
+                                     "manifest": identifier + ".manifest.json", "manifest_sha256": digest(manifest_bytes)})
         save_material(vault, record)
-        for copy in record["copies"]:
-            target = safe_path(copy["root"], copy["path"])
-            atomic(target, cipher)
-            require(digest(decrypt(vault, target.read_bytes())) == record["plain_sha256"], "Backup verification failed")
-            copy["status"] = "present"
+        return publish_generation(vault, record, cipher, plain, now)
+
+
+def external_file(path, label, *excluded):
+    value = Path(path or "")
+    require(value.is_absolute() and value.is_file() and
+            not any(value.resolve().is_relative_to(Path(root).resolve()) for root in excluded),
+            "External " + label + " file is required", 5)
+    return safe_path(value.parent, value.name, exists=True)
+
+
+def verify_conversation(record, plain):
+    archive = decode(plain)
+    require(isinstance(archive, dict) and archive.get("format") == "healdan-tree-v1" and isinstance(archive.get("files"), dict),
+            "Invalid conversation capture archive", 5)
+    files = archive_members(archive, Path.cwd())
+    require(record.get("artifact_inventory") == {name.as_posix(): {"sha256": digest(body), "size": len(body)}
+                                                  for name, body in files.items()},
+            "Conversation capture differs from its custody inventory", 5)
+
+
+def verify_portable_manifest(identifier, approval, signers):
+    require(isinstance(approval, dict) and set(approval) == snapshot.SIGNATURE_FIELDS,
+            "Invalid portable backup manifest envelope", 5)
+    manifest = verify(approval, "backup", signers)
+    fields = {"format", "id", "source_vault", "generation", "created_at", "expires_at", "members", "commit",
+              "git_sha256", "inventory_sha256", "plain_sha256", "cipher_sha256"}
+    require(isinstance(manifest, dict) and manifest.get("format") == snapshot.MANIFEST and
+            set(manifest) in (fields, fields | {"expiry"}) and manifest["id"] == identifier and
+            snapshot.identifier(identifier) and snapshot.identifier(manifest["source_vault"]) and
+            manifest["generation"] in {"long", "short"} and isinstance(manifest["members"], list) and
+            all(snapshot.identifier(member) for member in manifest["members"]) and
+            len(set(manifest["members"])) == len(manifest["members"]) and
+            (manifest["generation"] == "short" or not manifest["members"]) and
+            isinstance(manifest["commit"], str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", manifest["commit"]) and
+            all(sha256(manifest[key]) for key in ("git_sha256", "inventory_sha256", "plain_sha256", "cipher_sha256")),
+            "Portable backup manifest does not match the requested generation", 5)
+    require(manifest["created_at"] == stamp(manifest["created_at"]) and
+            (manifest["expires_at"] is None and manifest.get("expiry") == "permanent" or
+             "expiry" not in manifest and manifest["expires_at"] == stamp(manifest["expires_at"]) and
+             utc(manifest["created_at"]) < utc(manifest["expires_at"])), "Invalid original backup expiry", 5)
+    return manifest
+
+
+def publish_file(path, body):
+    if path.exists():
+        require(safe_path(path.parent, path.name, exists=True).read_bytes() == body,
+                "Backup target already contains different bytes: " + str(path), 5)
+    else:
+        atomic(path, body)
+
+
+def published_copy(record, index, copy, at):
+    return {"id": record["id"], "copy_index": index, "root": copy["root"], "path": copy["path"],
+            "cipher_sha256": copy["sha256"], "manifest_sha256": copy["manifest_sha256"],
+            "envelope_digest": (record.get("publication") or record["approval"])["digest"], "verified_at": at}
+
+
+def publish_generation(vault, record, cipher, plain, now):
+    manifest_bytes = canonical(record["publication"]) + b"\n"
+    for index, copy in enumerate(record["copies"]):
+        root = vault.relocated_path(copy["root"])
+        require(root.is_dir() and not root.is_junction() and root in map(Path, vault.config["backup_destinations"]),
+                "Backup replica destination is offline or unauthorized", 5)
+        target = safe_path(root, copy["path"])
+        manifest_path = safe_path(root, copy["manifest"])
+        publish_file(target, cipher)
+        publish_file(manifest_path, manifest_bytes)
+        persisted = safe_path(root, copy["path"], exists=True).read_bytes()
+        require(digest(persisted) == copy["sha256"] and decrypt(vault, persisted) == plain and
+                file_digest(safe_path(root, copy["manifest"], exists=True)) == copy["manifest_sha256"],
+                "Persisted backup replica did not match the verified snapshot and manifest", 5)
+        if copy["status"] != "present":
+            payload = published_copy(record, index, copy, now)
+            receipt = vault.receipt("backup-replica-published", payload, at=now)
+            copy.update(status="present", published_at=now, publication_receipt=receipt)
             save_material(vault, record)
-        record["status"] = "complete"
-        record["verified_at"] = stamp(now)
-        record["approval"] = envelope(record.copy(), "backup", identity, key)
-        verify(record["approval"], "backup", signers)
-        save_material(vault, record)
-        vault.receipt("backup", {"id": identifier, "status": "complete", "expires_at": record["expires_at"]})
-        return record
+    record.update(status="complete", verified_at=now, approval=record.pop("publication"))
+    save_material(vault, record)
+    vault.receipt("backup", {"id": record["id"], "status": "complete", "expires_at": record["expires_at"]}, at=now)
+    return record
+
+
+def reconcile(vault, identifier):
+    with vault.locked():
+        record = materials(vault)[identifier]
+        if record["status"] == "complete":
+            result, _ = _inspect(vault, record, decrypt_replicas=True)
+            vault.receipt("backup", {"id": identifier, "status": "complete", "expires_at": record["expires_at"]},
+                          at=record["verified_at"])
+            return result
+        require(record.get("format") == snapshot.MANIFEST and writing_generation(record),
+                "Backup is not an interrupted portable publication", 5)
+        check_writing_generation(vault, record)
+        require(record.get("expiry") == "permanent" or utc() < utc(record["expires_at"]),
+                "Backup publication has expired", 5)
+        require(all(copy["status"] in {"planned", "present"} for copy in record["copies"]),
+                "Retired backup publication cannot be resumed", 5)
+        signers = vault.config.get("backup_allowed_signers") or ""
+        manifest = verify_portable_manifest(identifier, record["publication"], signers)
+        check_portable_record(vault, record, manifest)
+        for copy in record["copies"]:
+            try:
+                cipher = replica_path(vault, copy).read_bytes()
+                require(digest(cipher) == manifest["cipher_sha256"], "Backup ciphertext mismatch", 5)
+                plain = decrypt(vault, cipher)
+                require(digest(plain) == manifest["plain_sha256"], "Backup plaintext mismatch", 5)
+                snapshot.check_snapshot(plain, manifest, vault.config.get("allowed_signers") or "", signers)
+            except (Blocked, OSError, ValueError, TypeError, KeyError):
+                continue
+            return publish_generation(vault, record, cipher, plain, stamp())
+        raise Blocked("Interrupted publication has no verified ciphertext; create a new generation", 5)
 
 
 def verify_backup(vault, identifier, *, allow_retired=False):
@@ -132,15 +210,45 @@ def verify_backup(vault, identifier, *, allow_retired=False):
         return _verify_backup(vault, identifier, allow_retired=allow_retired)
 
 
+def check_portable_record(vault, record, manifest):
+    require(all(record.get(key) == value for key, value in manifest.items()) and
+            {key for key in record if key in {"expiry"}} == {key for key in manifest if key in {"expiry"}} and
+            record.get("holds") == [] and record.get("dependencies") == [], "Signed backup manifest changed", 5)
+    copies = record["copies"]
+    approval = record.get("approval") or record.get("publication")
+    raw_digest = digest(canonical(approval) + b"\n")
+    require(isinstance(copies, list) and copies and all(
+        copy["kind"] == "ciphertext" and copy["path"] == record["id"] + ".age" and
+        copy["sha256"] == manifest["cipher_sha256"] and copy.get("manifest") == record["id"] + ".manifest.json" and
+        copy.get("manifest_sha256") == raw_digest and isinstance(copy.get("root"), str) and
+        copy["status"] in {"planned", "present", "deleted", "absent", "unavailable"} for copy in copies),
+        "Portable replica inventory changed", 5)
+    for index, copy in enumerate(copies):
+        if copy["status"] in {"present", "deleted"}:
+            receipt = copy.get("publication_receipt")
+            require(sha256(receipt), "Backup replica lacks a publication receipt", 5)
+            proof = read_json(safe_path(vault.control, f"receipts/{receipt}.json"), {})
+            expected = published_copy(record, index, copy, copy.get("published_at"))
+            require(digest(proof) == receipt and proof.get("kind") == "backup-replica-published" and
+                    proof.get("at") == copy.get("published_at") and proof.get("payload") == expected,
+                    "Backup replica publication receipt changed", 5)
+
+
 def signed_manifest(vault, record):
     require(record["kind"] == "backup", "Not a backup", 2)
-    signed = verify(record.get("approval"), "backup", vault.config.get("backup_allowed_signers") or "")
+    signers = vault.config.get("backup_allowed_signers") or ""
+    if record.get("format") == snapshot.MANIFEST:
+        require(record.get("status") == "complete", "Backup publication is incomplete", 5)
+        signed = verify_portable_manifest(record["id"], record.get("approval"), signers)
+        check_portable_record(vault, record, signed)
+        return signed
+    signed = verify(record.get("approval"), "backup", signers)
     from .retention import copy_identity
     require({k: v for k, v in record.items() if k not in {"approval", "copies"}} ==
             {k: v for k, v in signed.items() if k != "copies"} and
             [copy_identity(c) for c in record["copies"]] == [copy_identity(c) for c in signed["copies"]],
             "Signed backup manifest changed", 5)
-    require(all(c.get("status") in {"present", "deleted"} and not ({"absent_at", "absence_receipt"} & c.keys())
+    require(all(c.get("status") in {"present", "deleted", "unavailable"} and not ({"absent_at", "absence_receipt"} & c.keys())
                 for c in record["copies"]),
             "Invalid backup replica state", 5)
     return signed
@@ -156,7 +264,8 @@ def check_writing_generation(vault, record):
     identifier = record["id"]
     require(isinstance(identifier, str) and str(UUID(identifier)) == identifier and record.get("generation") in {"long", "short"} and
             sha256(record.get("cipher_sha256")) and isinstance(record.get("created_at"), str) and
-            isinstance(record.get("expires_at"), str) and utc(record["created_at"]) < utc(record["expires_at"]),
+            (isinstance(record.get("expires_at"), str) and utc(record["created_at"]) < utc(record["expires_at"]) or
+             record.get("format") == snapshot.MANIFEST and record.get("expiry") == "permanent" and record["expires_at"] is None),
             "Interrupted backup generation has an unproven identity or expiry", 5)
     copies = record["copies"]
     require(copies and all(copy.get("kind") == "ciphertext" and copy.get("path") == identifier + ".age" and
@@ -221,6 +330,7 @@ def inspect_writing_generation(vault, record):
 
 def replica_path(vault, copy):
     root = vault.relocated_path(copy["root"])
+    require(not root.is_junction(), "Unsafe backup replica root", 5)
     if root != Path(copy["root"]):
         require(root in map(Path, vault.config.get("backup_destinations", [])),
                 "Relocated backup destination is not authorized", 5)
@@ -240,7 +350,7 @@ def legacy_replica_receipt(vault, record, copy, index):
     if not (copy.get("deleted_at") and record.get("expires_at") and utc(copy["deleted_at"]) >= utc(record["expires_at"])):
         return None
     root = vault.relocated_path(copy["root"])
-    if root.is_dir() and safe_path(root, copy["path"]).exists():
+    if "origin_status" not in copy and root.is_dir() and safe_path(root, copy["path"]).exists():
         return None
     identity = copy_identity(copy)
     plans = {}
@@ -305,7 +415,7 @@ def verify_replica_deletions(vault, record):
                 payload.get("copy_index") == index and payload.get("sha256") == copy["sha256"] and
                 intent.get("at") == receipt["at"] and
                 (intent if primary else generation).get("generation_digest") == (None if writing else record["approval"]["digest"]) and
-                intent.get("path") and vault.relocated_path(intent["path"]) == vault.relocated_path(copy["root"]) / copy["path"],
+                intent.get("path") and deletion_location(vault, intent["path"], copy),
                 reason, 5)
         directory = safe_path(vault.control, "deletions")
         plan_id = intent.get("plan_id")
@@ -319,52 +429,146 @@ def verify_replica_deletions(vault, record):
     return retired
 
 
-def inspect_backup(vault, record, *, allow_retired=False, decrypt_replicas=False):
-    signed_manifest(vault, record)
+def deletion_location(vault, path, copy):
+    if "origin_status" in copy:
+        path_type = PureWindowsPath if PureWindowsPath(copy["root"]).drive else Path
+        return path_type(path) == path_type(copy["root"]) / copy["path"]
+    return vault.relocated_path(path) == vault.relocated_path(copy["root"]) / copy["path"]
+
+
+def load_replica(vault, record, copy, *, decrypt_replica):
+    path = replica_path(vault, copy)
+    cipher = path.read_bytes()
+    require(digest(cipher) == copy["sha256"] == record["cipher_sha256"], "Backup ciphertext mismatch", 5)
+    if record.get("format") == snapshot.MANIFEST:
+        raw_manifest = safe_path(path.parent, copy["manifest"], exists=True).read_bytes()
+        require(digest(raw_manifest) == copy["manifest_sha256"] and
+                decode(raw_manifest) == record["approval"], "Backup replica manifest mismatch", 5)
+    else:
+        raw_manifest = None
+    if not decrypt_replica:
+        return None
+    plain = decrypt(vault, cipher)
+    require(digest(plain) == record["plain_sha256"], "Backup plaintext mismatch", 5)
+    return path, raw_manifest, plain
+
+
+def replica_availability(vault, copy):
+    if copy["status"] != "present":
+        return "unavailable"
+    root = vault.relocated_path(copy["root"])
+    if not root.is_dir():
+        return "unavailable"
+    path = safe_path(root, copy["path"])
+    if not path.exists() or copy.get("manifest") and not safe_path(root, copy["manifest"]).exists():
+        return "unavailable"
+    return "available"
+
+
+def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allow_partial=True):
+    manifest = signed_manifest(vault, record)
     retired = verify_replica_deletions(vault, record)
-    checks = []
-    for copy in record["copies"]:
-        if copy["status"] == "present":
-            if decrypt_replicas:
-                verified_replica(vault, record, copy)
-            else:
-                require(file_digest(replica_path(vault, copy)) == copy["sha256"] == record["cipher_sha256"],
-                        "Backup ciphertext mismatch", 5)
-            checks.append({"root": str(vault.relocated_path(copy["root"])), "verified": True})
-    require(checks or allow_retired and retired, "Backup has no retained replicas", 5)
-    return {"id": record["id"], "status": "complete", "copies": checks, "deleted_copies": retired}
+    checks, replicas, selected = [], [], None
+    for index, copy in enumerate(record["copies"]):
+        root = str(vault.relocated_path(copy["root"]))
+        entry = {"copy_index": index, "root": root, "path": copy["path"]}
+        if copy["status"] == "deleted":
+            entry["status"] = "deleted"
+        else:
+            try:
+                if replica_availability(vault, copy) == "unavailable":
+                    entry.update(status="unavailable", reason="Required regular file is missing: backup replica is unavailable")
+                else:
+                    candidate = load_replica(vault, record, copy, decrypt_replica=decrypt_replicas)
+                    if candidate and selected is None:
+                        path, raw_manifest, plain = candidate
+                        if raw_manifest is not None:
+                            verified = snapshot.check_snapshot(plain, manifest, vault.config.get("allowed_signers") or "",
+                                                               vault.config.get("backup_allowed_signers") or "")
+                        else:
+                            verified = decode(plain)
+                        selected = (path, raw_manifest, plain, manifest, verified)
+                    entry["status"] = "verified"
+                    checks.append({"root": root, "verified": True})
+            except (Blocked, OSError, KeyError, TypeError, ValueError) as exc:
+                entry.update(status="invalid", reason=str(exc))
+        replicas.append(entry)
+    pending = [entry for entry in replicas if entry["status"] in {"unavailable", "invalid"}]
+    require(allow_partial or not pending, "; ".join(entry["reason"] for entry in pending), 5)
+    if not checks and not (allow_retired and retired and not pending):
+        raise Blocked("Backup has no verified retained replicas" +
+                      (": " + "; ".join(entry["reason"] for entry in pending) if pending else ""), 5)
+    report = {"id": record["id"], "status": "complete", "copies": checks, "deleted_copies": retired,
+              "replicas": replicas, "pending_replicas": pending}
+    if selected:
+        report["replica"] = str(selected[0])
+    return report, selected
+
+
+def inspect_backup(vault, record, *, allow_retired=False, decrypt_replicas=False):
+    report, _ = _inspect(vault, record, allow_retired=allow_retired, decrypt_replicas=decrypt_replicas,
+                         allow_partial=decrypt_replicas)
+    return report
 
 
 def _verify_backup(vault, identifier, *, allow_retired=False):
     record = materials(vault)[identifier]
     require(record["id"] == identifier, "Backup identity changed", 5)
-    return inspect_backup(vault, record, allow_retired=allow_retired, decrypt_replicas=True)
+    report, _ = _inspect(vault, record, allow_retired=allow_retired, decrypt_replicas=True)
+    return report
 
 
-def restore(vault, identifier, destination):
+def _portable_replica(identifier, manifest_path, replica, *, age_identity, backup_signers, allowed_signers=None,
+                      excluded=(), expected_vault=None):
+    require(manifest_path is not None and replica is not None,
+            "Portable backup verification requires both a trusted manifest and an age replica", 5)
+    manifest_path = Path(manifest_path).absolute()
+    replica = Path(replica).absolute()
+    raw_manifest = safe_path(manifest_path.parent, manifest_path.name, exists=True).read_bytes()
+    approval = decode(raw_manifest)
+    signers = external_file(backup_signers, "backup allowed signers", *excluded)
+    signers_human = external_file(allowed_signers, "human allowed signers", *excluded) if allowed_signers else ""
+    identity = external_file(age_identity, "age identity", *excluded)
+    manifest = verify_portable_manifest(identifier, approval, signers)
+    require(expected_vault is None or manifest["source_vault"] == expected_vault, "The backup source vault identity differs", 5)
+    cipher = safe_path(replica.parent, replica.name, exists=True).read_bytes()
+    require(digest(cipher) == manifest["cipher_sha256"], "Backup ciphertext mismatch", 5)
+    try:
+        plain = decrypt(None, cipher, identity)
+    except Blocked as exc:
+        raise Blocked("Cannot decrypt backup replica with the supplied age identity", 5) from exc
+    require(digest(plain) == manifest["plain_sha256"], "Backup plaintext mismatch", 5)
+    verified = snapshot.check_snapshot(plain, manifest, signers_human, signers)
+    entry = {"root": str(replica.parent), "path": replica.name, "manifest": str(manifest_path), "status": "verified"}
+    report = {"id": identifier, "status": "complete", "replica": str(replica), "replicas": [entry],
+              "copies": [{"root": str(replica.parent), "verified": True}], "deleted_copies": [], "pending_replicas": []}
+    return report, (replica, raw_manifest, plain, manifest, verified)
+
+
+def verify_portable(identifier, manifest_path, replica, **trust):
+    report, _ = _portable_replica(identifier, manifest_path, replica, **trust)
+    return report
+
+
+def restore_portable(identifier, destination, manifest_path, replica, *, state, remap=None, expected_vault=None,
+                     age_identity, backup_signers, allowed_signers=None):
+    from .backup_recovery import recover
+
+    require(state is not None, "Portable restore requires a new external --state directory", 5)
+    report, verified = _portable_replica(identifier, manifest_path, replica, age_identity=age_identity,
+                                        backup_signers=backup_signers, allowed_signers=allowed_signers,
+                                        excluded=(destination, state), expected_vault=expected_vault)
+    return recover(verified, destination, state, report, allowed_signers=allowed_signers, backup_signers=backup_signers,
+                   age_identity=age_identity, remap=remap)
+
+
+def restore(vault, identifier, destination, *, state=None, remap=None):
+    from .backup_recovery import recover
+
     with vault.locked():
-        return _restore(vault, identifier, destination)
-
-
-def _restore(vault, identifier, destination):
-    _verify_backup(vault, identifier)
-    copy = next(c for c in materials(vault)[identifier]["copies"] if c["status"] == "present")
-    cipher = safe_path(vault.relocated_path(copy["root"]), copy["path"], exists=True).read_bytes()
-    result = restore_tree(decode(decrypt(vault, cipher)), destination)
-    bundle = Path(destination) / "control/repository.bundle"
-    if bundle.exists():
-        git(destination, "-c", "init.templateDir=", "init")
-        git(destination, "fetch", "--update-head-ok", str(bundle.resolve()), "+refs/*:refs/*")
-        git(destination, "symbolic-ref", "HEAD", "refs/heads/healdan-recovered")
-        git(destination, "reset", "--mixed", materials(vault)[identifier]["commit"])
-        result["commit"] = git(destination, "rev-parse", "HEAD")
-        control = Path(destination) / ".git/healdan"
-        checkpoints = read_json(Path(destination) / "control/controller-checkpoints.json")
-        if checkpoints:
-            atomic(control / "reservations.json", checkpoints["reservations"])
-            atomic(control / "csp.json", checkpoints["csp"])
-            for session in checkpoints["sessions"]:
-                atomic(control / "sessions" / (session["operation"] + ".json"), session)
-        atomic(control / "restored-from.json", {"format": "healdan-restored-vault-v1", "source_vault": vault.identity,
-                                                "backup": identifier, "commit": result["commit"]})
-    return result
+        record = materials(vault)[identifier]
+        require(record["id"] == identifier, "Backup identity changed", 5)
+        report, verified = _inspect(vault, record, decrypt_replicas=True)
+        return recover(verified, destination, state, report, allowed_signers=vault.config.get("allowed_signers"),
+                       backup_signers=vault.config.get("backup_allowed_signers"), remap=remap, legacy_source=vault.identity,
+                       source_root=vault.root, source_state=vault.state)

@@ -94,8 +94,8 @@ def encrypt(vault, data):
 
 
 def decrypt(vault, cipher, identity=None):
-    key = Path(identity or vault.config.get("age_identity") or "")
-    require(key.is_absolute() and key.is_file() and not key.resolve().is_relative_to(vault.root),
+    key = Path(identity or (vault.config.get("age_identity") if vault else None) or "")
+    require(key.is_absolute() and key.is_file() and (vault is None or not key.resolve().is_relative_to(vault.root)),
             "External age identity is required", 5)
     return run([executable("age"), "--decrypt", "-i", key], data=cipher).stdout
 
@@ -189,6 +189,12 @@ def integrity_findings(vault, *, records=None):
                 findings.append((path.stem, journal.get("error") or "Restoration is awaiting reconciliation"))
         except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
             findings.append((path.stem, str(exc)))
+    try:
+        for identifier, path in origin_restorations(vault):
+            if identifier in records:
+                findings.append((path, "Origin restoration for " + identifier + " awaits custody reconciliation"))
+    except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+        findings.append(("origin-restorations", str(exc)))
     return findings
 
 
@@ -355,7 +361,18 @@ def native_guard(vault, material):
             proof.get("action") == session["action"] == receipt.get("action"), "Native resume is not proven", 5)
 
 
+def origin_restorations(vault):
+    directory = safe_path(vault.control, "historical/restorations")
+    for path in json_paths(directory):
+        journal = read_json(safe_path(directory, path.name, exists=True))
+        status = journal.get("status")
+        if status in {"staging", "publishing"} or status == "preparing" and not journal.get("terminal"):
+            yield journal["material"], path.stem
+
+
 def pending_restoration(vault, identifier=None, *, target=None):
+    if target is None and identifier is not None and any(material == identifier for material, _ in origin_restorations(vault)):
+        return True
     directory = safe_path(vault.control, "restorations")
     for path in json_paths(directory):
         journal = read_json(safe_path(directory, path.name, exists=True))

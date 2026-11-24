@@ -233,6 +233,22 @@ def setup_binding(root, state):
         return _start(repository, "setup", _new_marker(location))
 
 
+def stage_recovered_binding(staging, destination, state, vault_id):
+    """Prepare the reciprocal markers for publication at the recovered location."""
+    staged = Repository.open(staging)
+    require(staged.root == staged.primary and staged.common == staging / ".git",
+            "Recovery staging is not a standalone repository", 5)
+    repository = Repository(destination, destination, destination / ".git")
+    value = _validate_marker({"format": FORMAT, "vault_id": vault_id,
+                              "location": repository.location(state), "previous": []})
+    with pair_lock(staged, state):
+        require(marker(state) in (None, value) and marker(staged.control) in (None, value),
+                "Recovery binding would replace a foreign state marker", 5)
+        atomic(state / MARKER, value)
+        atomic(staged.control / MARKER, value)
+    return value
+
+
 def relocated_path(path, binding):
     original = Path(path)
     if not original.is_absolute():

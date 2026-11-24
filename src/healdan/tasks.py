@@ -27,8 +27,14 @@ def age_status(task, now=None):
 
 
 def require_active(task, now=None):
+    require_reconciled(task)
     require(task["state"] in {"active", "waiting"} and age_status(task, now) != "expired",
             "Task/worktree cannot perform new actions or integrations", 5)
+
+
+def require_reconciled(task):
+    require(task.get("state") != "reconciliation_required",
+            "Restored task requires reconciliation of origin worktree and processes", 5)
 
 
 def task_ids(vault):
@@ -135,6 +141,7 @@ def present(vault, task_id, question, delivery_receipt, now=None):
     require(delivery_receipt and question, "Successful presentation receipt and question are required", 2)
     with vault.locked():
         task = get_task(vault, task_id)
+        require_reconciled(task)
         require(task["state"] not in {"closed", "cancelled"}, "Task is already closed", 5)
         require(not task.get("presented_at"), "Waiting question already presented", 5)
         task.update(state="waiting", question=question, delivery_receipt=delivery_receipt, presented_at=stamp(now))
@@ -198,6 +205,7 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
     from .custody import capture_tree, materials, verified_capture
     with vault.locked():
         task = get_task(vault, task_id)
+        require_reconciled(task)
         if task.get("closed_at") and not task.get("capacity_held"):
             return task
         require(not task.get("processes"), "Processes require reconciliation before closure", 5)
@@ -251,6 +259,7 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
 
 def reconcile_processes(vault, task):
     """On macOS, stop only the supervised process identity recorded at launch."""
+    require_reconciled(task)
     import platform
     import signal
     import time
@@ -358,6 +367,7 @@ def reconcile_expired(vault, task_id, now=None):
     from .custody import capture_tree
     with vault.locked():
         task = get_task(vault, task_id)
+        require_reconciled(task)
         require(age_status(task, now) == "expired", "Worktree has not expired", 2)
         if task.get("worktree_removed"):
             return task

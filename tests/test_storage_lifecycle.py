@@ -1046,15 +1046,15 @@ class StorageLifecycle(VaultTest):
         independent = tasks.create(self.vault, "Independent waiting task", now=past)
         tasks.present(self.vault, independent["id"], "Proceed?", "fixture-delivery", now=past)
         _, expired_export = self.export("independent-of-task-read", stamp(past))
-        read = Path.read_bytes
+        read = tasks.read_json
 
-        def delayed_read(path):
+        def delayed_read(path, *args):
             if path == task_file:
                 raise PermissionError("Fixture task record temporarily unavailable")
-            return read(path)
+            return read(path, *args)
 
         output = BytesIO()
-        with patch.object(Path, "read_bytes", delayed_read), patch("healdan.cli.sys.stdout") as stdout:
+        with patch("healdan.tasks.read_json", side_effect=delayed_read), patch("healdan.cli.sys.stdout") as stdout:
             with self.assertRaisesRegex(PermissionError, "task record temporarily unavailable"):
                 tasks.create(self.vault, "Writer cannot assume free capacity")
             stdout.buffer = output
@@ -1083,7 +1083,7 @@ class StorageLifecycle(VaultTest):
         worktree = Path(expired["worktree"])
         directory = self.vault.control / "tasks"
         task_file = tasks.task_path(self.vault, expired["id"])
-        scandir, read = os.scandir, Path.read_bytes
+        scandir, read = os.scandir, tasks.read_json
         reads = []
 
         @contextmanager
@@ -1103,14 +1103,19 @@ class StorageLifecycle(VaultTest):
                 raise PermissionError("Fixture task clock write failed")
             return atomic(path, payload)
 
-        def failed_reload(path):
+        def failed_reload(path, *args):
             if path == task_file:
                 reads.append(path)
                 if len(reads) == 2:
                     raise PermissionError("Fixture task reload failed")
-            return read(path)
+            return read(path, *args)
 
-        with patch("os.scandir", side_effect=scan):
+        def scan_tasks(path):
+            with patch("os.scandir", side_effect=scan):
+                return tasks_json_paths(path)
+
+        tasks_json_paths = tasks.json_paths
+        with patch("healdan.tasks.json_paths", side_effect=scan_tasks):
             with self.assertRaisesRegex(PermissionError, "task inventory interrupted"):
                 tasks.create(self.vault, "Writer cannot assume an empty inventory")
             result = maintenance.daily(self.vault, now)
@@ -1119,7 +1124,7 @@ class StorageLifecycle(VaultTest):
         self.assertTrue(worktree.is_dir())
         self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
         cases = [(patch("healdan.tasks.atomic", side_effect=failed_clock_write), "Fixture task clock write failed"),
-                 (patch.object(Path, "read_bytes", failed_reload), "Fixture task reload failed")]
+                 (patch("healdan.tasks.read_json", side_effect=failed_reload), "Fixture task reload failed")]
         for failure, reason in cases:
             with self.subTest(reason=reason), failure:
                 result = maintenance.daily(self.vault, now + timedelta(hours=1))
@@ -1182,7 +1187,14 @@ class StorageLifecycle(VaultTest):
                         raise PermissionError("Fixture journal directory temporarily unavailable: " + name)
                     return scandir(path)
 
-                with patch("os.scandir", side_effect=unavailable):
+                module = retention if name == "deletions" else custody
+                original_paths = module.json_paths
+
+                def scan_journal(path):
+                    with patch("os.scandir", side_effect=unavailable):
+                        return original_paths(path)
+
+                with patch.object(module, "json_paths", side_effect=scan_journal):
                     if name == "deletions":
                         with self.assertRaisesRegex(PermissionError, "temporarily unavailable"):
                             retention.pending_deletion_paths(self.vault)
