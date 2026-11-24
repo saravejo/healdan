@@ -147,11 +147,16 @@ def integrity_findings(vault):
                 if any(copy.get("kind") == "ciphertext" for copy in live):
                     verified_capture(vault, record)
                 else:
-                    require(not any(copy.get("kind") == "native" for copy in live), "Native copies have lost their verified capture", 5)
+                    require(not any(copy.get("kind") in {"native", "checkpoint"} for copy in live),
+                            "Native copies or checkpoints have lost their verified capture", 5)
         except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
             findings.append((record["id"], str(exc)))
-    directory = safe_path(vault.control, "restorations")
-    for path in sorted(directory.glob("*.json")):
+    try:
+        directory = safe_path(vault.control, "restorations")
+        journals = json_paths(directory)
+    except (Blocked, OSError) as exc:
+        return [*findings, ("restorations", str(exc))]
+    for path in journals:
         try:
             journal = read_json(safe_path(directory, path.name, exists=True))
             if journal["status"] != "complete":

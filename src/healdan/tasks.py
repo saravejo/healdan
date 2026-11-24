@@ -6,7 +6,7 @@ import shutil
 from uuid import uuid4
 
 from .binding import project_record
-from .core import atomic, decode, digest, git, jsonl, read_json, require, safe_path, stamp, utc
+from .core import atomic, decode, digest, git, json_paths, jsonl, read_json, require, safe_path, stamp, utc
 from .ids import reserve
 from . import originals
 
@@ -31,8 +31,12 @@ def require_active(task, now=None):
             "Task/worktree cannot perform new actions or integrations", 5)
 
 
+def task_ids(vault):
+    return [path.stem for path in json_paths(safe_path(vault.control, "tasks"))]
+
+
 def all_tasks(vault):
-    return [get_task(vault, p.stem) for p in (vault.control / "tasks").glob("*.json")]
+    return [get_task(vault, identifier) for identifier in task_ids(vault)]
 
 
 def create(vault, title, now=None):

@@ -76,8 +76,8 @@ def json_paths(directory):
         scan = os.scandir(directory)
     except FileNotFoundError:
         return []
-    with scan:
-        return sorted(Path(entry.path) for entry in scan if os.path.normcase(entry.name).endswith(".json"))
+    with scan as entries:
+        return sorted(Path(entry.path) for entry in entries if os.path.normcase(entry.name).endswith(".json"))
 
 
 def parse_jsonl(data, path, *, include_bytes=False):

@@ -357,8 +357,7 @@ def dispatch(args):
             with vault.locked():
                 return plan(vault)
         if args.action == "execute":
-            from .retention import execute
-            result = execute(vault, args.plan)
+            result = maintenance.execute_plan(vault, args.plan)
             return result, 0 if result["status"] == "complete" else 5
         if args.action == "policy":
             from . import storage_policy

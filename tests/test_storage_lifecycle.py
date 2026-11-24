@@ -1,12 +1,14 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
+from io import BytesIO
 import os
 from pathlib import Path
 from unittest.mock import patch
 
 from support import VaultTest
-from healdan import backups, compatibility, custody, inbox, linting, maintenance, retention, setup, storage_policy, tasks
+from healdan import backups, cli, compatibility, custody, inbox, linting, maintenance, retention, setup, storage_policy, tasks
 from healdan.core import Blocked, Vault, atomic, decode, digest, read_json, stamp, utc
 
 
@@ -609,6 +611,10 @@ class StorageLifecycle(VaultTest):
         cipher = self.state / "custody" / (identifier + ".age")
         clear = [origin / name for name in ("a.jsonl", "nested/b.jsonl")]
         original = {path: path.read_bytes() for path in [*clear, cipher]}
+        without_cipher = {**material, "copies": [{**material["copies"][0], "status": "deleted"}, *material["copies"][1:]]}
+        with patch("healdan.custody.materials", return_value={identifier: without_cipher}):
+            self.assertIn((identifier, "Native copies or checkpoints have lost their verified capture"),
+                          custody.integrity_findings(self.vault))
         _, independent = self.export("independent-expiry")
         now = "2026-02-10T00:00:00Z"
         plan = retention.plan(self.vault, now)
@@ -886,6 +892,8 @@ class StorageLifecycle(VaultTest):
         checkpoint = origin / "nested" / "b.jsonl"
         data = checkpoint.read_bytes()
         cipher = self.state / "custody" / (material["id"] + ".age")
+        held, held_file = self.export("held-across-retry")
+        hold = custody.hold(self.vault, held["id"], "Retain during human review", "human")
         now = utc("2026-02-15T00:00:00Z")
         plan = retention.plan(self.vault, now)
         path = self.vault.control / "deletions" / (plan["id"] + ".json")
@@ -916,16 +924,125 @@ class StorageLifecycle(VaultTest):
             result = maintenance.daily(self.vault, now)
         self.assertEqual(visits.count(plan["id"]), 2)
         self.assertEqual(result["status"], "pending", result)
-        self.assertIn({"plan": plan["id"], "reason": "Fixture plan read temporarily unavailable on retry"}, result["pending"])
+        self.assertIn({"plan": plan["id"], "phase": "retry", "reason": "Fixture plan read temporarily unavailable on retry"},
+                      result["pending"])
+        self.assertTrue(any(entry.get("material") == material["id"] and "checkpoint read temporarily unavailable" in entry["reason"]
+                            for entry in result["pending"]))
+        self.assertTrue(any(entry.get("material") == held["id"] and entry["reason"] == "Active hold prevents deletion"
+                            for entry in result["pending"]))
         self.assertFalse(independent.exists())
         self.assertEqual(checkpoint.read_bytes(), data)
-        self.assertTrue(cipher.is_file())
+        self.assertTrue(cipher.is_file() and held_file.is_file())
         self.assertTrue(any("checkpoint read temporarily unavailable" in entry["reason"] for entry in read_json(path)["pending"]))
         self.assertEqual(result["backup_result"]["status"], "complete", result)
         self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
+        custody.release_hold(self.vault, held["id"], hold["id"], [])
         retry = maintenance.daily(Vault(self.root, self.state), now + timedelta(hours=1))
         self.assertEqual(retry["status"], "complete", retry)
+        self.assertFalse(checkpoint.exists() or cipher.exists() or held_file.exists())
+
+    def test_daily_unreadable_task_preserves_dependent_capture_and_runs_independent_work(self):
+        self.configure_age(backup_interval_hours=24)
+        self.change_policy(backup="scheduled")
+        past = utc() - timedelta(days=40)
+        unavailable = tasks.create(self.vault, "Task with unavailable closure record", now=past)
+        profile = self.state / "dependent-profile"
+        checkpoint = profile / "checkpoint.jsonl"
+        data = b"synthetic conversation"
+        atomic(checkpoint, data)
+        capture = custody.capture_tree(self.vault, profile, task=unavailable["id"], classification="common")
+        cipher = self.state / "custody" / (capture + ".age")
+        with patch("healdan.tasks.stamp", return_value=stamp(past)):
+            tasks.preserve_and_close(self.vault, unavailable["id"])
+        task_file = tasks.task_path(self.vault, unavailable["id"])
+        task_data = task_file.read_bytes()
+        independent = tasks.create(self.vault, "Independent waiting task", now=past)
+        tasks.present(self.vault, independent["id"], "Proceed?", "fixture-delivery", now=past)
+        _, expired_export = self.export("independent-of-task-read", stamp(past))
+        read = Path.read_bytes
+
+        def delayed_read(path):
+            if path == task_file:
+                raise PermissionError("Fixture task record temporarily unavailable")
+            return read(path)
+
+        output = BytesIO()
+        with patch.object(Path, "read_bytes", delayed_read), patch("healdan.cli.sys.stdout") as stdout:
+            with self.assertRaisesRegex(PermissionError, "task record temporarily unavailable"):
+                tasks.create(self.vault, "Writer cannot assume free capacity")
+            stdout.buffer = output
+            code = cli.main(["--vault", str(self.root), "--state", str(self.state), "maintenance", "daily"])
+        result = decode(output.getvalue())
+        self.assertEqual((code, result["status"]), (5, "pending"), result)
+        self.assertIn({"task": unavailable["id"], "reason": "Fixture task record temporarily unavailable"}, result["pending"])
+        self.assertTrue(any(entry.get("material") == capture and "origin or deadline is unknown" in entry["reason"]
+                            for entry in result["pending"]))
+        self.assertEqual(task_file.read_bytes(), task_data)
+        self.assertEqual(checkpoint.read_bytes(), data)
+        self.assertTrue(cipher.is_file())
+        self.assertFalse(expired_export.exists() or Path(independent["worktree"]).exists())
+        self.assertEqual(tasks.get_task(self.vault, independent["id"])["state"], "cancelled")
+        self.assertEqual(result["backup_result"]["status"], "complete", result)
+        self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
+        code, recovered = self.cli("maintenance", "daily")
+        self.assertEqual((code, recovered["status"], recovered["backup_result"]["status"]), (0, "complete", "not_due"), recovered)
         self.assertFalse(checkpoint.exists() or cipher.exists())
+
+    def test_daily_task_inventory_and_reconciliation_failures_are_isolated(self):
+        self.configure_age(backup_interval_hours=24)
+        self.change_policy(backup="scheduled")
+        now = utc()
+        expired = tasks.create(self.vault, "Expired disposable task", now=now - timedelta(days=2))
+        worktree = Path(expired["worktree"])
+        directory = self.vault.control / "tasks"
+        task_file = tasks.task_path(self.vault, expired["id"])
+        scandir, read = os.scandir, Path.read_bytes
+        reads = []
+
+        @contextmanager
+        def interrupted_scan(scan):
+            def partial():
+                yield next(scan)
+                raise PermissionError("Fixture task inventory interrupted")
+            with scan:
+                yield partial()
+
+        def scan(path):
+            entries = scandir(path)
+            return interrupted_scan(entries) if Path(path) == directory else entries
+
+        def failed_clock_write(path, payload):
+            if path == task_file:
+                raise PermissionError("Fixture task clock write failed")
+            return atomic(path, payload)
+
+        def failed_reload(path):
+            if path == task_file:
+                reads.append(path)
+                if len(reads) == 2:
+                    raise PermissionError("Fixture task reload failed")
+            return read(path)
+
+        with patch("os.scandir", side_effect=scan):
+            with self.assertRaisesRegex(PermissionError, "task inventory interrupted"):
+                tasks.create(self.vault, "Writer cannot assume an empty inventory")
+            result = maintenance.daily(self.vault, now)
+        self.assertEqual(result["status"], "pending", result)
+        self.assertIn({"task_inventory": "inventory", "reason": "Fixture task inventory interrupted"}, result["pending"])
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
+        cases = [(patch("healdan.tasks.atomic", side_effect=failed_clock_write), "Fixture task clock write failed"),
+                 (patch.object(Path, "read_bytes", failed_reload), "Fixture task reload failed")]
+        for failure, reason in cases:
+            with self.subTest(reason=reason), failure:
+                result = maintenance.daily(self.vault, now + timedelta(hours=1))
+                self.assertEqual(result["status"], "pending", result)
+                self.assertIn({"task": expired["id"], "reason": reason}, result["pending"])
+                self.assertEqual(result["backup_result"]["status"], "not_due", result)
+                self.assertTrue(worktree.is_dir())
+        resolved = maintenance.daily(self.vault, now + timedelta(hours=1))
+        self.assertEqual(resolved["status"], "complete", resolved)
+        self.assertFalse(worktree.exists())
 
     def test_daily_unreadable_plan_inventory_suspends_retention_but_runs_due_backup(self):
         self.configure_age(backup_interval_hours=24)
@@ -985,6 +1102,12 @@ class StorageLifecycle(VaultTest):
                     else:
                         with self.assertRaisesRegex(PermissionError, "temporarily unavailable"):
                             custody.pending_restoration(self.vault, material["id"])
+                        checks = setup.doctor(self.vault)["checks"]
+                        findings, _ = linting.collect(self.vault)
+                        self.assertTrue(any(check["name"] == "custody:restorations" and not check["passed"] and
+                                            "temporarily unavailable" in check["detail"] for check in checks))
+                        self.assertTrue(any(row["category"] == "custody" and row["key"] == "restorations" and
+                                            "temporarily unavailable" in row["message"] for row in findings.values()))
                     result = maintenance.daily(self.vault, now + timedelta(days=offset))
                 self.assertEqual(result["status"], "pending", result)
                 self.assertTrue(any("Fixture journal directory temporarily unavailable" in row["reason"] for row in result["pending"]))
@@ -995,6 +1118,37 @@ class StorageLifecycle(VaultTest):
         done = maintenance.daily(Vault(self.root, self.state), now + timedelta(days=1, hours=1))
         self.assertEqual(done["status"], "complete", done)
         self.assertFalse(checkpoint.exists() or cipher.exists())
+
+    def test_explicit_retention_execute_reports_unreadable_plan_and_preserves_input_errors(self):
+        _, target = self.export("explicit-plan-retry", stamp(utc() - timedelta(days=8)))
+        original = target.read_bytes()
+        plan = retention.plan(self.vault)
+        identifier = plan["id"]
+        plan_path = self.vault.control / "deletions" / (identifier + ".json")
+        saved = plan_path.read_bytes()
+        read = Path.read_bytes
+
+        def delayed_read(path):
+            if path == plan_path:
+                raise PermissionError("Fixture plan temporarily unavailable")
+            return read(path)
+
+        output = BytesIO()
+        with patch.object(Path, "read_bytes", delayed_read), patch("healdan.cli.sys.stdout") as stdout:
+            stdout.buffer = output
+            code = cli.main(["--vault", str(self.root), "--state", str(self.state), "maintenance", "execute", identifier])
+        self.assertEqual(code, 5)
+        self.assertEqual(decode(output.getvalue()), {"id": identifier, "status": "pending",
+                                                    "pending": [{"reason": "Fixture plan temporarily unavailable"}]})
+        self.assertEqual(plan_path.read_bytes(), saved)
+        self.assertEqual(target.read_bytes(), original)
+        code, error = self.cli("maintenance", "execute", "../outside")
+        self.assertEqual((code, error["error"]), (2, "Path must be relative and confined"))
+        code, error = self.cli("maintenance", "execute", "missing-plan")
+        self.assertEqual((code, error["error"]), (4, "Required regular file is missing: missing-plan.json"))
+        code, recovered = self.cli("maintenance", "execute", identifier)
+        self.assertEqual((code, recovered["status"]), (0, "complete"), recovered)
+        self.assertFalse(target.exists())
 
     def test_overlapping_rounds_reconcile_all_plans_and_discover_new_slots(self):
         self.change_policy()

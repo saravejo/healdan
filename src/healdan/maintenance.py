@@ -14,33 +14,48 @@ from .trials import TRIALS, attest, status as trial_status
 TRIAL_MARKER = "launchd-trial.json"
 
 
+def execute_plan(vault, identifier, now=None, *, automatic=False, previous=None):
+    from . import retention
+
+    try:
+        return retention.execute(vault, identifier, now)
+    except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
+        if not automatic and not isinstance(exc, OSError):
+            raise
+        if previous is not None:
+            return {**previous, "status": "pending",
+                    "pending": [*previous.get("pending", []), {"phase": "retry", "reason": str(exc)}]}
+        return {"id": identifier, "status": "pending", "pending": [{"reason": str(exc)}]}
+
+
 def daily(vault, now=None):
     from . import retention
-    from .tasks import all_tasks, get_task, reconcile_clock, reconcile_expired, preserve_and_close
+    from .tasks import get_task, preserve_and_close, reconcile_clock, reconcile_expired, task_ids
 
     now = utc(now)
     notices, pending, results = [], [], []
     legacy_backup_error = {}
 
-    def execute_plan(identifier):
-        try:
-            return retention.execute(vault, identifier, now)
-        except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
-            return {"id": identifier, "status": "pending", "pending": [{"reason": str(exc)}]}
-
-    for task in all_tasks(vault):
+    try:
+        identifiers = task_ids(vault)
+    except (Blocked, OSError) as exc:
+        identifiers = []
+        pending.append({"task_inventory": "inventory", "reason": str(exc)})
+    for identifier in identifiers:
         with vault.locked():
-            task = get_task(vault, task["id"])
-            if task.get("capacity_held"):
+            try:
+                task = get_task(vault, identifier)
+                require(task["id"] == identifier, "Task identity does not match its record", 5)
+                if not task.get("capacity_held"):
+                    continue
                 updates = reconcile_clock(vault, task, now)
-                notices.extend({"task": task["id"], "notice": update} for update in updates)
-                try:
-                    if task.get("closure_pending"):
-                        preserve_and_close(vault, task["id"], reason="human_timeout")
-                    elif task.get("worktree_expired"):
-                        reconcile_expired(vault, task["id"], now=now)
-                except (Blocked, OSError) as exc:
-                    pending.append({"task": task["id"], "reason": str(exc)})
+                notices.extend({"task": identifier, "notice": update} for update in updates)
+                if task.get("closure_pending"):
+                    preserve_and_close(vault, identifier, reason="human_timeout")
+                elif task.get("worktree_expired"):
+                    reconcile_expired(vault, identifier, now=now)
+            except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
+                pending.append({"task": identifier, "reason": str(exc)})
     with vault.locked():
         vault.no_transaction()
         try:
@@ -56,11 +71,11 @@ def daily(vault, now=None):
                     plans.append(discovered)
             except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
                 pending.append({"retention": "discovery", "reason": str(exc)})
-            results = [execute_plan(plan["id"]) for plan in plans]
+            results = [execute_plan(vault, plan["id"], now, automatic=True) for plan in plans]
             for index, result in enumerate(results):
                 if any(item.get("reason") in {retention.NATIVE_REPLICAS_PENDING, retention.CHECKPOINT_REPLICAS_PENDING}
                        for item in result.get("pending", [])):
-                    results[index] = execute_plan(result["id"])
+                    results[index] = execute_plan(vault, result["id"], now, automatic=True, previous=result)
         pending.extend({"plan": result["id"], **item} for result in results for item in result.get("pending", []))
         backup = backup_round(vault, now)
         if backup["status"] == "pending":

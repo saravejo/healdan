@@ -7,7 +7,7 @@ from . import storage_policy
 from .core import Blocked, atomic, canonical_storage_path, digest, json_paths, read_json, require, safe_path, stamp, sync_directory, utc
 from .custody import INACTIVE_COPIES, materials, native_guard, save_material, verified_capture
 from .inbox import pending_archive_paths
-from .tasks import all_tasks
+from .tasks import get_task
 
 RESOLVED = INACTIVE_COPIES | {"preserved"}
 NATIVE_REPLICAS_PENDING = "Verified ciphertext is needed by native copies awaiting deletion"
@@ -16,12 +16,30 @@ PRESERVATION_AUTHORIZATION_PENDING = "Expired signed backup awaits individual pr
 
 
 def reconcile_closures(vault):
-    tasks = {t["id"]: t for t in all_tasks(vault)}
+    closures, open_tasks = {}, set()
     for record in materials(vault).values():
-        task = tasks.get(record.get("task"))
-        if task and task.get("closed_at") and not record.get("closed_at"):
-            record["closed_at"] = task["closed_at"]
+        identifier = record.get("task")
+        if not isinstance(identifier, str) or not identifier or record.get("closed_at"):
+            continue
+        if identifier not in closures:
+            closures[identifier] = None
+            try:
+                task = get_task(vault, identifier)
+                require(task["id"] == identifier, "Task identity does not match its record", 5)
+                closed_at = task.get("closed_at")
+                if closed_at:
+                    require(isinstance(closed_at, str), "Task closure timestamp is invalid", 5)
+                    utc(closed_at)
+                    closures[identifier] = closed_at
+                else:
+                    open_tasks.add(identifier)
+            except (Blocked, OSError, KeyError, ValueError, TypeError):
+                # Keep the expiry origin unknown. Execution will preserve these copies.
+                pass
+        if closures[identifier] is not None:
+            record["closed_at"] = closures[identifier]
             save_material(vault, record)
+    return open_tasks
 
 
 def preserved(vault, record, policy):
@@ -397,12 +415,11 @@ def reconcile_inbox(vault, now):
 
 def plan(vault, now=None, *, exclude=(), skip_empty=False):
     with vault.locked():
-        reconcile_closures(vault)
+        open_tasks = reconcile_closures(vault)
         reconcile_inbox(vault, now)
         now = stamp(now)
         pending = pending_archive_paths(vault)
         policy = storage_policy.effective(vault)
-        open_tasks = {t["id"] for t in all_tasks(vault) if not t.get("closed_at")}
         excluded = set(exclude)
         entries = []
         for record in materials(vault).values():
