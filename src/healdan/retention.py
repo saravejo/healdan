@@ -164,7 +164,70 @@ def deletion_payload(entry, material, index):
     return {"material": material, "copy_index": index, "sha256": entry["copy"]["sha256"], "intent": entry.get("intent")}
 
 
-def check_deletion_proof(record, index, copy, read_record, matches_path, *, generation_digest=None, reason):
+def legacy_round_deletion_proof(record, copy, index, deletion_plans, deletion_receipts):
+    deleted_at = copy.get("deleted_at")
+    if not isinstance(deleted_at, str):
+        return None
+    identity = copy_identity(copy)
+    plans = {}
+    for key, plan in deletion_plans:
+        try:
+            if (plan["id"] == key and plan["status"] in {"pending", "complete"} and plan_digest(plan) == plan["digest"] and
+                    utc(plan["created_at"]) <= utc(deleted_at) and any(
+                        entry["material"] == record["id"] and type(entry["copy_index"]) is int and entry["copy_index"] == index and
+                        entry["status"] == "deleted" and entry.get("at") == deleted_at and
+                        not ({"intent", "receipt"} & entry.keys()) and entry["copy"].get("status") == "present" and
+                        copy_identity(entry["copy"]) == identity for entry in plan["entries"])):
+                plans[plan["id"]] = plan["digest"]
+        except (Blocked, OSError, ValueError, KeyError, TypeError):
+            continue
+    if not plans:
+        return None
+    for key, receipt in deletion_receipts:
+        try:
+            if not isinstance(receipt, dict):
+                continue
+            payload = receipt.get("payload", {})
+            if (receipt.get("kind") == "deletion-round" and isinstance(payload, dict) and
+                    set(payload) == {"plan", "digest", "status"} and
+                    payload["plan"] in plans and payload["digest"] == plans[payload["plan"]] and
+                    payload["status"] in {"pending", "complete"} and utc(receipt["at"]) >= utc(deleted_at) and
+                    digest(receipt) == key):
+                return key
+        except (Blocked, OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def historical_deletion_plan(intent, plans):
+    matches = 0
+    for name, plan in plans:
+        if (name != f"deletions/{plan['id']}.json" or plan.get("digest") != intent["plan_digest"] or
+                plan.get("status") not in {"planned", "pending", "complete"} or plan_digest(plan) != plan["digest"]):
+            continue
+        matches += sum(entry.get("intent") == intent and type(entry.get("copy_index")) is int and
+                       list(slot(entry)) == intent["slot"] and
+                       (entry.get("status") == "deleted" or
+                        entry.get("status") == "deleting" and plan["status"] != "complete")
+                       for entry in plan["entries"])
+    return matches == 1
+
+
+def historical_backup_slot(record, index, copy):
+    # The snapshot verifier has already checked the signature of the legacy envelope.
+    approval = record.get("approval", {})
+    signed = approval.get("payload", {})
+    slots = signed.get("copies", [])
+    return (record.get("format") != backup_snapshot.MANIFEST and approval.get("namespace") == "backup" and
+            {key: value for key, value in record.items() if key not in {"approval", "copies"}} ==
+            {key: value for key, value in signed.items() if key != "copies"} and
+            isinstance(slots, list) and len(slots) == len(record["copies"]) and index < len(slots) and
+            isinstance(slots[index], dict) and copy_identity(slots[index]) == copy_identity(copy) and
+            signed.get("cipher_sha256") == copy["sha256"] and isinstance(record.get("expires_at"), str) and
+            utc(copy["deleted_at"]) >= utc(record["expires_at"]))
+
+
+def check_deletion_proof(record, index, copy, read_record, matches_path, *, generation_digest=None, reason, origin_plans=None):
     receipt_id = copy.get("deletion_receipt")
     require(sha256(receipt_id), reason, 5)
     receipt = read_record(f"receipts/{receipt_id}.json")
@@ -179,12 +242,22 @@ def check_deletion_proof(record, index, copy, read_record, matches_path, *, gene
     primary = intent_slot == [expected["material"], expected["copy_index"], expected["identity"]]
     association = intent if primary else next((item for item in generations if isinstance(item, dict) and
                                                 all(item.get(key) == value for key, value in expected.items())), None)
+    historical = origin_plans is not None and "plan_id" not in intent
     require(digest(receipt) == receipt_id and receipt.get("kind") == "deletion-copy" and
             isinstance(receipt.get("at"), str) and receipt["at"] == copy.get("deleted_at") == intent.get("at") and
             payload.get("material") == record["id"] and type(payload.get("copy_index")) is int and
             payload["copy_index"] == index and payload.get("sha256") == copy["sha256"] and association is not None and
-            association.get("generation_digest") == generation_digest and
+            association.get("generation_digest") == (None if historical else generation_digest) and
             isinstance(intent.get("path"), str) and matches_path(intent["path"], copy), reason, 5)
+    if historical:
+        require(primary and type(intent_slot[1]) is int and
+                intent.keys() == {"at", "path", "slot", "root_identity", "file_identity", "plan_digest"} and
+                all(isinstance(identity, list) and len(identity) == 2 and all(type(value) is int for value in identity)
+                    for identity in (intent["root_identity"], intent["file_identity"])) and
+                sha256(intent["plan_digest"]) and payload == deletion_payload({"copy": copy, "intent": intent}, record["id"], index) and
+                (record["kind"] != "backup" or historical_backup_slot(record, index, copy)) and
+                historical_deletion_plan(intent, origin_plans), reason, 5)
+        return receipt_id
     plan_id = intent.get("plan_id")
     require(isinstance(plan_id, str) and plan_id and Path(plan_id).name == plan_id, reason, 5)
     plan = read_record(f"deletions/{plan_id}.json")

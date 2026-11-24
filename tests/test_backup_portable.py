@@ -1,4 +1,5 @@
 """Portable backups with disposable Git, OpenSSH and age fixtures."""
+from copy import deepcopy
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -482,6 +483,72 @@ class BackupPortable(VaultTest):
         deleted, _ = export("already-deleted", old)
         plan = retention.plan(self.vault)
         self.assertEqual(retention.execute(self.vault, plan["id"])["status"], "complete")
+        historical, _ = export("historically-deleted", old)
+        divergent, _ = export("divergent-deletion-proof", old)
+        legacy_id = str(uuid4())
+        bundle = self.base / "retired-generation.bundle"
+        git(self.root, "bundle", "create", str(bundle), "--all")
+        files = {name: backup_snapshot.file_entry("knowledge", (self.root / name).read_bytes()) for name in self.vault.inputs()}
+        files[backup_snapshot.BUNDLE] = backup_snapshot.file_entry("git", bundle.read_bytes())
+        for entry in files.values():
+            entry.pop("kind")
+        plain = canonical({"format": "healdan-tree-v1", "files": files})
+        cipher = custody.encrypt(self.vault, plain)
+        replica = self.destinations[0] / (legacy_id + ".age")
+        atomic(replica, cipher)
+        legacy = {"id": legacy_id, "kind": "backup", "generation": "long", "created_at": stamp(old),
+                  "expires_at": stamp(old + timedelta(days=1)), "members": [], "commit": self.vault.head(),
+                  "plain_sha256": digest(plain), "cipher_sha256": digest(cipher), "holds": [], "dependencies": [],
+                  "copies": [{"root": str(replica.parent), "path": replica.name, "kind": "ciphertext",
+                              "sha256": digest(cipher), "status": "present"}], "status": "complete", "verified_at": stamp(old)}
+        legacy["approval"] = envelope(deepcopy(legacy), "backup", "backup", self.vault.config["backup_signing_key"])
+        custody.save_material(self.vault, legacy)
+
+        # Persist the initial B04 intent after unlink, then use retention to write the original receipt format.
+        now = utc()
+        historical_plan = retention.plan(self.vault, now)
+        self.assertEqual({entry["material"] for entry in historical_plan["entries"]},
+                         {historical["id"], divergent["id"], legacy_id})
+        for entry in historical_plan["entries"]:
+            root = Path(entry["copy"]["root"])
+            target = root / entry["copy"]["path"]
+            self.assertEqual(digest(target.read_bytes()), entry["copy"]["sha256"])
+            entry.update(status="deleting", intent={"slot": list(retention.slot(entry)), "path": str(target),
+                         "root_identity": retention.file_identity(root), "file_identity": retention.file_identity(target),
+                         "plan_digest": historical_plan["digest"], "at": stamp(now)})
+            target.unlink()
+        historical_path = f"deletions/{historical_plan['id']}.json"
+        atomic(self.vault.control / historical_path, historical_plan)
+        completed = retention.execute(self.vault, historical_plan["id"], now)
+        self.assertEqual(completed["status"], "complete")
+        altered = next(entry for entry in completed["entries"] if entry["material"] == divergent["id"])
+        altered["intent"]["at"] = stamp(now + timedelta(seconds=1))
+        self.assertEqual(retention.plan_digest(completed), completed["digest"])
+        atomic(self.vault.control / historical_path, completed)
+
+        round_deleted, _ = export("deleted-by-round", old)
+        round_divergent, _ = export("divergent-round-date", old)
+        # The earliest producer persisted the completed slot's own timestamp and a single receipt for the round.
+        round_plan = retention.plan(self.vault, now)
+        round_material = {record["id"]: record for record in (round_deleted, round_divergent)}
+        self.assertEqual({entry["material"] for entry in round_plan["entries"]}, round_material.keys())
+        for entry in round_plan["entries"]:
+            record = round_material[entry["material"]]
+            copy = record["copies"][0]
+            (Path(copy["root"]) / copy["path"]).unlink()
+            copy.update(status="deleted", deleted_at=stamp(now))
+            entry.update(status="deleted", at=stamp(now))
+            if record["id"] == round_divergent["id"]:
+                copy["deleted_at"] = stamp(now + timedelta(seconds=1))
+            custody.save_material(self.vault, record)
+        round_plan["status"] = "complete"
+        round_path = f"deletions/{round_plan['id']}.json"
+        atomic(self.vault.control / round_path, round_plan)
+        round_receipt = self.vault.receipt("deletion-round", {"plan": round_plan["id"], "digest": round_plan["digest"],
+                                                             "status": "complete"}, at=now + timedelta(seconds=2))
+        round_receipt_path = f"receipts/{round_receipt}.json"
+        original = custody.materials(self.vault)
+
         held, held_source = export("held", old)
         hold = custody.hold(self.vault, held["id"], "Await origin decision", "human", ["evidence"])
         held = custody.materials(self.vault)[held["id"]]
@@ -538,6 +605,19 @@ class BackupPortable(VaultTest):
         self.assertEqual(current[held["id"]]["dependencies"], ["evidence"])
         self.assertEqual(current[independent["id"]]["captured_at"], independent["captured_at"])
         self.assertEqual(current[deleted["id"]]["copies"][0]["status"], "deleted")
+        for path in (historical_path, round_path, round_receipt_path):
+            self.assertEqual((new.control / path).read_bytes(), (self.vault.control / path).read_bytes())
+        for key in (historical["id"], legacy_id):
+            copy = original[key]["copies"][0]
+            self.assertEqual(current[key]["copies"][0], {**copy, "origin_status": "deleted"})
+            relative = f"receipts/{copy['deletion_receipt']}.json"
+            self.assertEqual((new.control / relative).read_bytes(), (self.vault.control / relative).read_bytes())
+        self.assertEqual(current[legacy_id]["approval"], legacy["approval"])
+        self.assertEqual(current[round_deleted["id"]]["copies"][0], {**round_deleted["copies"][0], "origin_status": "deleted"})
+        for key in (divergent["id"], round_divergent["id"]):
+            self.assertEqual(current[key]["copies"][0]["status"], "unavailable")
+            self.assertTrue(any(row["material"] == key and row["copy_index"] == 0 and row["status"] == "invalid"
+                                for row in result["pending_copies"]))
         self.assertEqual(current[unavailable["id"]]["copies"][0]["status"], "unavailable")
         recovered_checkpoint = next(copy for copy in current[preserved["id"]]["copies"] if copy.get("path") == moved_checkpoint["path"])
         self.assertEqual(recovered_checkpoint, {**moved_checkpoint, "origin_status": "moved"})
@@ -562,7 +642,9 @@ class BackupPortable(VaultTest):
         sha = digest(b"")
         past = stamp(now - timedelta(days=40))
         for key, relative in (("archive-a", "a/shared.txt"), ("archive-b", "b/shared.txt"),
-                              ("archive-unproved", "different.txt")):
+                              ("archive-unproved", "different.txt"), ("archive-round", "a/single.txt"),
+                              ("archive-wrong-material", "b/single.txt"), ("archive-resumed", "resumed.txt"),
+                              ("archive-intent-primary", "a/intent.txt"), ("archive-intent-sibling", "b/intent.txt")):
             atomic(self.root / "inbox" / relative, b"")
             custody.save_material(self.vault, {
                 "id": key, "kind": "export", "classification": "common", "captured_at": past,
@@ -578,7 +660,7 @@ class BackupPortable(VaultTest):
         archive = self.root / "archive" / sha / "shared.txt"
         self.assertEqual(digest(archive.read_bytes()), sha)
         exclusions = [retention.slot({"material": record["id"], "copy_index": 1, "copy": record["copies"][1]})
-                      for record in (sibling, unproved)]
+                      for record in records.values() if record["id"] != primary["id"]]
         plan = retention.plan(self.vault, now, exclude=exclusions)
         entry, = plan["entries"]
         self.assertEqual((entry["material"], entry["copy_index"]), (primary["id"], 1))
@@ -640,6 +722,101 @@ class BackupPortable(VaultTest):
             self.assertFalse({"root", "path", "sha256"} & pending.keys())
             self.assertTrue(any(row["material"] == record["id"] and row["copy_index"] == 1 and row["status"] == "invalid"
                                 for row in second["pending_copies"]))
+
+        self.check_pre_generation_archive_proofs(now, sha)
+
+    def check_pre_generation_archive_proofs(self, now, sha):
+        inventory = custody.materials(self.vault)
+        historical_files = []
+
+        def prepare(material):
+            exclusions = [retention.slot({"material": key, "copy_index": index, "copy": copy})
+                          for key, record in inventory.items() if key != material
+                          for index, copy in enumerate(record["copies"]) if copy["kind"] == "archive"]
+            plan = retention.plan(self.vault, now, exclude=exclusions)
+            entry, = plan["entries"]
+            self.assertEqual((entry["material"], entry["copy_index"]), (material, 1))
+            relative = f"deletions/{plan['id']}.json"
+            historical_files.append(relative)
+            target = Path(entry["copy"]["root"]) / entry["copy"]["path"]
+            self.assertEqual(digest(target.read_bytes()), sha)
+            return plan, entry, self.vault.control / relative, target
+
+        # Completed single-slot proof from before B03 stored verified archive generations.
+        plan, entry, path, target = prepare("archive-round")
+        entry.update(status="deleted", at=stamp(now), verified_archive_sha256=sha)
+        plan["status"] = "complete"
+        atomic(path, plan)
+        target.unlink()
+        for key in ("archive-round", "archive-wrong-material"):
+            inventory[key]["copies"][1].update(status="deleted", deleted_at=stamp(now), verified_archive_sha256=sha)
+            custody.save_material(self.vault, inventory[key])
+        receipt = self.vault.receipt("deletion-round", {"plan": plan["id"], "digest": plan["digest"], "status": "complete"},
+                                     at=now)
+        historical_files.append(f"receipts/{receipt}.json")
+
+        # Resume the single-slot journal after unlink using the current B04 engine.
+        plan, entry, path, target = prepare("archive-resumed")
+        entry.update(status="deleting", verified_archive_sha256=sha)
+        atomic(path, plan)
+        target.unlink()
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        copy = custody.materials(self.vault)["archive-resumed"]["copies"][1]
+        receipt_path = f"receipts/{copy['deletion_receipt']}.json"
+        self.assertEqual(read_json(self.vault.control / receipt_path)["payload"],
+                         {"material": "archive-resumed", "copy_index": 1, "sha256": sha, "intent": None})
+        historical_files.append(receipt_path)
+
+        # Early B04 persisted the primary slot and plan digest in the intent and listed archive slots in the plan entry.
+        plan, entry, path, target = prepare("archive-intent-primary")
+        intent = {"path": str(target), "slot": list(retention.slot(entry)),
+                  "root_identity": retention.file_identity(Path(entry["copy"]["root"])),
+                  "file_identity": retention.file_identity(target), "plan_digest": plan["digest"], "at": stamp(now)}
+        entry.update(status="deleting", intent=intent, verified_archive_generations=[
+            retention.generation_locator(inventory[key], 1, inventory[key]["copies"][1])
+            for key in ("archive-intent-primary", "archive-intent-sibling")
+        ])
+        atomic(path, plan)
+        target.unlink()
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        original = custody.materials(self.vault)
+        for key in ("archive-intent-primary", "archive-intent-sibling"):
+            receipt = original[key]["copies"][1]["deletion_receipt"]
+            relative = f"receipts/{receipt}.json"
+            self.assertEqual(read_json(self.vault.control / relative)["payload"],
+                             {"material": key, "copy_index": 1, "sha256": sha, "intent": intent})
+            historical_files.append(relative)
+
+        history = (self.vault.control / "materials.json").read_bytes()
+        restored = self.restore(self.create(), self.base / "early-restored", self.base / "early-state")
+        new = Vault(restored["destination"], restored["state"])
+        self.assertEqual((new.control / "historical/materials.json").read_bytes(), history)
+        for relative in historical_files:
+            self.assertEqual((new.control / relative).read_bytes(), (self.vault.control / relative).read_bytes())
+        recovered = custody.materials(new)
+        for key in ("archive-round", "archive-resumed", "archive-intent-primary", "archive-intent-sibling"):
+            with self.subTest(proof=key):
+                self.assertEqual(recovered[key]["copies"][1], {**original[key]["copies"][1], "origin_status": "deleted"})
+        key = "archive-wrong-material"
+        self.assertEqual(recovered[key]["copies"][1]["status"], "unavailable")
+        self.assertTrue(any(row["material"] == key and row["copy_index"] == 1 and row["status"] == "invalid"
+                            for row in restored["pending_copies"]))
+
+        # A digest-valid plan with two entries for the same primary slot leaves the unnamed intent ambiguous.
+        record = original["archive-intent-sibling"]
+        copy = record["copies"][1]
+        ambiguous = read_json(path)
+        ambiguous["entries"].append(deepcopy(ambiguous["entries"][0]))
+        ambiguous["digest"] = retention.plan_digest(ambiguous)
+        altered_intent = {**intent, "plan_digest": ambiguous["digest"]}
+        for entry in ambiguous["entries"]:
+            entry["intent"] = altered_intent
+        proof = {"kind": "deletion-copy", "at": copy["deleted_at"],
+                 "payload": {"material": record["id"], "copy_index": 1, "sha256": sha, "intent": altered_intent}}
+        identifier = digest(proof)
+        records = {f"deletions/{ambiguous['id']}.json": ambiguous, f"receipts/{identifier}.json": proof}
+        with self.assertRaisesRegex(Blocked, "lacks a verified deletion receipt"):
+            backup_recovery.check_inactive_origin(record, 1, {**copy, "deletion_receipt": identifier}, records, [])
 
     def test_1_process_and_origin_paths_are_inactive(self):
         self.configure()

@@ -516,39 +516,11 @@ def legacy_replica_receipt(vault, record, copy, index):
 
 
 def legacy_replica_proof(record, copy, index, deletion_plans, deletion_receipts):
-    from .retention import copy_identity, plan_digest
+    from .retention import legacy_round_deletion_proof
 
     if not (copy.get("deleted_at") and record.get("expires_at") and utc(copy["deleted_at"]) >= utc(record["expires_at"])):
         return None
-    identity = copy_identity(copy)
-    plans = {}
-    for key, plan in deletion_plans:
-        try:
-            if (plan["id"] == key and plan["status"] in {"pending", "complete"} and plan_digest(plan) == plan["digest"] and
-                    utc(plan["created_at"]) <= utc(copy["deleted_at"]) and any(
-                        entry["material"] == record["id"] and entry["copy_index"] == index and
-                        entry["status"] == "deleted" and entry.get("at") == copy["deleted_at"] and
-                        not ({"intent", "receipt"} & entry.keys()) and entry["copy"].get("status") == "present" and
-                        copy_identity(entry["copy"]) == identity for entry in plan["entries"])):
-                plans[plan["id"]] = plan["digest"]
-        except (Blocked, OSError, ValueError, KeyError, TypeError):
-            continue
-    if not plans:
-        return None
-    for key, receipt in deletion_receipts:
-        try:
-            if not isinstance(receipt, dict):
-                continue
-            payload = receipt.get("payload", {})
-            if (receipt.get("kind") == "deletion-round" and isinstance(payload, dict) and
-                    set(payload) == {"plan", "digest", "status"} and
-                    payload["plan"] in plans and payload["digest"] == plans[payload["plan"]] and
-                    payload["status"] in {"pending", "complete"} and utc(receipt["at"]) >= utc(copy["deleted_at"]) and
-                    digest(receipt) == key):
-                return key
-        except (Blocked, OSError, ValueError, KeyError, TypeError):
-            continue
-    return None
+    return legacy_round_deletion_proof(record, copy, index, deletion_plans, deletion_receipts)
 
 
 def verify_replica_deletion(vault, record, index, copy):

@@ -204,45 +204,76 @@ def legacy_archive_entry_matches(entry, expected, copy, bindings):
     from .retention import generation_locator
 
     frozen = entry["copy"]
-    generations = entry.get("verified_archive_generations")
-    if (entry.get("intent") is not None or not isinstance(generations, list) or
-            not isinstance(frozen, dict) or frozen.get("kind") != "archive" or frozen.get("sha256") != copy["sha256"] or
+    if (not isinstance(frozen, dict) or frozen.get("kind") != "archive" or frozen.get("sha256") != copy["sha256"] or
             type(entry.get("copy_index")) is not int):
-        return False
-    locators = [locator for locator in generations if isinstance(locator, dict) and type(locator.get("copy_index")) is int]
-    primary = generation_locator({"id": entry["material"]}, entry["copy_index"], frozen)
-    if locators.count(expected) != 1 or locators.count(primary) != 1:
         return False
     try:
         snapshot.check_material_copy(entry["material"], frozen)
     except Blocked:
         return False
-    return matches_origin_path(str(origin_copy_path(frozen)), copy, bindings)
+    if not matches_origin_path(str(origin_copy_path(frozen)), copy, bindings):
+        return False
+    primary = generation_locator({"id": entry["material"]}, entry["copy_index"], frozen)
+    if "verified_archive_generations" not in entry:
+        return entry.get("intent") is None and entry.get("verified_archive_sha256") == copy["sha256"] and primary == expected
+    generations = entry["verified_archive_generations"]
+    if not isinstance(generations, list):
+        return False
+    locators = [locator for locator in generations if isinstance(locator, dict) and type(locator.get("copy_index")) is int]
+    return locators.count(expected) == locators.count(primary) == 1
 
 
 def verified_legacy_archive_deletion(record, index, copy, records, bindings):
-    from .retention import deletion_payload, generation_locator, plan_digest
+    from .retention import deletion_payload, generation_locator, plan_digest, slot
 
     at = copy.get("deleted_at")
     if copy["kind"] != "archive" or copy.get("verified_archive_sha256") != copy["sha256"] or not isinstance(at, str):
         return False
-    direct = "deletion_receipt" in copy
-    if direct:
-        # B04 may write a per-slot receipt while finishing a plan that predates deletion intents.
-        expected_receipt = {"kind": "deletion-copy", "at": at,
-                            "payload": deletion_payload({"copy": copy}, record["id"], index)}
-        identifier = copy["deletion_receipt"]
-        if digest(expected_receipt) != identifier or records.get(f"receipts/{identifier}.json") != expected_receipt:
-            return False
-
     expected = generation_locator(record, index, copy)
+    direct = "deletion_receipt" in copy
+    intent = None
+    if direct:
+        identifier = copy["deletion_receipt"]
+        if not sha256(identifier):
+            return False
+        receipt = records.get(f"receipts/{identifier}.json", {})
+        payload = receipt.get("payload")
+        if not isinstance(payload, dict) or type(payload.get("copy_index")) is not int:
+            return False
+        # B04 could resume an older plan with no intent or with the original archive intent.
+        intent = payload.get("intent")
+        expected_receipt = {"kind": "deletion-copy", "at": at,
+                            "payload": deletion_payload({"copy": copy, "intent": intent}, record["id"], index)}
+        if receipt != expected_receipt or digest(receipt) != identifier:
+            return False
+        if intent is not None:
+            if (not isinstance(intent, dict) or "generations" in intent or intent.get("generation_digest") is not None or
+                    intent.get("at") != at or not isinstance(intent.get("path"), str) or
+                    not matches_origin_path(intent["path"], copy, bindings)):
+                return False
+            intent_slot = intent.get("slot")
+            if not isinstance(intent_slot, list) or len(intent_slot) != 3 or type(intent_slot[1]) is not int:
+                return False
+            if "plan_id" in intent and intent_slot == [expected["material"], index, expected["identity"]]:
+                return False
+
+    intent_matches = 0
     for name, plan in records.items():
         if (not name.startswith("deletions/") or name != f"deletions/{plan['id']}.json" or
                 plan.get("status") not in {"planned", "pending", "complete"} or plan_digest(plan) != plan["digest"]):
             continue
-        if not any((entry.get("status") == "deleted" or
-                    entry.get("status") == "deleting" and plan.get("status") != "complete") and
-                   legacy_archive_entry_matches(entry, expected, copy, bindings) for entry in plan["entries"]):
+        if intent is not None and (intent.get("plan_digest") != plan["digest"] or
+                intent.get("plan_id", plan["id"]) != plan["id"]):
+            continue
+        matches = sum((entry.get("status") == "deleted" or
+                       entry.get("status") == "deleting" and plan.get("status") != "complete") and
+                      entry.get("intent") == intent and
+                      legacy_archive_entry_matches(entry, expected, copy, bindings) and
+                      (intent is None or intent_slot == list(slot(entry))) for entry in plan["entries"])
+        if not matches:
+            continue
+        if intent is not None:
+            intent_matches += matches
             continue
         if direct:
             return True
@@ -253,12 +284,12 @@ def verified_legacy_archive_deletion(record, index, copy, records, bindings):
                receipt.get("payload") in payloads and utc(receipt["at"]) >= utc(at) and
                receipt_name == f"receipts/{digest(receipt)}.json" for receipt_name, receipt in records.items()):
             return True
-    return False
+    return intent_matches == 1
 
 
 def check_inactive_origin(record, index, copy, records, bindings):
     from .backups import check_replica_absence_proof, legacy_replica_proof, writing_generation
-    from .retention import check_deletion_proof
+    from .retention import check_deletion_proof, legacy_round_deletion_proof
 
     status = copy["status"]
     backup = record["kind"] == "backup"
@@ -269,15 +300,18 @@ def check_inactive_origin(record, index, copy, records, bindings):
         check_origin_move(record, index, copy, records, bindings)
     elif status == "deleted":
         reason = f"Origin custody copy {index} lacks a verified deletion receipt"
-        if backup and not writing_generation(record) and "deletion_receipt" not in copy:
+        writing = backup and writing_generation(record)
+        if not writing and copy["kind"] != "archive" and "deletion_receipt" not in copy:
             plans = ((Path(name).stem, value) for name, value in records.items() if name.startswith("deletions/"))
             receipts = ((Path(name).stem, value) for name, value in records.items() if name.startswith("receipts/"))
-            require(legacy_replica_proof(record, copy, index, plans, receipts), reason, 5)
+            prove_round = legacy_replica_proof if backup else legacy_round_deletion_proof
+            require(prove_round(record, copy, index, plans, receipts), reason, 5)
         elif not verified_legacy_archive_deletion(record, index, copy, records, bindings):
+            origin_plans = ((name, value) for name, value in records.items() if name.startswith("deletions/"))
             check_deletion_proof(record, index, copy, records.get,
                                  lambda path, claim: matches_origin_path(path, claim, bindings),
-                                 generation_digest=record["approval"]["digest"] if backup and not writing_generation(record) else None,
-                                 reason=reason)
+                                 generation_digest=record["approval"]["digest"] if backup and not writing else None,
+                                 reason=reason, origin_plans=origin_plans if copy["kind"] != "archive" else None)
 
 
 def reconcile_copies(archive, contents, records, state, control, journal, remaps):
