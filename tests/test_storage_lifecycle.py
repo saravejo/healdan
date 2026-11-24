@@ -157,6 +157,88 @@ class StorageLifecycle(VaultTest):
         retention.execute(self.vault, retention.plan(self.vault, "2040-01-01T00:00:00Z")["id"], "2040-01-01T00:00:00Z")
         self.assertEqual(custody.materials(self.vault)[generation["id"]], original)
 
+    def test_expired_signed_generations_under_keep_forever_report_pending_authorization(self):
+        destination = self.configure_age()
+        start = utc("2026-01-02T00:00:00Z")
+        expiry = start + timedelta(days=2)
+        previous = backups.create(self.vault, "long", expiry, now=start)
+        plan = retention.plan(self.vault, expiry)
+        self.change_policy(backup="manual", retention_mode="keep_forever")
+        current = backups.create(self.vault, "long", expiry, now=start)
+        self.assertEqual(maintenance.daily(self.vault, start)["status"], "complete")
+        pending = retention.execute(self.vault, plan["id"], expiry)
+        self.assertEqual(pending["status"], "pending", pending)
+        generation_ids = {previous["id"], current["id"]}
+        before = {identifier: (destination / (identifier + ".age")).read_bytes() for identifier in generation_ids}
+        result = maintenance.daily(self.vault, expiry)
+        self.assertEqual({row["material"] for row in result["pending"]}, generation_ids)
+        findings = linting.lint(self.vault, expiry)["findings"]
+        self.assertTrue(all(f"retention:{identifier}" in findings for identifier in generation_ids))
+        for identifier in generation_ids:
+            decision = storage_policy.preservation_request(self.vault, identifier, "Keep this signed generation")
+            storage_policy.apply_preservation(self.vault, identifier, decision)
+        self.assertEqual(maintenance.daily(self.vault, expiry)["status"], "complete")
+        for original in (previous, current):
+            identifier = original["id"]
+            self.assertEqual(custody.materials(self.vault)[identifier], original)
+            self.assertEqual((destination / (identifier + ".age")).read_bytes(), before[identifier])
+
+    def test_backup_deleted_replica_requires_intent_receipt(self):
+        first = self.configure_age()
+        second = self.base / "backup-secondary"
+        second.mkdir()
+        self.vault.config["backup_destinations"].append(str(second))
+        atomic(self.vault.config_path, self.vault.config)
+        start = utc("2026-01-02T00:00:00Z")
+        expiry = start + timedelta(days=2)
+        record = backups.create(self.vault, "long", expiry, now=start)
+        identifier = record["id"]
+        original = record["approval"]
+        target = second / (identifier + ".age")
+        cipher = target.read_bytes()
+        target.unlink()
+        material = custody.materials(self.vault)[identifier]
+        material["copies"][1]["status"] = "deleted"
+        custody.save_material(self.vault, material)
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.verify_backup(self.vault, identifier)
+        self.assertIn("verified deletion receipt", linting.lint(self.vault)["findings"][f"custody:{identifier}"]["message"])
+
+        material["copies"][1]["status"] = "present"
+        custody.save_material(self.vault, material)
+        atomic(target, cipher)
+        offline = self.base / "first-backup-offline"
+        first.rename(offline)
+        plan = retention.plan(self.vault, expiry)
+        self.assertEqual(retention.execute(self.vault, plan["id"], expiry)["status"], "pending")
+        first = offline.rename(first)
+        outcome = backups.verify_backup(self.vault, identifier)
+        self.assertEqual(outcome["copies"], [{"root": str(first), "verified": True}])
+        self.assertEqual(outcome["deleted_copies"][0]["copy_index"], 1)
+        self.assertEqual(custody.materials(self.vault)[identifier]["approval"], original)
+        self.assertFalse(target.exists())
+        self.assertNotIn(f"custody:{identifier}", linting.lint(self.vault)["findings"])
+        replica_receipt = outcome["deleted_copies"][0]["receipt"]
+        receipt = read_json(self.vault.control / "receipts" / (replica_receipt + ".json"))
+        incomplete = receipt["payload"]
+        self.assertEqual(incomplete["intent"].pop("generation_digest"), original["digest"])
+        replacement = self.vault.receipt("deletion-copy", incomplete, at=receipt["at"])
+        plan_path = self.vault.control / "deletions" / (plan["id"] + ".json")
+        before = read_json(plan_path)
+        saved_plan = read_json(plan_path)
+        saved_plan["entries"][1].update(intent=incomplete["intent"], receipt=replacement)
+        atomic(plan_path, saved_plan)
+        material = custody.materials(self.vault)[identifier]
+        material["copies"][1]["deletion_receipt"] = replacement
+        custody.save_material(self.vault, material)
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.verify_backup(self.vault, identifier)
+        atomic(plan_path, before)
+        material["copies"][1]["deletion_receipt"] = replica_receipt
+        custody.save_material(self.vault, material)
+        self.assertEqual(retention.execute(self.vault, plan["id"], expiry)["status"], "complete")
+        self.assertNotIn(f"custody:{identifier}", linting.lint(self.vault)["findings"])
+
     def test_task_capacity_waits_for_custody_with_backup_off(self):
         keys = self.age()
         self.change_policy(retention_mode="keep_forever")
@@ -168,7 +250,13 @@ class StorageLifecycle(VaultTest):
                 tasks.preserve_and_close(self.vault, task["id"])
         self.assertTrue(tasks.get_task(self.vault, task["id"])["capacity_held"])
         self.assertTrue(draft.exists())
+        with patch("healdan.tasks.record_worktree_removal", side_effect=SystemExit("interrupted after Git removal")), self.assertRaises(SystemExit):
+            tasks.preserve_and_close(self.vault, task["id"])
+        interrupted = tasks.get_task(self.vault, task["id"])
+        self.assertTrue(interrupted["capacity_held"])
+        self.assertFalse(draft.exists())
         closed = tasks.preserve_and_close(self.vault, task["id"])
+        self.assertEqual(closed["preservation"], interrupted["preservation"])
         material = custody.materials(self.vault)[closed["preservation"]]
         plain = custody.decrypt(self.vault, custody.capture_copy(self.vault, material), keys[1])
         self.assertTrue(any(name.endswith("draft.txt") for name in decode(plain)["files"]))
@@ -193,13 +281,48 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "pending")
         self.assertTrue(cipher.exists() and (origin / "a.jsonl").exists())
         material = custody.materials(self.vault)[identifier]
-        material["native_recovery"] = self.signed(proof, "recovery")
+        session_file = self.vault.control / "sessions" / (record["session"] + ".json")
+        session = read_json(session_file)
+        for invalid_usage in (None, {"input_tokens": True, "output_tokens": 0, "evidence_bytes": 0}):
+            if invalid_usage is None:
+                session["launches"][0].pop("cumulative_usage", None)
+            else:
+                session["launches"][0]["cumulative_usage"] = invalid_usage
+            atomic(session_file, session)
+            invalid = dict(proof, usage=invalid_usage) if invalid_usage is not None else {k: v for k, v in proof.items() if k != "usage"}
+            material["native_recovery"] = self.signed(invalid, "recovery")
+            custody.save_material(self.vault, material)
+            result = retention.execute(self.vault, plan["id"], now)
+            self.assertEqual(result["status"], "pending", result)
+            self.assertTrue(all("cumulative usage" in row["reason"] for row in result["pending"]))
+            self.assertTrue(cipher.exists() and (origin / "a.jsonl").exists())
+        zeros = {"input_tokens": 0, "output_tokens": 0, "evidence_bytes": 0}
+        session["launches"][0]["cumulative_usage"] = zeros
+        atomic(session_file, session)
+        material["native_recovery"] = self.signed(dict(proof, usage=zeros), "recovery")
         custody.save_material(self.vault, material)
         result = maintenance.daily(self.vault, now)
         self.assertEqual(result["status"], "complete", result)
         self.assertFalse(cipher.exists() or (origin / "a.jsonl").exists())
         copies = custody.materials(self.vault)[identifier]["copies"]
         self.assertTrue(all(c["status"] == "deleted" and c.get("deletion_receipt") for c in copies))
+
+    def test_human_hold_cannot_impersonate_automatic_recovery_hold(self):
+        self.change_policy()
+        row, target = self.export("human-request")
+        code, hold = self.cli("maintenance", "hold", row["id"], "--owner", "controller", "--reason", "Native recovery unproven")
+        self.assertEqual(code, 0, hold)
+        code, result = self.cli("maintenance", "daily")
+        self.assertEqual(code, 5, result)
+        self.assertTrue(target.exists())
+        legacy = custody.materials(self.vault)[row["id"]]
+        del legacy["holds"][0]["origin"]
+        custody.save_material(self.vault, legacy)
+        self.assertEqual(self.cli("maintenance", "daily")[0], 5)
+        self.assertTrue(target.exists())
+        custody.release_hold(self.vault, row["id"], hold["id"], [])
+        self.assertEqual(self.cli("maintenance", "daily")[0], 0)
+        self.assertFalse(target.exists())
 
     def test_known_rename_duplicate_and_equal_hash_ambiguity(self):
         self.change_policy()
@@ -331,6 +454,29 @@ class StorageLifecycle(VaultTest):
         for left, right in zip(known[0]["entries"], known[1]["entries"]):
             self.assertEqual(left["receipt"], right["receipt"])
 
+    def test_uncertain_copy_paths_preserve_shared_bytes_and_isolate_other_effects(self):
+        self.change_policy()
+        unsafe, first = self.export("uncertain-a", data=b"matching export")
+        eligible, second = self.export("eligible-b")
+        shared, third = self.export("shared-c", data=b"matching export")
+        unsafe["copies"].append(dict(unsafe["copies"][0], path=third.name, unavailable=True))
+        custody.save_material(self.vault, unsafe)
+        now = "2026-02-01T00:00:00Z"
+        physical_path = retention.copy_path
+
+        def unresolved(vault, copy):
+            if copy.get("unavailable") or copy["path"] == first.name:
+                raise Blocked("Fixture could not identify custody copy", 5)
+            return physical_path(vault, copy)
+
+        plan = retention.plan(self.vault, now)
+        with patch("healdan.retention.copy_path", side_effect=unresolved):
+            result = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual({item["material"] for item in result["pending"]}, {unsafe["id"], shared["id"]})
+        self.assertTrue(first.is_file() and third.is_file())
+        self.assertFalse(second.exists())
+        self.assertEqual(custody.materials(self.vault)[eligible["id"]]["copies"][0]["status"], "deleted")
+
     def test_restore_merges_current_material_and_session(self):
         self.age()
         record, origin = self.capture(native=True)
@@ -422,3 +568,65 @@ class StorageLifecycle(VaultTest):
         self.assertIn("Ciphertext changed", result["error"])
         self.assertEqual(len(custody.materials(self.vault)[identifier]["copies"]), len(record["copies"]))
         self.assertEqual(len(list((self.vault.control / "restorations").glob("*.json"))), 3)
+
+    def test_restore_to_existing_inventory_reuses_only_active_matching_slots(self):
+        self.age()
+        self.change_policy()
+        record, origin = self.capture(native=True)
+        identifier = record["id"]
+        for relative in ("a.jsonl", "nested/b.jsonl"):
+            (origin / relative).unlink()
+        (origin / "nested").rmdir()
+        # One slot recorded a completed removal before these bytes are published again.
+        record["copies"][2].update(status="deleted", deleted_at="2026-01-21T00:00:00Z", deletion_receipt="legacy-copy-fixture")
+        custody.save_material(self.vault, record)
+        proof = self.native_approval(record, origin)
+        saved = custody.materials(self.vault)[identifier]
+        self.assertEqual(saved["copies"][1], record["copies"][1])
+        self.assertEqual(saved["copies"][2], record["copies"][2])
+        self.assertEqual(len(saved["copies"]), 4)
+        self.assertEqual(saved["copies"][3]["path"], "nested/b.jsonl")
+        self.assertIn("restoration", saved["copies"][3])
+        saved["native_recovery"] = self.signed(proof, "recovery")
+        custody.save_material(self.vault, saved)
+        self.assertEqual(maintenance.daily(self.vault, "2026-02-10T00:00:00Z")["status"], "complete")
+        self.assertFalse((origin / "a.jsonl").exists())
+        self.assertFalse((origin / "nested/b.jsonl").exists())
+
+    def test_restore_waits_for_offline_external_parent_without_losing_cipher(self):
+        self.age()
+        self.change_policy()
+        material, _ = self.capture()
+        identifier = material["id"]
+        destination = self.base / "offline-parent" / "recovered"
+        cipher = self.state / "custody" / (identifier + ".age")
+        before = cipher.read_bytes()
+        with self.assertRaisesRegex(Blocked, "parent is offline"):
+            custody.restore_capture(self.vault, identifier, destination)
+        result = maintenance.daily(self.vault, "2026-02-12T00:00:00Z")
+        self.assertTrue(any("pending restoration" in row["reason"] for row in result["pending"]))
+        self.assertEqual(cipher.read_bytes(), before)
+        destination.parent.mkdir()
+        code, restore = self.cli("session", "restore", identifier, destination)
+        self.assertEqual(code, 0, restore)
+        self.assertEqual((destination / "a.jsonl").read_bytes(), b"first synthetic conversation file")
+        self.assertEqual(restore["status"], "complete")
+
+    def test_scheduled_daily_isolates_custody_findings_and_keeps_trial_gate(self):
+        self.configure_age()
+        record, _ = self.capture()
+        destination = self.base / "occupied-restore"
+        atomic(destination / "other.txt", b"external fixture")
+        with self.assertRaisesRegex(Blocked, "collision"):
+            custody.restore_capture(self.vault, record["id"], destination)
+        findings = [row for row in setup.doctor(self.vault)["checks"] if row["name"].startswith("custody:")]
+        self.assertEqual(len(findings), 1)
+        trial = {"name": "trial:launchd", "passed": False}
+        with patch("healdan.setup.doctor", return_value={"ready": False, "checks": [*findings, trial]}):
+            with self.assertRaisesRegex(Blocked, "running a scheduled job"):
+                maintenance.run_scheduled(self.vault, "daily", self.vault.identity)
+            trial["passed"] = True
+            result = maintenance.run_scheduled(self.vault, "daily", self.vault.identity)
+        self.assertEqual(result["backup_result"]["status"], "complete", result)
+        self.assertTrue(backups.verify_backup(self.vault, result["backup"])["copies"])
+        self.assertEqual((destination / "other.txt").read_bytes(), b"external fixture")

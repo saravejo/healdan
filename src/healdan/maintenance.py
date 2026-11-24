@@ -20,6 +20,7 @@ def daily(vault, now=None):
 
     now = utc(now)
     notices, pending, results = [], [], []
+    legacy_backup_error = {}
     for task in all_tasks(vault):
         with vault.locked():
             task = get_task(vault, task["id"])
@@ -56,9 +57,11 @@ def daily(vault, now=None):
         pending.extend({"plan": result["id"], **item} for result in results for item in result.get("pending", []))
         backup = backup_round(vault, now)
         if backup["status"] == "pending":
+            if not pending and backup.get("legacy_error"):
+                legacy_backup_error = {"error": backup["legacy_error"], "code": 5}
             pending.append({"backup": backup["reason"]})
     legacy = pending[0] if pending and "task" in pending[0] else {}
-    return {**legacy, "status": "pending" if pending else "complete", "notices": notices,
+    return {**legacy, **legacy_backup_error, "status": "pending" if pending else "complete", "notices": notices,
             "retention": results[0]["id"] if results else None, "plans": results, "pending": pending,
             "backup": backup.get("id"), "backup_result": backup}
 
@@ -72,6 +75,11 @@ def backup_round(vault, now):
         mode = policy["backup"]["mode"]
         if mode in {"off", "manual"}:
             return {"status": "disabled" if mode == "off" else "manual", "mode": mode}
+        days = vault.config.get("backup_generation_days")
+        if policy["version"] == 0 and days != "permanent" and (type(days) is not int or days <= 0):
+            message = "Approved backup generation lifetime is required"
+            return {"status": "pending", "configuration": "missing" if days is None else "invalid",
+                    "reason": message, "legacy_error": message}
         status, reason = storage_policy.backup_status(vault, policy, scheduled=True)
         if status != "configured":
             return {"status": "pending", "configuration": status, "reason": reason}
@@ -84,7 +92,6 @@ def backup_round(vault, now):
                     return {"status": "not_due", "mode": mode, "last_generation": record["id"]}
                 except (Blocked, OSError):
                     continue
-        days = vault.config["backup_generation_days"]
         expiry = "permanent" if days == "permanent" else now + timedelta(days=days)
         record = backups.create(vault, "long", expiry, now=now, scheduled=True)
         return {"status": "complete", "id": record["id"], "mode": mode}
@@ -159,13 +166,16 @@ def _schedule_scope(vault, trial):
         _check_trial_settings(vault, workspace)
 
 
-def _check_readiness(vault, trial, operation):
+def _check_readiness(vault, trial, operation, *, allow_custody_findings=False):
     from .setup import doctor
 
     report = doctor(vault)
     ready = report["ready"]
+    checks = report.get("checks", [])
+    if allow_custody_findings and checks:
+        checks = [row for row in checks if not row["name"].startswith("custody:")]
+        ready = all(row["passed"] for row in checks)
     if trial:
-        checks = report["checks"]
         ready = (sum(row["name"] == "trial:launchd" for row in checks) == 1 and
                  all(row["passed"] for row in checks if row["name"] != "trial:launchd"))
     require(ready, "Configuration and native trials must pass before " + operation, 5)
@@ -185,7 +195,7 @@ def run_scheduled(vault, job, expected_vault, *, trial=False):
     with vault.locked():
         vault.refresh_settings()
         _schedule_scope(vault, trial)
-        _check_readiness(vault, trial, "running a scheduled job")
+        _check_readiness(vault, trial, "running a scheduled job", allow_custody_findings=job == "daily")
         return lint(vault) if job == "lint" else daily(vault)
 
 

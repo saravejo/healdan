@@ -72,11 +72,13 @@ def collect(vault, now=None):
             except Blocked as exc:
                 add("retention", material["id"] + ":purpose", str(exc))
         if policy:
-            from .retention import preserved
+            from .retention import PRESERVATION_AUTHORIZATION_PENDING, preserved
             try:
                 state, deadline = storage_policy.deadline(material, policy)
                 live = any(c.get("status") not in INACTIVE_COPIES for c in material.get("copies", []))
-                if live and (state == "unknown" or deadline and utc(now) >= deadline) and not preserved(vault, material, policy):
+                if live and storage_policy.preservation_authorization_pending(vault, material, policy, now):
+                    add("retention", material["id"], PRESERVATION_AUTHORIZATION_PENDING)
+                elif live and (state == "unknown" or deadline and utc(now) >= deadline) and not preserved(vault, material, policy):
                     add("retention", material["id"], "No proven deadline" if state == "unknown" else "Deletion overdue or held")
             except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
                 add("retention", material["id"], str(exc))

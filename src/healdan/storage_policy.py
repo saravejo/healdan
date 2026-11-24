@@ -153,6 +153,13 @@ def preservation_for(vault, record):
     return validate_preservation(vault, record, approval)
 
 
+def preservation_authorization_pending(vault, record, policy, now):
+    if (policy["retention"]["mode"] != "keep_forever" or record.get("kind") != "backup" or
+            record.get("status") != "complete" or not record.get("expires_at") or utc(now) < utc(record["expires_at"])):
+        return False
+    return preservation_for(vault, record) is None
+
+
 def validate_preservation(vault, record, approval):
     from .backups import signed_manifest
 

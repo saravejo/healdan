@@ -127,9 +127,9 @@ def create(vault, kind, expires_at, member_ids=(), *, now=None, scheduled=False)
         return record
 
 
-def verify_backup(vault, identifier):
+def verify_backup(vault, identifier, *, allow_retired=False):
     with vault.locked():
-        return _verify_backup(vault, identifier)
+        return _verify_backup(vault, identifier, allow_retired=allow_retired)
 
 
 def signed_manifest(vault, record):
@@ -156,16 +156,51 @@ def verified_replica(vault, record, copy):
     return cipher
 
 
-def _verify_backup(vault, identifier):
+def verify_replica_deletions(vault, record):
+    from .lineage import sha256
+    from .retention import copy_identity, plan_digest, slot
+
+    retired = []
+    for index, copy in enumerate(record["copies"]):
+        if copy["status"] != "deleted":
+            continue
+        reason = f"Backup replica {index} lacks a verified deletion receipt"
+        receipt_id = copy.get("deletion_receipt")
+        require(sha256(receipt_id), reason, 5)
+        receipt = read_json(safe_path(vault.control, f"receipts/{receipt_id}.json"), {})
+        payload = receipt.get("payload", {})
+        intent = payload.get("intent")
+        expected_slot = [record["id"], index, digest(copy_identity(copy))]
+        require(digest(receipt) == receipt_id and receipt.get("kind") == "deletion-copy" and
+                receipt.get("at") == copy.get("deleted_at") and payload.get("material") == record["id"] and
+                payload.get("copy_index") == index and payload.get("sha256") == copy["sha256"] and
+                isinstance(intent, dict) and intent.get("slot") == expected_slot and intent.get("at") == receipt["at"] and
+                intent.get("generation_digest") == record["approval"]["digest"] and
+                intent.get("path") and vault.relocated_path(intent["path"]) == vault.relocated_path(copy["root"]) / copy["path"],
+                reason, 5)
+        directory = safe_path(vault.control, "deletions")
+        plan_id = intent.get("plan_id")
+        require(isinstance(plan_id, str) and Path(plan_id).name == plan_id and plan_id, reason, 5)
+        plan = read_json(safe_path(directory, plan_id + ".json"), {})
+        require(plan.get("id") == plan_id and plan.get("digest") == intent.get("plan_digest") and
+                plan_digest(plan) == plan["digest"] and any(list(slot(entry)) == expected_slot and
+                    entry.get("status") in {"deleting", "deleted"} and entry.get("intent") == intent
+                    for entry in plan["entries"]), reason, 5)
+        retired.append({"copy_index": index, "root": str(vault.relocated_path(copy["root"])), "receipt": receipt_id})
+    return retired
+
+
+def _verify_backup(vault, identifier, *, allow_retired=False):
     record = materials(vault)[identifier]
     signed_manifest(vault, record)
+    retired = verify_replica_deletions(vault, record)
     checks = []
     for copy in record["copies"]:
         if copy["status"] == "present":
             verified_replica(vault, record, copy)
             checks.append({"root": str(vault.relocated_path(copy["root"])), "verified": True})
-    require(checks, "Backup has no retained replicas", 5)
-    return {"id": identifier, "status": "complete", "copies": checks}
+    require(checks or allow_retired and retired, "Backup has no retained replicas", 5)
+    return {"id": identifier, "status": "complete", "copies": checks, "deleted_copies": retired}
 
 
 def restore(vault, identifier, destination):

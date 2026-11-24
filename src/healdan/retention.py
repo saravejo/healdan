@@ -10,6 +10,7 @@ from .tasks import all_tasks
 
 RESOLVED = INACTIVE_COPIES | {"preserved"}
 NATIVE_REPLICAS_PENDING = "Verified ciphertext is needed by native copies awaiting deletion"
+PRESERVATION_AUTHORIZATION_PENDING = "Expired signed backup awaits individual preservation authorization"
 
 
 def reconcile_closures(vault):
@@ -37,11 +38,26 @@ def require_expired(record, now, policy):
 
 
 def recovery_hold(hold):
-    return hold.get("owner") == "controller" and hold.get("reason") == "Native recovery unproven"
+    return (hold.get("origin") == "controller:native-recovery" and hold.get("owner") == "controller" and
+            hold.get("reason") == "Native recovery unproven" and hold.get("dependencies") == [])
 
 
 def copy_path(vault, copy):
     return canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"])
+
+
+def shares_path(vault, copy, target):
+    try:
+        return copy_path(vault, copy) == target
+    except (Blocked, OSError, ValueError, KeyError, TypeError) as original:
+        try:
+            root = vault.relocated_path(copy["root"])
+            candidate = safe_path(root, copy["path"])
+            if root.is_absolute() and candidate.resolve() == candidate and candidate != target:
+                return False
+        except (Blocked, OSError, ValueError, KeyError, TypeError, RuntimeError):
+            pass
+        raise Blocked("Cannot establish whether custody copy shares the deletion path: " + str(original), 5) from original
 
 
 def copy_identity(copy):
@@ -55,7 +71,7 @@ def active_archive_generations(vault, inventory, target, sha):
     return [{"material": record["id"], "copy_index": index, "identity": digest(copy_identity(copy))}
             for record in inventory.values() for index, copy in enumerate(record.get("copies", []))
             if copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] not in INACTIVE_COPIES and
-            copy_path(vault, copy) == location]
+            shares_path(vault, copy, location)]
 
 
 def verified_archive_slots(inventory, entry):
@@ -99,7 +115,7 @@ def record_archive_deletion(vault, inventory, entry, at):
         save_material(vault, record)
 
 
-def pending_deletion_paths(vault):
+def pending_deletion_paths(vault, *, target=None):
     root = safe_path(vault.control, "deletions")
     inventory = materials(vault)
     paths = {}
@@ -114,7 +130,13 @@ def pending_deletion_paths(vault):
                     copy_identity(copies[index]) == copy_identity(entry["copy"]) and
                     archive_verification_complete(inventory, entry)):
                 continue
-            paths.setdefault(copy_path(vault, entry["copy"]), set()).add(plan["id"])
+            if target is None:
+                location = copy_path(vault, entry["copy"])
+            elif shares_path(vault, entry["copy"], target):
+                location = target
+            else:
+                continue
+            paths.setdefault(location, set()).add(plan["id"])
     return paths
 
 
@@ -133,13 +155,14 @@ def require_secret_decisions(vault, record):
 
 
 def material_guard(vault, record, now, policy):
-    from .backups import signed_manifest
+    from .backups import signed_manifest, verify_replica_deletions
     require(not preserved(vault, record, policy), "Retention policy preserves material", 5)
     require_expired(record, now, policy)
     if record.get("classification") == "secret":
         require_secret_decisions(vault, record)
     if record.get("kind") == "backup":
         signed_manifest(vault, record)
+        verify_replica_deletions(vault, record)
     if any(c.get("kind") == "native" for c in record.get("copies", [])):
         from .custody import hold
 
@@ -149,7 +172,7 @@ def material_guard(vault, record, now, policy):
             verified_capture(vault, record)
         except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
             if not recovery_holds:
-                hold(vault, record["id"], "Native recovery unproven", "controller")
+                hold(vault, record["id"], "Native recovery unproven", "controller", origin="controller:native-recovery")
             raise Blocked("Native recovery unproven: " + str(exc), 5) from exc
         if recovery_holds:
             for entry in recovery_holds:
@@ -190,15 +213,28 @@ def guard(vault, record, copy, now, policy=None):
     _, target = authorized_target(vault, record, copy)
     destination = copy_path(vault, copy)
     require(destination not in pending_archive_paths(vault), "Inbox archive move is pending for " + str(target), 5)
+    require(not pending_restoration(vault, target=destination),
+            "Copy path is reserved by a pending restoration", 5)
     for other in materials(vault).values():
-        if other["id"] != record["id"] and any(c.get("status") not in INACTIVE_COPIES and
-                copy_path(vault, c) == destination for c in other.get("copies", [])):
+        if other["id"] == record["id"]:
+            continue
+        shared = [c for c in other.get("copies", []) if c.get("status") not in INACTIVE_COPIES and shares_path(vault, c, destination)]
+        if shared:
+            require(all(c["sha256"] == copy["sha256"] for c in shared), "Shared copy has conflicting custody hashes", 5)
             material_guard(vault, other, now, policy)
+            if any(c["kind"] == "ciphertext" for c in shared):
+                guard_ciphertext(vault, other)
     if copy["kind"] == "ciphertext":
-        require(not pending_restoration(vault, record["id"]), "Ciphertext is needed by a pending restoration", 5)
-        require(not any(c["kind"] == "native" and c["status"] not in INACTIVE_COPIES for c in record["copies"]),
-                NATIVE_REPLICAS_PENDING, 5)
+        guard_ciphertext(vault, record)
     return target
+
+
+def guard_ciphertext(vault, record):
+    from .custody import pending_restoration
+
+    require(not pending_restoration(vault, record["id"]), "Ciphertext is needed by a pending restoration", 5)
+    require(not any(c["kind"] == "native" and c["status"] not in INACTIVE_COPIES for c in record["copies"]),
+            NATIVE_REPLICAS_PENDING, 5)
 
 
 def pending_plans(vault):
@@ -212,12 +248,18 @@ def slot(entry):
     return entry["material"], entry["copy_index"], digest(copy_identity(entry["copy"]))
 
 
+def plan_digest(record):
+    frozen = {"id": record["id"], "created_at": record["created_at"], "status": "planned",
+              "entries": [{"material": e["material"], "copy_index": e["copy_index"], "copy": e["copy"], "status": "planned"}
+                          for e in record["entries"]]}
+    return digest(frozen)
+
+
 def reconcile_inbox(vault, now):
     from .inbox import ordinary
 
     inbox = read_json(vault.control / "inbox.json", {})
     root = vault.root / "inbox"
-    reservations = pending_deletion_paths(vault)
     archives = pending_archive_paths(vault)
     records = materials(vault)
     owners = {}
@@ -240,12 +282,14 @@ def reconcile_inbox(vault, now):
             try:
                 target = safe_path(vault.root, relative)
                 location = canonical_storage_path(target)
-                if location in reservations or location in archives or not target.is_file() or digest(target.read_bytes()) != sha:
+                if (location in archives or pending_deletion_paths(vault, target=location) or
+                        not target.is_file() or digest(target.read_bytes()) != sha):
                     continue
             except (Blocked, OSError):
                 continue
             index = next((i for i, c in enumerate(copies) if c["kind"] == "export" and c["sha256"] == sha and
-                          c["status"] not in INACTIVE_COPIES and copy_path(vault, c) == location), len(copies))
+                          c["status"] not in INACTIVE_COPIES and c["path"] == relative.removeprefix("inbox/") and
+                          vault.relocated_path(c["root"]) == root), len(copies))
             if index == len(copies):
                 copies.append({"root": str(root), "path": relative.removeprefix("inbox/"), "sha256": sha,
                                "kind": "export", "status": "present"})
@@ -259,7 +303,7 @@ def reconcile_inbox(vault, now):
                 try:
                     target = safe_path(root, copy["path"])
                     location = canonical_storage_path(target)
-                    if location in reservations or location in archives or target.exists():
+                    if location in archives or pending_deletion_paths(vault, target=location) or target.exists():
                         continue
                     receipt = vault.receipt("retention-copy-move", {"material": record["id"], "sha256": sha,
                                             "from": copy["path"], "inventory_copies": sorted(live.values())}, at=now)
@@ -282,17 +326,22 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False):
         excluded = set(exclude)
         entries = []
         for record in materials(vault).values():
-            status, deadline = storage_policy.deadline(record, policy)
-            if preserved(vault, record, policy) or (deadline and utc(now) < deadline) or (
-                    status == "unknown" and record.get("task") in open_tasks):
-                continue
+            try:
+                status, deadline = storage_policy.deadline(record, policy)
+                if (deadline and utc(now) < deadline) or (status == "unknown" and record.get("task") in open_tasks):
+                    continue
+                if preserved(vault, record, policy) and not storage_policy.preservation_authorization_pending(vault, record, policy, now):
+                    continue
+            except (Blocked, OSError, ValueError, KeyError, TypeError):
+                # The execution guard will diagnose unproven deadlines or decisions for this material.
+                pass
             for index, copy in enumerate(record.get("copies", [])):
                 if copy.get("status") in INACTIVE_COPIES:
                     continue
                 try:
                     if copy_path(vault, copy) in pending:
                         continue
-                except Blocked:
+                except (Blocked, OSError, ValueError, KeyError, TypeError):
                     # Keep unverified copies in the plan for the execution guard to report.
                     pass
                 entry = {"material": record["id"], "copy_index": index, "copy": copy, "status": "planned"}
@@ -329,6 +378,8 @@ def apply_entry(vault, path, plan, entry, now):
     policy = storage_policy.effective(vault)
     intent = entry.get("intent")
     if not intent and not entry.get("verified_archive_generations") and preserved(vault, material, policy):
+        require(not storage_policy.preservation_authorization_pending(vault, material, policy, now),
+                PRESERVATION_AUTHORIZATION_PENDING, 5)
         entry.update(status="preserved", at=at, policy_version=policy["version"])
         return
     root, target = authorized_target(vault, material, copy)
@@ -338,10 +389,12 @@ def apply_entry(vault, path, plan, entry, now):
                 intent["slot"] == list(slot(entry)), "Deletion intent no longer matches the storage or copy", 5)
     if present:
         if preserved(vault, material, policy):
+            require(not storage_policy.preservation_authorization_pending(vault, material, policy, now),
+                    PRESERVATION_AUTHORIZATION_PENDING, 5)
             entry.update(status="preserved", at=at, policy_version=policy["version"])
             return
         guard(vault, material, copy, now, policy)
-        reservation = pending_deletion_paths(vault).get(copy_path(vault, copy), set()) - {plan["id"]}
+        reservation = pending_deletion_paths(vault, target=copy_path(vault, copy)).get(copy_path(vault, copy), set()) - {plan["id"]}
         require(not reservation, "Another deletion plan is reconciling this copy", 5)
         file_id = file_identity(target)
         require(not intent or intent["file_identity"] == file_id, "Copy identity changed after deletion intent", 5)
@@ -355,8 +408,12 @@ def apply_entry(vault, path, plan, entry, now):
             else:
                 entry["verified_archive_generations"] = generations
             verified_archive_slots(inventory, entry)
-        entry["intent"] = intent or {"path": str(target), "slot": list(slot(entry)), "root_identity": file_identity(root),
-                                    "file_identity": file_id, "plan_digest": plan["digest"], "at": at}
+        if intent is None:
+            intent = {"path": str(target), "slot": list(slot(entry)), "root_identity": file_identity(root),
+                      "file_identity": file_id, "plan_digest": plan["digest"], "plan_id": plan["id"], "at": at}
+            if material["kind"] == "backup":
+                intent["generation_digest"] = material["approval"]["digest"]
+        entry["intent"] = intent
         require(entry["intent"]["plan_digest"] == plan["digest"], "Deletion intent does not match the plan", 5)
         entry["status"] = "deleting"
         atomic(path, plan)
@@ -389,14 +446,20 @@ def execute(vault, identifier, now=None):
     with vault.locked():
         path = safe_path(vault.control / "deletions", identifier + ".json", exists=True)
         record = read_json(path)
-        frozen = {"id": record["id"], "created_at": record["created_at"], "status": "planned",
-                  "entries": [{"material": e["material"], "copy_index": e["copy_index"], "copy": e["copy"], "status": "planned"}
-                              for e in record["entries"]]}
-        require(digest(frozen) == record["digest"], "Deletion plan changed after persistence")
+        require(plan_digest(record) == record["digest"], "Deletion plan changed after persistence")
         require(record["id"] == identifier, "Deletion plan identifier changed", 5)
         reconcile_inbox(vault, now)
         for entry in sorted(record["entries"], key=lambda e: (e["status"] != "deleting", e["copy"]["kind"] == "ciphertext")):
             if entry["status"] in RESOLVED:
+                if entry["status"] == "preserved":
+                    try:
+                        material = materials(vault)[entry["material"]]
+                        copy = material["copies"][entry["copy_index"]]
+                        if (copy["status"] not in INACTIVE_COPIES and
+                                storage_policy.preservation_authorization_pending(vault, material, storage_policy.effective(vault), now)):
+                            entry.update(status="pending", error=PRESERVATION_AUTHORIZATION_PENDING, at=stamp(now))
+                    except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+                        entry.update(status="pending", error=str(exc), at=stamp(now))
                 continue
             try:
                 apply_entry(vault, path, record, entry, now)

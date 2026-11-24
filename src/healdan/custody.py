@@ -118,11 +118,11 @@ def integrity_findings(vault):
     findings = []
     for record in records.values():
         live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
-        if not live:
+        if not live and record.get("kind") != "backup":
             continue
         try:
             if record["kind"] == "backup":
-                verify_backup(vault, record["id"])
+                verify_backup(vault, record["id"], allow_retired=True)
             elif record.get("decryption_verified"):
                 if any(copy.get("kind") == "ciphertext" for copy in live):
                     verified_capture(vault, record)
@@ -250,12 +250,12 @@ def validate_purpose(material):
                     for k in ("purpose", "necessity", "owner", "link")), "Personal/unknown material lacks specific purpose")
 
 
-def hold(vault, identifier, reason, owner, dependencies=(), review_at=None):
+def hold(vault, identifier, reason, owner, dependencies=(), review_at=None, *, origin="human"):
     with vault.locked():
         record = materials(vault)[identifier]
         require(record.get("kind") != "backup", "Existing backup expiry cannot be suspended; use a separate preservation plan", 5)
         item = {"id": str(uuid4()), "reason": reason, "owner": owner, "started_at": stamp(),
-                "review_at": stamp(review_at) if review_at else None, "dependencies": list(dependencies)}
+                "review_at": stamp(review_at) if review_at else None, "dependencies": list(dependencies), "origin": origin}
         require(reason and owner, "Hold requires reason and owner", 2)
         record.setdefault("holds", []).append(item)
         save_material(vault, record)
@@ -290,31 +290,48 @@ def native_guard(vault, material):
     require(reconstruction.get("material") == material["id"] and
             reconstruction.get("archive_sha256") == proof.get("reconstruction_sha256") and
             proof.get("reconstruction_sha256") == material.get("plain_sha256"), "Native reconstruction is not proven", 5)
+    usage = proof.get("usage")
+    require(isinstance(usage, dict) and set(usage) == {"input_tokens", "output_tokens", "evidence_bytes"} and
+            all(type(value) is int and value >= 0 for value in usage.values()) and receipt and
+            isinstance(receipt.get("cumulative_usage"), dict) and
+            all(type(value) is int for value in receipt["cumulative_usage"].values()) and usage == receipt["cumulative_usage"],
+            "Native resume requires valid cumulative usage in the decision and receipt", 5)
     require(receipt and receipt.get("resumed") and receipt.get("recovery_material") == material["id"] and receipt.get("success") and
             proof.get("uuid") == session["uuid"] == receipt.get("uuid") and
-            proof.get("action") == session["action"] == receipt.get("action") and
-            proof.get("usage") == receipt.get("cumulative_usage"), "Native resume is not proven", 5)
+            proof.get("action") == session["action"] == receipt.get("action"), "Native resume is not proven", 5)
 
 
-def pending_restoration(vault, identifier):
+def pending_restoration(vault, identifier=None, *, target=None):
     directory = safe_path(vault.control, "restorations")
     for path in directory.glob("*.json"):
         journal = read_json(safe_path(directory, path.name, exists=True))
         status = journal.get("status")
-        if journal.get("material") == identifier and (status in {"staging", "publishing"} or
-                status == "preparing" and not journal.get("error")):
+        if (target is None and journal.get("material") == identifier and
+                (status in {"staging", "publishing"} or status == "preparing" and not journal.get("terminal"))):
             return True
+        if target is not None and status in {"staging", "publishing"}:
+            destination = vault.relocated_path(journal["binding"]["destination"])
+            if target.is_relative_to(destination) and target.relative_to(destination).as_posix() in journal["inventory"]:
+                return True
     return False
 
 
+class RestoreDestinationConflict(Blocked):
+    pass
+
+
 def restore_destination(vault, destination):
-    require(destination != destination.parent and canonical_storage_path(destination) == destination,
-            "Restore destination must be canonical and external", 5)
     prohibited = (*vault.repository.worktree_roots(), vault.common, vault.state / "custody")
-    require(not any(destination.is_relative_to(root) or root.is_relative_to(destination) for root in prohibited) and
-            destination != vault.state, "Restore destination must be external to Git and custody storage", 5)
-    safe_path(destination.parent, destination.name)
-    require(destination.parent.is_dir() and not destination.is_junction(), "Restore destination parent is unsafe or offline", 5)
+    if (destination == destination.parent or ".." in destination.parts or destination == vault.state or
+            any(destination.is_relative_to(root) or root.is_relative_to(destination) for root in prohibited)):
+        raise RestoreDestinationConflict("Restore destination must be canonical and external to Git and custody storage", 5)
+    require(destination.parent.is_dir(), "Restore destination parent is offline", 5)
+    if canonical_storage_path(destination) != destination or destination.is_junction():
+        raise RestoreDestinationConflict("Restore destination must be canonical and external", 5)
+    try:
+        safe_path(destination.parent, destination.name)
+    except Blocked as exc:
+        raise RestoreDestinationConflict(str(exc), 5) from exc
 
 
 def restored_directory(path):
@@ -352,6 +369,7 @@ def restore_capture(vault, identifier, destination):
             require(journal.get("format") == "healdan-restore-v1" and journal.get("binding") == binding,
                     "Restore intention no longer matches the capture or destination", 5)
             if journal["status"] != "complete" and journal.pop("error", None) is not None:
+                journal.pop("terminal", None)
                 atomic(path, journal)
         try:
             restore_destination(vault, destination)
@@ -359,6 +377,8 @@ def restore_capture(vault, identifier, destination):
         except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
             with vault.locked():
                 journal["error"] = str(exc)
+                if journal["status"] == "preparing" and isinstance(exc, RestoreDestinationConflict):
+                    journal["terminal"] = True
                 atomic(path, journal)
             raise
 
@@ -391,12 +411,16 @@ def reconstruct_capture(vault, record, destination, path, journal):
         check_reconstruction(destination, journal)
         return journal["result"]
 
-    if journal.get("stage_identity") and restored_directory(destination) == journal["stage_identity"]:
+    try:
+        destination_id = restored_directory(destination)
+    except Blocked as exc:
+        raise RestoreDestinationConflict(str(exc), 5) from exc
+    if journal.get("stage_identity") and destination_id == journal["stage_identity"]:
         check_reconstruction(destination, journal)
         return finish_reconstruction(vault, destination, path, journal)
 
-    destination_id = restored_directory(destination)
-    require(destination_id is None or not any(destination.iterdir()), "Restore destination must be empty (collision)", 5)
+    if destination_id is not None and any(destination.iterdir()):
+        raise RestoreDestinationConflict("Restore destination must be empty (collision)", 5)
     require(os.name != "nt" or sys.version_info >= (3, 12, 4),
             "Restricted restoration staging on Windows requires Python 3.12.4 or later", 5)
     if not journal.get("stage_identity") and stage.exists():
@@ -431,6 +455,9 @@ def reconstruct_capture(vault, record, destination, path, journal):
     with vault.locked():
         restore_destination(vault, destination)
         check_reconstruction(stage, journal)
+        from .retention import pending_deletion_paths
+        require(not any(pending_deletion_paths(vault, target=destination / relative) for relative in checked),
+                "Restore destination has a pending deletion intent", 5)
         require(restored_directory(destination) in (None, destination_id) and
                 (not destination.exists() or not any(destination.iterdir())), "Restore destination collision", 5)
         journal["status"] = "publishing"
@@ -460,7 +487,10 @@ def finish_reconstruction(vault, destination, path, journal):
             candidate = {"root": str(destination), "path": name, "sha256": entry["sha256"],
                          "kind": "native" if record.get("session") else "checkpoint", "status": "present",
                          "restoration": restoration}
-            if not any(copy.get("restoration") == restoration and copy["path"] == name for copy in copies):
+            if not any(copy["path"] == name and (copy.get("restoration") == restoration or
+                       copy["status"] not in INACTIVE_COPIES and copy["kind"] == candidate["kind"] and
+                       copy["sha256"] == candidate["sha256"] and vault.relocated_path(copy["root"]) == destination)
+                       for copy in copies):
                 additions.append(candidate)
         if additions:
             copies.extend(additions)

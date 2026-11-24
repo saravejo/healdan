@@ -79,9 +79,10 @@ retention. Existing installations start with 30 days for common conversations,
 seven for other conversations and exports, and the daily backup cadence if the
 legacy configuration supplies a generation lifetime without an interval.
 The signed policy identifies the vault, current materials, and whether it
-applies to future materials. `keep_forever` preserves existing copies under the
-active policy. A separate preservation decision remains effective when the vault
-returns to `by_class` and leaves the generation's signed expiry intact.
+applies to future materials. `keep_forever` protects the copies of an expired
+signed generation while maintenance reports that its individual preservation
+decision is pending. The decision leaves the signed expiry intact and remains
+effective when the vault returns to `by_class`.
 
 Repeat `session restore MATERIAL DESTINATION` with the same external destination
 after an interruption. The controller verifies the published files against the
