@@ -265,7 +265,7 @@ class BackupPortable(VaultTest):
         for label, copy, error in (
             ("manifest-digest", {**first, "manifest_sha256": "0" * 64}, "Portable replica inventory changed"),
             ("malformed-copy", None, "Portable replica inventory changed"),
-            ("other-slot", second, "Backup replica publication receipt changed"),
+            ("other-slot", second, "duplicates a verified publication slot"),
             ("substituted-root", substituted, "signed publication plan"),
             ("unavailable-copy", {**first, "status": "unavailable"}, None),
         ):
@@ -278,9 +278,10 @@ class BackupPortable(VaultTest):
                     self.assertNotIn(first["root"], [call.args[0] for call in relocated.call_args_list])
                     self.assertNotIn(str(moved), [call.args[0] for call in relocated.call_args_list])
                     self.assertIn(error, report["replicas"][0]["reason"])
-                    with self.assertRaisesRegex(Blocked, error):
+                    strict_error = "publication receipt changed" if label == "other-slot" else error
+                    with self.assertRaisesRegex(Blocked, strict_error):
                         backups.inspect_backup(self.vault, damaged, allow_retired=True)
-                    with self.assertRaisesRegex(Blocked, error):
+                    with self.assertRaisesRegex(Blocked, strict_error):
                         backups.reconcile(self.vault, identifier)
                 destination = self.base / label
                 restored = backups.restore(self.vault, identifier, destination)
@@ -337,31 +338,80 @@ class BackupPortable(VaultTest):
                     self.assertIn("replica count", checked["pending_replicas"][0]["reason"])
                 self.assertTrue(all(path.is_file() for slot in (0, 1) for path in self.paths(record, slot)))
 
+        reordered = {**record, "copies": list(reversed(record["copies"]))}
+        custody.save_material(self.vault, reordered)
+        offline = self.destinations[0].rename(self.base / "offline-reordered-slot")
+        try:
+            report = backups.verify_backup(self.vault, identifier)
+            restored = backups.restore(self.vault, identifier, self.base / "reordered-restore")
+            for result in (report, restored):
+                self.assertEqual(result["replica"], str(self.paths(record, 1)[1]))
+                self.assertEqual([(row["copy_index"], row["status"]) for row in result["replicas"]],
+                                 [(1, "verified"), (0, "unavailable")])
+                self.assertTrue(any("catalog order" in row["reason"] for row in result["pending_replicas"]))
+            with self.assertRaisesRegex(Blocked, "publication receipt changed"):
+                backups.inspect_backup(self.vault, reordered, decrypt_replicas=True)
+            with self.assertRaisesRegex(Blocked, "publication receipt changed"):
+                backups.reconcile(self.vault, identifier)
+        finally:
+            offline.rename(self.destinations[0])
+        self.assertEqual(retention.plan(self.vault, expiry)["entries"], [])
+        outcome = retention.execute(self.vault, plan["id"], expiry)
+        self.assertEqual(outcome["status"], "pending")
+        self.assertTrue(all(path.is_file() for slot in (0, 1) for path in self.paths(record, slot)))
+
+        first, second = record["copies"]
+        repeated = {**record, "copies": [{**second, "status": "unavailable"}, first, first]}
+        custody.save_material(self.vault, repeated)
+        report = backups.verify_backup(self.vault, identifier)
+        self.assertEqual(report["replica"], str(self.paths(record)[1]))
+        self.assertEqual([row["status"] for row in report["replicas"]], ["unavailable", "verified", "invalid"])
+        self.assertIn("duplicates a verified publication slot", report["replicas"][2]["reason"])
+
+        conflicting = {**record, "copies": [first, second, {**first, "status": "unavailable"}]}
+        custody.save_material(self.vault, conflicting)
+        report = backups.verify_backup(self.vault, identifier)
+        self.assertEqual(report["replica"], str(self.paths(record, 1)[1]))
+        self.assertEqual([row["status"] for row in report["replicas"]], ["invalid", "verified", "invalid"])
+        self.assertTrue(all("conflicting catalog entries" in report["replicas"][index]["reason"] for index in (0, 2)))
+
         scheduled = maintenance.backup_round(self.vault, now + timedelta(minutes=1))
         self.assertEqual(scheduled["status"], "complete", scheduled)
         self.assertNotEqual(scheduled["id"], identifier)
 
     def test_1_portable_manifest_without_signed_publication_plan(self):
-        self.configure()
+        self.configure(2)
         record = self.create()
-        manifest_path, replica = self.paths(record)
-        payload = {key: value for key, value in record["approval"]["payload"].items() if key != "replica_slots_sha256"}
-        approval = envelope(payload, "backup", "backup", self.vault.config["backup_signing_key"])
-        original = canonical(approval) + b"\n"
-        atomic(manifest_path, original)
-        copy = {**record["copies"][0], "manifest_sha256": digest(original)}
-        older = {key: value for key, value in record.items() if key != "replica_slots_sha256"}
-        older.update(approval=approval, copies=[copy])
-        at = copy["published_at"]
-        copy["publication_receipt"] = self.vault.receipt("backup-replica-published", backups.published_copy(older, 0, copy, at), at=at)
-        custody.save_material(self.vault, older)
-        self.assertEqual(backups.verify_portable(record["id"], manifest_path, replica, **self.trust)["status"], "complete")
-        report = backups.verify_backup(self.vault, record["id"])
-        self.assertEqual(report["replica"], str(replica))
-        self.assertIn("authenticated publication plan", report["pending_replicas"][0]["reason"])
-        with self.assertRaisesRegex(Blocked, "authenticated publication plan"):
-            backups.inspect_backup(self.vault, older)
-        self.assertEqual(manifest_path.read_bytes(), original)
+        manifest_path, replica = self.paths(record, 1)
+        for removed, issue in (({"replica_slots_sha256"}, "authenticated publication plan"),
+                               ({"replica_slots_sha256", "replica_count"}, "authenticated replica count")):
+            with self.subTest(issue=issue):
+                payload = {key: value for key, value in record["approval"]["payload"].items() if key not in removed}
+                approval = envelope(payload, "backup", "backup", self.vault.config["backup_signing_key"])
+                original = canonical(approval) + b"\n"
+                older = {key: value for key, value in record.items() if key not in removed}
+                older.update(approval=approval)
+                copies = []
+                for index, copy in enumerate(record["copies"]):
+                    atomic(self.paths(record, index)[0], original)
+                    copy = {**copy, "manifest_sha256": digest(original)}
+                    at = copy["published_at"]
+                    proof = backups.published_copy(older, index, copy, at)
+                    copy["publication_receipt"] = self.vault.receipt("backup-replica-published", proof, at=at)
+                    copies.append(copy)
+                older["copies"] = [copies[1], {**copies[0], "status": "unavailable"}]
+                custody.save_material(self.vault, older)
+                self.assertEqual(backups.verify_portable(record["id"], manifest_path, replica, **self.trust)["status"], "complete")
+                report = backups.verify_backup(self.vault, record["id"])
+                self.assertEqual(report["replica"], str(replica))
+                self.assertEqual([(row["copy_index"], row["status"]) for row in report["replicas"]],
+                                 [(1, "verified"), (0, "unavailable")])
+                reasons = [row["reason"] for row in report["pending_replicas"]]
+                self.assertTrue(any(issue in reason for reason in reasons))
+                self.assertTrue(any("catalog order" in reason for reason in reasons))
+                with self.assertRaisesRegex(Blocked, issue):
+                    backups.inspect_backup(self.vault, older)
+                self.assertEqual(manifest_path.read_bytes(), original)
 
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
@@ -540,7 +590,15 @@ class BackupPortable(VaultTest):
             backups.verify_portable(identifier, None, replica, **self.trust)
 
         first, second = record["copies"]
-        damaged = {**record, "copies": [first, {**second, "root": first["root"]}]}
+        reordered = {**record, "copies": [second, first]}
+        custody.save_material(self.vault, reordered)
+        report = backups.verify_backup(self.vault, identifier)
+        self.assertEqual([(row["copy_index"], row["status"]) for row in report["replicas"]],
+                         [(1, "unavailable"), (0, "verified")])
+        self.assertTrue(any("catalog order" in row["reason"] for row in report["pending_replicas"]))
+        with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
+            backups.inspect_backup(self.vault, reordered)
+        damaged = {**record, "copies": [first, {**second, "root": str(self.base / "unsigned-root")}]}
         custody.save_material(self.vault, damaged)
         report = backups.verify_backup(self.vault, identifier)
         self.assertEqual([entry["status"] for entry in report["replicas"]], ["verified", "invalid"])
@@ -809,8 +867,28 @@ class BackupPortable(VaultTest):
         previous = self.create()
         damaged = {**previous, "copies": [None]}
         custody.save_material(self.vault, damaged)
+        export_id = "unrelated-export"
+        export_body = b"Export custody bytes"
+        copies = []
+        for name in ("old-export.txt", "verified-export.txt"):
+            target = self.state / "custody" / name
+            atomic(target, export_body)
+            copies.append({"root": str(target.parent), "path": name, "kind": "export",
+                           "sha256": digest(export_body), "status": "present"})
+        export = {"id": export_id, "kind": "export", "classification": "common", "source_sha256": digest(export_body),
+                  "captured_at": stamp(now - timedelta(days=40)), "copies": copies, "holds": [], "dependencies": []}
+        custody.save_material(self.vault, export)
         pending = retention.plan(self.vault, now)
         self.assertEqual(pending["pending"][0]["material"], previous["id"])
+        self.assertEqual([entry["copy_index"] for entry in pending["entries"] if entry["material"] == export_id], [0, 1])
+        malformed = {**export, "copies": [{**copies[0], "path": "../unconfined.txt"},
+                                         {**copies[1], "status": "unavailable"}]}
+        custody.save_material(self.vault, malformed)
+        malformed_plan = retention.plan(self.vault, now)
+        pending_export = retention.execute(self.vault, malformed_plan["id"], now)
+        self.assertEqual(pending_export["status"], "pending")
+        self.assertTrue(any(row["material"] == export_id and row["copy_index"] == 0 and "relative and confined" in row["reason"]
+                            for row in pending_export["pending"]))
         raw_inventory = (self.vault.control / "materials.json").read_bytes()
         deadline = now + timedelta(days=30)
         working = self.base / "unrelated-launch-directory"
@@ -827,16 +905,37 @@ class BackupPortable(VaultTest):
         self.assertTrue(ordinary.samefile(homonym))
         self.assertEqual(ordinary.read_bytes(), unrelated)
         record = decode(result.stdout)
-        new = self.restore(record)
+        export_remap = self.base / "export-remap.txt"
+        atomic(export_remap, export_body)
+        with self.assertRaisesRegex(Blocked, "Unsafe backup path"):
+            self.restore(record, remap={export_id: {"0": str(export_remap)}})
+        new = self.restore(record, remap={export_id: {"1": str(export_remap)}})
         recovered = Vault(new["destination"], new["state"])
         self.assertEqual((recovered.control / "historical/materials.json").read_bytes(), raw_inventory)
-        projected = custody.materials(recovered)[previous["id"]]
-        self.assertEqual(projected["copies"], [])
+        inventory = custody.materials(recovered)
+        projected = inventory[previous["id"]]
+        self.assertEqual([copy["status"] for copy in projected["copies"]], ["unavailable"])
         self.assertEqual(projected["approval"], previous["approval"])
-        self.assertTrue(any(row.get("material") == previous["id"] and row.get("copy_index") == 0 and
-                            row.get("status") == "invalid" for row in new["pending_copies"]))
+        self.assertEqual({(row["material"], row["copy_index"]) for row in new["pending_copies"]
+                          if row["status"] == "invalid"}, {(previous["id"], 0), (export_id, 0)})
+        invalid, intact, local = inventory[export_id]["copies"]
+        self.assertEqual(invalid["status"], "unavailable")
+        self.assertFalse({"root", "path", "sha256"} & invalid.keys())
+        self.assertEqual(intact["path"], copies[1]["path"])
+        self.assertEqual(local["status"], "present")
+        local_path = Path(local["root"]) / local["path"]
+        self.assertEqual(local_path.read_bytes(), export_body)
+        receipt = read_json(recovered.control / "receipts" / (local["recovery_receipt"] + ".json"))
+        self.assertEqual(receipt["payload"]["origin_copy_index"], 1)
+        self.assertEqual(read_json(recovered.control / "deletions" / (pending["id"] + ".json")),
+                         {key: value for key, value in pending.items() if key != "pending"})
+        self.assertEqual(retention.execute(recovered, pending["id"], now)["status"], "pending")
+        self.assertEqual(local_path.read_bytes(), export_body)
+        discovered = retention.plan(recovered, now)
+        self.assertTrue(any(row["material"] == export_id and row["copy_index"] == 0 for row in discovered["pending"]))
+        self.assertFalse(any(entry["material"] == export_id and entry["copy_index"] == 0 for entry in discovered["entries"]))
         self.assertTrue(all(path.is_file() for path in self.paths(previous)))
-        current = custody.materials(recovered)[eligible["id"]]
+        current = inventory[eligible["id"]]
         self.assertEqual(current["closed_at"], eligible["closed_at"])
         self.assertEqual(current["plain_sha256"], eligible["plain_sha256"])
         self.assertEqual(current["cipher_sha256"], eligible["cipher_sha256"])
@@ -846,6 +945,12 @@ class BackupPortable(VaultTest):
                                (deadline, unknown["id"])):
             with self.subTest(expiry=expiry, member=member), self.assertRaisesRegex(Blocked, "precede every finite"):
                 self.create("short", expiry, [member])
+        selected_copies = eligible["copies"].copy()
+        selected_copies[0] = {**selected_copies[0], "sha256": "unproven"}
+        custody.save_material(self.vault, {**eligible, "copies": selected_copies})
+        with self.assertRaisesRegex(Blocked, "Invalid backed-up custody copy"):
+            self.create("short", deadline - timedelta(seconds=1), [eligible["id"]])
+        custody.save_material(self.vault, eligible)
         path = self.state / "custody" / (eligible["id"] + ".age")
         cipher = path.read_bytes()
         atomic(path, b"tampered")

@@ -84,6 +84,7 @@ def remapped_copies(remap, records, destination, state):
                     int(index) < len(record["copies"]) and isinstance(filename, str) and Path(filename).is_absolute(),
                     "Invalid remapped custody copy: " + key, 5)
             original = record["copies"][int(index)]
+            snapshot.check_material_copy(key, original)
             require(original["status"] not in INACTIVE_COPIES and original["kind"] in {"ciphertext", "checkpoint", "export", "archive"},
                     "Remapping cannot revive retired copies or import native profiles", 5)
             snapshot.portable_path(original["path"])
@@ -99,27 +100,28 @@ def remapped_copies(remap, records, destination, state):
 
 
 def reconcile_copies(archive, contents, records, state, control, journal, remaps):
-    from .backups import valid_replica_root
-
     inventory = deepcopy(records)
     sources = {entry["sha256"]: contents[name] for name, entry in archive["files"].items()
                if entry["kind"] == "knowledge" and snapshot.originals.source_path(name)}
     pending = []
     for key, record in inventory.items():
         portable = snapshot.portable_backup_record(record)
-        original, local = [], []
+        local = []
         for index, copy in enumerate(record["copies"]):
-            if portable:
-                try:
-                    snapshot.check_material_copy(key, copy)
-                    require(valid_replica_root(copy["root"]) and copy["kind"] == "ciphertext" and
-                            copy["path"] == key + ".age" and copy.get("manifest") == key + ".manifest.json" and
+            try:
+                snapshot.check_material_copy(key, copy)
+                if record["kind"] == "backup":
+                    require(copy["kind"] == "ciphertext", "Invalid backed-up replica kind: " + key, 5)
+                if portable:
+                    require(copy["path"] == key + ".age" and copy.get("manifest") == key + ".manifest.json" and
                             copy["status"] in ("planned", "present", "deleted", "absent", "unavailable"),
                             "Invalid backed-up replica location: " + key, 5)
-                except Blocked as exc:
-                    pending.append({"material": key, "copy_index": index, "status": "invalid", "reason": str(exc)})
-                    continue
-            original.append(copy)
+            except Blocked as exc:
+                reason = copy.get("inventory_error") if isinstance(copy, dict) else None
+                reason = reason if isinstance(reason, str) and reason else str(exc)
+                record["copies"][index] = {"status": "unavailable", "kind": None, "inventory_error": reason}
+                pending.append({"material": key, "copy_index": index, "status": "invalid", "reason": reason})
+                continue
             copy.setdefault("origin_status", copy["status"])
             if copy["status"] in INACTIVE_COPIES:
                 continue
@@ -154,7 +156,7 @@ def reconcile_copies(archive, contents, records, state, control, journal, remaps
             receipt = proof_receipt(control, "backup-copy-recovered", payload, journal["at"])
             local.append({"root": str(target.parent), "path": target.name, "sha256": copy["sha256"], "kind": copy["kind"],
                           "status": "present", "recovery_receipt": receipt})
-        record["copies"] = original + local
+        record["copies"].extend(local)
     atomic(control / "materials.json", inventory)
     return pending
 

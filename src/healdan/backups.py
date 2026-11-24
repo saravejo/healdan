@@ -36,9 +36,12 @@ def generation_members(known, kind, expires_at, member_ids, now, policy):
     validate_generation(kind, members, expires_at, now, policy=policy)
     for member_id, member in zip(member_ids, members, strict=True):
         require(snapshot.identifier(member_id) and member.get("id") == member_id and
-                member.get("kind") == "conversation" and member.get("classification") != "secret",
+                member.get("kind") == "conversation" and member.get("classification") != "secret" and
+                isinstance(member.get("copies"), list),
                 "Only eligible conversation captures can be copied into a short backup", 5)
         validate_purpose(member)
+        for copy in member["copies"]:
+            snapshot.check_material_copy(member_id, copy)
     return members
 
 
@@ -285,16 +288,10 @@ def replica_inventory_problem(record, manifest, count):
     return None
 
 
-def valid_replica_root(value):
-    if not isinstance(value, str) or any(ord(char) < 32 for char in value):
-        return False
-    return any(path.is_absolute() and ".." not in path.parts for path in (PurePosixPath(value), PureWindowsPath(value)))
-
-
 def check_replica_record(vault, record, manifest, index, copy):
     portable = record.get("format") == snapshot.MANIFEST
     error = "Portable replica inventory changed" if portable else "Signed backup manifest changed"
-    require(isinstance(copy, dict) and valid_replica_root(copy.get("root")) and
+    require(isinstance(copy, dict) and snapshot.valid_origin_root(copy.get("root")) and
             copy.get("kind") == "ciphertext" and copy.get("sha256") == manifest["cipher_sha256"], error, 5)
     if portable:
         approval = record.get("approval") or record["publication"]
@@ -340,7 +337,7 @@ def check_replica_publication(vault, record, index, copy, replica_count):
             "Backup replica publication receipt changed", 5)
     if index is None:
         index = payload["copy_index"]
-        require(0 <= index < replica_count, "Backup replica publication receipt changed", 5)
+        require(index >= 0 and (replica_count is None or index < replica_count), "Backup replica publication receipt changed", 5)
     expected = published_copy(record, index, copy, copy.get("published_at"))
     require(digest(proof) == receipt and proof.get("kind") == "backup-replica-published" and
             proof.get("at") == copy.get("published_at") and payload == expected,
@@ -411,7 +408,7 @@ def check_writing_generation(vault, record):
              record.get("format") == snapshot.MANIFEST and record.get("expiry") == "permanent" and record["expires_at"] is None),
             "Interrupted backup generation has an unproven identity or expiry", 5)
     copies = record.get("copies")
-    require(isinstance(copies, list) and copies and all(isinstance(copy, dict) and valid_replica_root(copy.get("root")) and
+    require(isinstance(copies, list) and copies and all(isinstance(copy, dict) and snapshot.valid_origin_root(copy.get("root")) and
             copy.get("kind") == "ciphertext" and copy.get("path") == identifier + ".age" and
             copy.get("sha256") == record["cipher_sha256"] and copy.get("status") in ("planned", "present", "deleted", "absent")
             for copy in copies), "Interrupted backup copy does not match its generation", 5)
@@ -645,27 +642,55 @@ def replica_availability(vault, copy):
     return "available"
 
 
+def replica_entries(vault, record, manifest, *, allow_partial):
+    rows, by_slot = [], {}
+    for index, copy in enumerate(record["copies"]):
+        entry = {"copy_index": index}
+        if isinstance(copy, dict):
+            entry.update({key: copy[key] for key in ("root", "path") if isinstance(copy.get(key), str)})
+        try:
+            slot = check_replica_record(vault, record, manifest, None if allow_partial else index, copy)
+        except (Blocked, OSError, KeyError, TypeError, ValueError) as exc:
+            if not allow_partial:
+                raise Blocked(str(exc), 5) from exc
+            entry.update(status="invalid", reason=str(exc))
+        else:
+            if slot != index:
+                entry.update(catalog_index=index, copy_index=slot)
+            by_slot.setdefault(slot, []).append((index, copy, entry))
+        rows.append((copy, entry))
+
+    for slot, claims in by_slot.items():
+        if len(claims) < 2:
+            continue
+        chosen_index, chosen_copy, _ = next((claim for claim in claims if claim[0] == slot), claims[0])
+        identical = all(copy == chosen_copy for _, copy, _ in claims)
+        for index, _, entry in claims:
+            if not identical:
+                entry.update(status="invalid", reason="Backup replica has conflicting catalog entries for its authenticated slot")
+            elif index != chosen_index:
+                entry.update(status="invalid", reason="Backup replica duplicates a verified publication slot")
+    return rows
+
+
 def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allow_partial=False):
     manifest = authenticate_generation(vault, record)
     portable = record.get("format") == snapshot.MANIFEST
     count = manifest.get("replica_count") if portable else len(manifest["copies"])
     inventory_problem = replica_inventory_problem(record, manifest, count)
     require(allow_partial or inventory_problem is None, inventory_problem, 5)
-    recover_slot = count is not None and len(record["copies"]) != count
-    seen = set()
-    checks, replicas, retired, selected = [], [], [], None
-    for index, copy in enumerate(record["copies"]):
-        entry = {"catalog_index" if recover_slot else "copy_index": index}
-        if isinstance(copy, dict):
-            entry.update({key: copy[key] for key in ("root", "path") if isinstance(copy.get(key), str)})
+    rows = replica_entries(vault, record, manifest, allow_partial=allow_partial)
+    reordered = any("catalog_index" in entry and "status" not in entry for _, entry in rows)
+    replicas = [entry for _, entry in rows]
+    checks, retired, selected = [], [], None
+    for copy, entry in rows:
+        if "status" in entry:
+            continue
         try:
-            slot = check_replica_record(vault, record, manifest, None if recover_slot else index, copy)
-            require(slot not in seen, "Backup replica duplicates a verified publication slot", 5)
-            entry["copy_index"] = slot
             root = str(vault.relocated_path(copy["root"]))
             entry["root"] = root
             if copy["status"] == "deleted":
-                retired.append(verify_replica_deletion(vault, record, slot, copy))
+                retired.append(verify_replica_deletion(vault, record, entry["copy_index"], copy))
                 entry["status"] = "deleted"
             elif replica_availability(vault, copy) == "unavailable":
                 entry.update(status="unavailable", reason="Required regular file is missing: backup replica is unavailable")
@@ -681,15 +706,15 @@ def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allo
                     selected = (path, raw_manifest, plain, manifest, verified)
                 entry["status"] = "verified"
                 checks.append({"root": root, "verified": True})
-            seen.add(slot)
         except (Blocked, OSError, KeyError, TypeError, ValueError, IndexError, AttributeError, OverflowError) as exc:
             if not allow_partial:
                 raise Blocked(str(exc), 5) from exc
             entry.update(status="invalid", reason=str(exc))
-        replicas.append(entry)
     pending = [entry for entry in replicas if entry["status"] in {"unavailable", "invalid"}]
     if inventory_problem:
         pending.append({"status": "invalid", "reason": inventory_problem})
+    if reordered:
+        pending.append({"status": "invalid", "reason": "Backup replica catalog order differs from the authenticated slots"})
     require(allow_partial or not pending, "; ".join(entry["reason"] for entry in pending), 5)
     if portable and not allow_partial:
         require_distinct_publication_roots([Path(check["root"]) for check in checks])

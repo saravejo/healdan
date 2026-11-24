@@ -435,9 +435,8 @@ def publication(vault, admissions, status, *, at):
                     if path.startswith("inbox/") and origin.is_file() and digest(origin.read_bytes()) == sha:
                         copy = {"root": str(vault.root / "inbox"), "path": path.removeprefix("inbox/"),
                                 "sha256": sha, "kind": "export", "status": "present"}
-                        if not any(vault.relocated_path(other["root"]) == vault.root / "inbox" and
-                                   other["path"] == copy["path"] and other["sha256"] == sha and
-                                   other["status"] == "present" for other in record["copies"]):
+                        if not any(other["status"] == "present" and vault.relocated_path(other["root"]) == vault.root / "inbox" and
+                                   other["path"] == copy["path"] and other["sha256"] == sha for other in record["copies"]):
                             record["copies"].append(copy)
                             changed = True
     if changed:

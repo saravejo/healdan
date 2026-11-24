@@ -452,26 +452,28 @@ def portable_backup_record(record):
     return record.get("kind") == "backup" and record.get("format") == MANIFEST
 
 
+def valid_origin_root(value):
+    if not isinstance(value, str) or any(ord(char) < 32 for char in value):
+        return False
+    return any(path.is_absolute() and ".." not in path.parts for path in (PurePosixPath(value), PureWindowsPath(value)))
+
+
 def check_material_copy(key, copy):
-    require(isinstance(copy, dict) and isinstance(copy.get("root"), str) and
-            sha256(copy.get("sha256")) and isinstance(copy.get("kind"), str) and
+    require(isinstance(copy, dict) and valid_origin_root(copy.get("root")) and sha256(copy.get("sha256")) and
+            copy.get("kind") in ("archive", "checkpoint", "ciphertext", "export", "native") and
             copy.get("status") in ("present", "planned", "deleted", "moved", "absent", "unavailable"),
             "Invalid backed-up custody copy: " + key, 5)
     portable_path(copy.get("path"), historical=True)
 
 
 def check_materials(inventory):
+    # The raw catalog is kept as evidence. Selected and recovered copies are checked before use.
     for key, record in inventory.items():
         require(isinstance(key, str) and "/" not in portable_path(key) and isinstance(record, dict) and record.get("id") == key and
                 record.get("kind") in {"conversation", "export", "backup"} and isinstance(record.get("copies"), list) and
                 isinstance(record.get("holds"), list) and isinstance(record.get("dependencies"), list),
                 "Invalid backed-up custody record: " + key, 5)
         require(record["kind"] == "export" or identifier(key), "Invalid backup or conversation identity: " + key, 5)
-        if portable_backup_record(record):
-            # Capture the original mutable catalog as evidence, including damaged replica rows.
-            continue
-        for copy in record["copies"]:
-            check_material_copy(key, copy)
 
 
 def check_recovery_history(archive, contents, records, backup_signers):
@@ -625,6 +627,8 @@ def check_members(manifest, records, contents):
                         policy=policy[-1]["payload"] if policy else None)
     for record in selected:
         validate_purpose(record)
+        for copy in record["copies"]:
+            check_material_copy(record["id"], copy)
         data = contents[f"custody/{record['id']}.age"]
         require(digest(data) == record.get("cipher_sha256") and len(data) == record.get("size") and
                 any(copy["kind"] == "ciphertext" and copy["sha256"] == record["cipher_sha256"] and copy["status"] == "present"

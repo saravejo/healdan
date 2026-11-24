@@ -489,6 +489,10 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False, inventory_findings=No
                 # The execution guard will diagnose unproven deadlines or decisions for this material.
                 pass
             for index, copy in enumerate(record.get("copies", [])):
+                if copy.get("kind") is None and copy.get("status") == "unavailable" and copy.get("inventory_error"):
+                    findings.append({"material": identifier, "copy_index": index, "retention": "discovery",
+                                     "reason": copy["inventory_error"]})
+                    continue
                 if copy.get("status") in INACTIVE_COPIES:
                     continue
                 try:

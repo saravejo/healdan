@@ -46,9 +46,9 @@ def legacy_proof(repository, state):
         if record.get("kind") == "backup":
             continue
         for copy in record["copies"]:
-            root = Path(copy["root"])
             if copy["kind"] != "ciphertext":
                 continue
+            root = Path(copy["root"])
             require(root == state / "custody", "Controller ciphertext identifies a different external state", 5)
             if copy.get("status") == "present":
                 cipher = safe_path(root, copy["path"], exists=True)
@@ -142,6 +142,8 @@ def _references(repository, binding, worktrees):
 
     for record in _materials(repository):
         for copy in record["copies"]:
+            if copy.get("status") == "unavailable" and copy.get("kind") is None:
+                continue
             original = Path(copy["root"])
             target = relocated_path(original, binding)
             status = copy.get("status")

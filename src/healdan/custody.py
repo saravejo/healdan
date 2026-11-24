@@ -168,6 +168,8 @@ def integrity_findings(vault, *, records=None):
                     inspect_backup(vault, record, allow_retired=True)
                 continue
             live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
+            findings.extend((identifier, f"Custody copy {index}: {copy['inventory_error']}")
+                            for index, copy in enumerate(record.get("copies", [])) if copy.get("inventory_error"))
             if live and record.get("decryption_verified"):
                 if any(copy.get("kind") == "ciphertext" for copy in live):
                     capture_ciphertexts(vault, record, read_bytes=False)
@@ -672,7 +674,7 @@ def finish_reconstruction(vault, destination, path, journal):
             candidate = {"root": str(destination), "path": name, "sha256": entry["sha256"],
                          "kind": "native" if record.get("session") else "checkpoint", "status": "present",
                          "restoration": restoration}
-            if not any(copy["path"] == name and (copy.get("restoration") == restoration or
+            if not any(copy.get("path") == name and (copy.get("restoration") == restoration or
                        copy["status"] not in INACTIVE_COPIES and copy["kind"] == candidate["kind"] and
                        copy["sha256"] == candidate["sha256"] and vault.relocated_path(copy["root"]) == destination)
                        for copy in copies):
