@@ -1,4 +1,5 @@
 from datetime import timedelta
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -7,7 +8,7 @@ from uuid import uuid4
 
 from support import VaultTest
 from healdan import admission, backups, custody, inbox, originals, retention, setup, tasks, transactions
-from healdan.core import Blocked, atomic, digest, git, git_bytes, jsonl, read_json, stamp, utc
+from healdan.core import Blocked, atomic, digest, git, git_bytes, jsonl, read_json, run, stamp, utc
 from healdan.ids import reserve
 from healdan.knowledge import query
 
@@ -305,6 +306,107 @@ class OriginalAdmission(VaultTest):
         self.assertEqual(destination.read_bytes(), b"")
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(len(self.archive_receipts()), 2)
+
+    def test_archive_waits_for_pending_deletion_and_archives_independent_paths(self):
+        first, second, independent = "inbox/a/nota.txt", "inbox/b/nota.txt", "inbox/c/other.txt"
+        sha = self.triage_empty(first)
+        tracked = self.expiring_export("archive-copy", (self.root / "inbox", "a/nota.txt", "export"))
+        inbox.archive_empty(self.vault, sha)
+        archive_name = f"archive/{sha}/nota.txt"
+        destination = self.root / archive_name
+        original_receipts = self.archive_receipts()
+        now = "2026-04-15T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        with patch("healdan.retention.save_material", side_effect=OSError("Interrupted before custody update")):
+            interrupted = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(interrupted["entries"][0]["status"], "deleting")
+        self.assertFalse(destination.exists())
+        slot = interrupted["entries"][0]["copy_index"]
+        self.assertEqual(custody.materials(self.vault)[tracked["id"]]["copies"][slot]["status"], "present")
+
+        for source in (second, independent):
+            atomic(self.root / source, b"")
+        inbox.inventory(self.vault)
+        code, error = self.cli("inbox", "archive-empty", sha)
+        self.assertEqual(code, 5, error)
+        self.assertIn("Resume retention first", error["error"])
+        self.assertIn(second, error["error"])
+        self.assertIn(archive_name, error["error"])
+        self.assertNotIn(independent, error["error"])
+        self.assertEqual((self.root / second).read_bytes(), b"")
+        self.assertFalse(destination.exists())
+        self.assertFalse((self.root / independent).exists())
+        self.assertEqual((self.root / f"archive/{sha}/other.txt").read_bytes(), b"")
+        self.assertEqual(read_json(self.vault.control / inbox.ARCHIVE_JOURNAL), {})
+        self.assertIn(original_receipts[0], self.archive_receipts())
+
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertEqual(self.cli("inbox", "archive-empty", sha)[0], 0)
+        self.assertEqual(destination.read_bytes(), b"")
+        self.assertCountEqual([receipt["source"] for receipt in self.archive_receipts()], [first, second, independent])
+        copies = custody.materials(self.vault)[tracked["id"]]["copies"]
+        self.assertEqual(copies[slot]["status"], "deleted")
+        self.assertTrue(any(c["status"] == "present" and c["path"] == f"{sha}/nota.txt" for c in copies))
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertEqual(destination.read_bytes(), b"")
+
+    def test_absent_copy_during_deletion_waits_for_custody_reconciliation(self):
+        first, second = "inbox/a/nota.txt", "inbox/b/nota.txt"
+        sha = self.triage_empty(first)
+        self.expiring_export("archive-copy", (self.root / "inbox", "a/nota.txt", "export"))
+        inbox.archive_empty(self.vault, sha)
+        now = "2026-04-15T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        destination = self.root / "archive" / sha / "nota.txt"
+        destination.unlink()
+        with patch("healdan.retention.save_material", side_effect=OSError("Interrupted absent-copy reconciliation")):
+            result = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(result["entries"][0]["status"], "deleting")
+        atomic(self.root / second, b"")
+        inbox.inventory(self.vault)
+        with self.assertRaisesRegex(Blocked, "Resume retention first"):
+            inbox.archive_empty(self.vault, sha)
+        self.assertTrue((self.root / second).exists())
+        self.assertFalse(destination.exists())
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        inbox.archive_empty(self.vault, sha)
+        self.assertEqual(destination.read_bytes(), b"")
+
+    def test_retention_guard_recognizes_held_alias_of_canonical_storage(self):
+        root = self.state / "custody"
+        root.mkdir()
+        alias = self.state / "alternate storage"
+
+        def link_directory(link, target):
+            if os.name == "nt":
+                run(["cmd.exe", "/d", "/c", "mklink", "/J", link, target])
+                self.assertTrue(link.is_junction())
+            else:
+                link.symlink_to(target, target_is_directory=True)
+
+        link_directory(alias, root)
+        copy = {"root": str(root), "path": "only-declared.age", "kind": "ciphertext", "status": "present",
+                "sha256": digest(b"")}
+        free = {"id": "free", "kind": "export", "classification": "common", "holds": [], "dependencies": [],
+                "captured_at": "2026-04-01T00:00:00Z", "copies": [copy]}
+        held = {**free, "id": "held", "copies": [{**copy, "root": str(alias)}]}
+        custody.save_material(self.vault, free)
+        custody.save_material(self.vault, held)
+        custody.hold(self.vault, held["id"], "Protect the shared storage path", "human")
+        with self.assertRaisesRegex(Blocked, "Active hold"):
+            retention.guard(self.vault, free, copy, "2026-04-15T00:00:00Z")
+
+        offline = self.state / "offline"
+        offline.mkdir()
+        unresolved = self.state / "unresolved storage"
+        link_directory(unresolved, offline)
+        offline.rmdir()
+        held = custody.materials(self.vault)[held["id"]]
+        held["copies"][0]["root"] = str(unresolved)
+        custody.save_material(self.vault, held)
+        with self.assertRaisesRegex(Blocked, "Cannot verify storage location"):
+            retention.guard(self.vault, free, copy, "2026-04-15T00:00:00Z")
+        self.assertEqual(list(root.iterdir()), [])
 
     def test_original_bytes_survive_stage_commit_checkout_and_locators(self):
         git(self.root, "config", "core.autocrlf", "true")

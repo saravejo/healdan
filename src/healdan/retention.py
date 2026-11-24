@@ -1,9 +1,8 @@
 """Durable per-copy deletion plans with rechecks before every effect."""
-from os.path import abspath
 from pathlib import Path
 from uuid import uuid4
 
-from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, utc
+from .core import Blocked, atomic, canonical_storage_path, digest, read_json, require, safe_path, stamp, utc
 from .custody import INACTIVE_COPIES, materials, native_guard, retention_deadline, save_material
 from .inbox import pending_archive_paths
 from .tasks import all_tasks
@@ -26,7 +25,30 @@ def require_expired(record, now):
 
 
 def copy_path(vault, copy):
-    return Path(abspath(vault.relocated_path(copy["root"]) / copy["path"]))
+    return canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"])
+
+
+def copy_identity(copy):
+    state = {"status", "deleted_at", "moved_at", "move_receipt"}
+    return {key: value for key, value in copy.items() if key not in state}
+
+
+def pending_deletion_paths(vault):
+    root = safe_path(vault.control, "deletions")
+    inventory = materials(vault)
+    paths = set()
+    for path in root.glob("*.json"):
+        plan = read_json(safe_path(root, path.name, exists=True))
+        for entry in plan["entries"]:
+            if entry["status"] != "deleting":
+                continue
+            copies = inventory.get(entry["material"], {}).get("copies", [])
+            index = entry["copy_index"]
+            if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
+                    copy_identity(copies[index]) == copy_identity(entry["copy"])):
+                continue
+            paths.add(copy_path(vault, entry["copy"]))
+    return paths
 
 
 def guard(vault, record, copy, now):
@@ -69,9 +91,15 @@ def plan(vault, now=None):
             if not deadline or utc(now) < deadline:
                 continue
             for index, copy in enumerate(record.get("copies", [])):
-                if copy.get("status") not in INACTIVE_COPIES and copy_path(vault, copy) not in pending:
-                    entries.append({"material": record["id"], "copy_index": index, "copy": copy,
-                                    "status": "planned"})
+                if copy.get("status") in INACTIVE_COPIES:
+                    continue
+                try:
+                    if copy_path(vault, copy) in pending:
+                        continue
+                except Blocked:
+                    # Keep unverified copies in the plan for the execution guard to report.
+                    pass
+                entries.append({"material": record["id"], "copy_index": index, "copy": copy, "status": "planned"})
         result = {"id": str(uuid4()), "created_at": now, "entries": entries, "status": "planned"}
         result["digest"] = digest(result)
         atomic(vault.control / "deletions" / (result["id"] + ".json"), result)
@@ -92,9 +120,7 @@ def execute(vault, identifier, now=None):
             try:
                 material = materials(vault)[entry["material"]]
                 copy = material["copies"][entry["copy_index"]]
-                state = {"status", "deleted_at", "moved_at", "move_receipt"}
-                require({k: v for k, v in copy.items() if k not in state} ==
-                        {k: v for k, v in entry["copy"].items() if k not in state}, "Copy inventory changed", 5)
+                require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
                 if copy["status"] in INACTIVE_COPIES:
                     status = copy["status"]
                     entry.update(status=status, at=copy.get(f"{status}_at") or stamp(now))
@@ -102,11 +128,13 @@ def execute(vault, identifier, now=None):
                     atomic(path, record)
                     continue
                 target = guard(vault, material, copy, now)
-                if target.exists():
+                present = target.exists()
+                if present:
                     require(digest(target.read_bytes()) == copy["sha256"], "Copy hash changed; deletion stopped", 5)
-                    # The plan and intent are durable before unlink. Recovery rechecks the same path.
-                    entry["status"] = "deleting"
-                    atomic(path, record)
+                # Reserve the path until custody records the deletion, even if the file is already absent.
+                entry["status"] = "deleting"
+                atomic(path, record)
+                if present:
                     target.unlink()
                 require(not target.exists(), "Copy still exists after deletion", 5)
                 copy["status"] = "deleted"
@@ -115,7 +143,9 @@ def execute(vault, identifier, now=None):
                 entry.update(status="deleted", at=stamp(now))
                 entry.pop("error", None)
             except (Blocked, OSError, KeyError) as exc:
-                entry.update(status="pending", error=str(exc), at=stamp(now))
+                if entry["status"] != "deleting":
+                    entry["status"] = "pending"
+                entry.update(error=str(exc), at=stamp(now))
                 if entry["copy"].get("kind") == "native":
                     from .custody import hold
                     current = materials(vault).get(entry["material"], {})

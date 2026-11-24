@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from . import admission, custody
-from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, sync_directory, utc
+from .core import Blocked, atomic, canonical_storage_path, digest, read_json, require, safe_path, stamp, sync_directory, utc
 
 EXCLUDED = {"inbox/agent-activities-today.md", "inbox/manual-activities-today.md", "inbox/agent-dashboard.html"}
 ARCHIVE_JOURNAL = "zero-byte-archive.json"
@@ -130,11 +130,14 @@ def pending_archive_paths(vault):
     paths = set()
     for move in pending.values():
         roots = (vault.relocated_path(move["worktree"]),) if "worktree" in move else vault.repository.worktree_roots()
-        paths.update(root / move["payload"][key] for root in roots for key in ("source", "destination"))
+        paths.update(canonical_storage_path(root / move["payload"][key])
+                     for root in roots for key in ("source", "destination"))
     return paths
 
 
 def archive_empty(vault, sha256):
+    from .retention import pending_deletion_paths
+
     with vault.locked():
         path = vault.control / "inbox.json"
         items = read_json(path, {})
@@ -146,7 +149,8 @@ def archive_empty(vault, sha256):
                 "Only zero-byte ordinary material may auto-archive", 5)
         journal_path = safe_path(vault.control, ARCHIVE_JOURNAL)
         pending = read_json(journal_path, {})
-        moves = []
+        deletions = pending_deletion_paths(vault)
+        moves, blocked = [], []
         for relative in item["paths"]:
             require(ordinary(relative), "Only ordinary Inbox material may auto-archive", 5)
             source = safe_path(vault.root, relative)
@@ -157,6 +161,9 @@ def archive_empty(vault, sha256):
             if not source.exists() and not move:
                 continue
             target_name = f"archive/{sha256}/{Path(relative).name}"
+            if canonical_storage_path(source) in deletions or canonical_storage_path(vault.root / target_name) in deletions:
+                blocked.append(f"{relative} -> {target_name}")
+                continue
             target = empty_archive_target(vault, relative, target_name)
             if source.exists():
                 require(source.is_file() and source.read_bytes() == b"", "Inbox item changed: " + relative, 5)
@@ -190,6 +197,7 @@ def archive_empty(vault, sha256):
                 atomic(path, items)
             del pending[relative]
             atomic(journal_path, pending)
+        require(not blocked, "Resume retention first for the pending deletion: " + ", ".join(blocked), 5)
         return item
 
 

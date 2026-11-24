@@ -124,6 +124,25 @@ def sync_directory(path):
             os.close(directory)
 
 
+def canonical_storage_path(path):
+    original = current = Path(path)
+    message = "Cannot verify storage location: " + str(original)
+    require(original.is_absolute(), message, 5)
+    missing = []
+    try:
+        while True:
+            try:
+                resolved = current.resolve(strict=True)
+                require(not missing or resolved.is_dir(), message, 5)
+                return resolved.joinpath(*reversed(missing))
+            except FileNotFoundError:
+                require(current.parent != current and not current.is_symlink() and not current.is_junction(), message, 5)
+                missing.append(current.name)
+                current = current.parent
+    except (OSError, RuntimeError) as exc:
+        raise Blocked(message, 5) from exc
+
+
 def atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
