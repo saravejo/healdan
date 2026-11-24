@@ -22,16 +22,16 @@ def check_path(name, failures):
         failures.append("Forbidden publication path: " + name)
 
 
-def check_content(name, sha256, private, failures, reference_hashes):
+def check_content(name, sha256, private, failures, reference_hash):
     if private:
         failures.append("Possible credential in: " + name)
-    if sha256 in reference_hashes:
+    if reference_hash and (sha256 == reference_hash if isinstance(reference_hash, str) else sha256 in reference_hash):
         failures.append("Local reference content found under: " + name)
 
 
-def check(name, data, failures, reference_hashes):
+def check(name, data, failures, reference_hash):
     check_path(name, failures)
-    check_content(name, hashlib.sha256(data).hexdigest(), PRIVATE.search(data), failures, reference_hashes)
+    check_content(name, hashlib.sha256(data).hexdigest(), PRIVATE.search(data), failures, reference_hash)
 
 
 class AuditError(Exception):
@@ -59,6 +59,14 @@ class GitHistory:
         if (self.git("config", "--get", "extensions.partialclone", check=False) or
                 any(line.rsplit(b" ", 1)[-1] == b"true" for line in promisor.splitlines())):
             raise AuditError("Complete Git history is required. The repository uses a partial clone")
+        path = self.git("rev-parse", "--path-format=absolute", "--git-path", "info/grafts").rstrip(b"\r\n")
+        grafts = Path(os.fsdecode(path))
+        if grafts.is_symlink():
+            raise AuditError("Complete Git history is required. The repository uses local grafts")
+        lines = grafts.read_bytes().splitlines() if grafts.exists() else []
+        if any(line and not line.startswith(b"#") for line in map(bytes.strip, lines)):
+            raise AuditError("Complete Git history is required. The repository uses local grafts")
+        self.env["GIT_GRAFT_FILE"] = os.devnull
 
     def occurrences(self, head, failures):
         """Deduplicate identical trees and keep every distinct path of a reachable blob."""

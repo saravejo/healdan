@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -45,6 +46,9 @@ class NativeTrialIdentity(VaultTest):
         self.assertEqual(path.read_bytes(), original)
 
     def test_changes_to_build_dependency_and_config_expire_only_the_applicable_trials(self):
+        backup_key = self.base / "separate backup key fixture"
+        atomic(backup_key, b"synthetic key material")
+        self.vault.config["backup_signing_key"] = str(backup_key)
         for name in ("claude-auth", "offline-recovery", "launchd"):
             maintenance.attest(self.vault, name, self.evidence(name))
         self.assertTrue(self.statuses()["offline-recovery"]["passed"])
@@ -57,6 +61,17 @@ class NativeTrialIdentity(VaultTest):
         self.assertFalse(statuses["claude-auth"]["passed"])
         self.assertTrue(statuses["offline-recovery"]["passed"])
         self.versions["node"] = "v22.12.0"
+        atomic(backup_key, b"changed synthetic key material")
+        statuses = self.statuses()
+        self.assertTrue(statuses["claude-auth"]["passed"])
+        self.assertFalse(statuses["offline-recovery"]["passed"])
+        self.assertFalse(statuses["launchd"]["passed"])
+        atomic(backup_key, b"synthetic key material")
+        self.vault.config["backup_signing_key"] = str(backup_key.with_name("missing key fixture"))
+        statuses = self.statuses()
+        self.assertRegex(statuses["offline-recovery"]["reason"], "Backup signing key is unavailable")
+        self.assertRegex(statuses["launchd"]["reason"], "Backup signing key is unavailable")
+        self.vault.config["backup_signing_key"] = str(backup_key)
         self.vault.config["offline_recipients"] = ["new recipient"]
         statuses = self.statuses()
         self.assertTrue(statuses["claude-auth"]["passed"])
@@ -86,6 +101,20 @@ class NativeTrialIdentity(VaultTest):
         sibling = self.base / "new bound vault"
         initialize(sibling, self.base / "sibling state")
         vault = Vault(sibling)
+        escape = self.state / ".." / vault.state.name / "authentication"
+        alias = self.state / "aliased profile"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(vault.state / "authentication"), str(alias))
+        else:
+            alias.symlink_to(vault.state / "authentication", target_is_directory=True)
+        for candidate in (escape, alias):
+            with self.assertRaises(Blocked):
+                trials.environment(self.vault, "claude-auth", candidate)
+            self.vault.config["native_trial_profiles"] = {"claude-auth": str(candidate)}
+            with self.assertRaises(Blocked):
+                trials.environment(self.vault, "claude-auth")
+            del self.vault.config["native_trial_profiles"]
         vault.config.update(self.vault.config)
         other_receipt = maintenance.attest(self.vault, "offline-recovery", self.evidence("offline-recovery"))
         atomic(vault.control / "trials/v2/offline-recovery.json", other_receipt)
@@ -99,7 +128,16 @@ class NativeTrialIdentity(VaultTest):
         maintenance.attest(self.vault, "claude-auth", self.evidence("claude-auth"))
         self.assertEqual(old.read_bytes(), bytes_before)
         self.assertEqual([row["name"] for row in self.statuses().values() if not row["passed"]], list(trials.TRIALS[1:]))
-        with patch("healdan.setup.doctor", return_value={"ready": all(r["passed"] for r in self.statuses().values())}):
+        with patch("healdan.setup.doctor", return_value={"ready": all(r["passed"] for r in self.statuses().values())}) as gate, \
+                patch("healdan.linting.lint") as lint, patch("healdan.maintenance.daily") as daily:
             with self.assertRaisesRegex(Blocked, "native trials must pass"):
                 maintenance.schedule(self.vault, activate=True)
+            for job in ("lint", "daily"):
+                with self.assertRaisesRegex(Blocked, "native trials must pass"):
+                    maintenance.run_scheduled(self.vault, job, self.vault.identity)
+            lint.assert_not_called()
+            daily.assert_not_called()
+            gate.return_value = {"ready": True}
+            self.assertEqual(maintenance.run_scheduled(self.vault, "lint", self.vault.identity), lint.return_value)
+            self.assertEqual(maintenance.run_scheduled(self.vault, "daily", self.vault.identity), daily.return_value)
         self.assertFalse((self.state / "launchd").exists())

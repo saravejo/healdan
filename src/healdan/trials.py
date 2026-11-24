@@ -11,7 +11,7 @@ TRIAL_FORMAT = "healdan-native-trial-v2"
 TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", "launchd")
 PROFILE_TRIALS = frozenset(TRIALS[:3])
 PROFILE_CONFIG = ("signing_key", "age_identity", "backup_signing_key", "storage_roots", "backup_destinations")
-RECOVERY_CONFIG = ("age_recipients", "offline_recipients", "age_identity", "backup_signing_identity",
+RECOVERY_CONFIG = ("age_recipients", "offline_recipients", "age_identity", "backup_signing_identity", "backup_signing_key",
                    "backup_allowed_signers", "backup_destinations", "storage_roots")
 SCHEDULE_CONFIG = (*RECOVERY_CONFIG, "backup_generation_days", "backup_interval_hours")
 TOOL_ARGUMENTS = {"claude": ("--version",), "node": ("--version",), "srt": ("--version",),
@@ -29,14 +29,27 @@ def _tool(name):
     return result
 
 
+def _profile_directory(vault, path):
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts and path != vault.state and path.is_relative_to(vault.state),
+            "Native trial profile must use a canonical path in the selected vault state", 5)
+    path = safe_path(vault.state, path.relative_to(vault.state))
+    require(path.is_dir() and path.resolve() == path, "Native trial profile directory is unavailable or aliased", 5)
+    require(not any(path.is_relative_to(root) for root in vault.repository.worktree_roots()),
+            "Native trial profile must remain outside vault worktrees", 5)
+    return path
+
+
 def _profile(vault, name, requested):
-    configured = vault.config.get("native_trial_profiles", {}).get(name)
-    if configured:
-        configured = vault.relocated_path(configured)
-        require(requested is None or Path(requested) == configured, "Trial used a different configured profile", 5)
-    path = Path(configured or requested or vault.state / "authentication")
-    require(path.is_absolute() and path != vault.state and path.is_relative_to(vault.state),
-            "Native trial profile must be in the selected vault state", 5)
+    options = vault.config.get("native_trial_profiles", {})
+    require(isinstance(options, dict), "Native trial profiles must map trial names to paths", 5)
+    configured = options.get(name)
+    if configured is not None:
+        configured = _profile_directory(vault, vault.relocated_path(configured))
+    if requested is not None:
+        requested = _profile_directory(vault, requested)
+    require(configured is None or requested is None or requested == configured, "Trial used a different configured profile", 5)
+    path = configured or requested or _profile_directory(vault, vault.state / "authentication")
     settings = safe_path(path, "settings.json", exists=True)
     files = {"settings.json": digest(settings.read_bytes())}
     for name in (".claude.json", "settings.local.json"):
@@ -46,7 +59,7 @@ def _profile(vault, name, requested):
     return {"path": str(path), "configuration": files}
 
 
-def _config_receipt(vault, names):
+def _config_receipt(vault, names, *, recovery):
     values = {name: vault.config.get(name) for name in names}
     if "backup_allowed_signers" in values and values["backup_allowed_signers"]:
         path = Path(values["backup_allowed_signers"])
@@ -56,6 +69,14 @@ def _config_receipt(vault, names):
         path = Path(values["age_identity"])
         require(path.is_absolute() and path.is_file(), "Operational age identity is unavailable", 5)
         values["age_identity_sha256"] = digest(path.read_bytes())
+    if recovery and values.get("backup_signing_key"):
+        key = Path(values["backup_signing_key"])
+        require(key.is_absolute() and key.is_file(), "Backup signing key is unavailable", 5)
+        effective = key.resolve()
+        require(effective != Path(vault.config.get("signing_key") or "").resolve() and
+                not any(effective.is_relative_to(root) for root in vault.repository.worktree_roots()),
+                "A separate external backup signing key is required", 5)
+        values["backup_signing_key"] = {"path": str(effective), "sha256": digest(effective.read_bytes())}
     return digest(values)
 
 
@@ -95,7 +116,7 @@ def environment(vault, name, profile=None, *, build=None, measured_tools=None):
     if "srt" in values["tools"]:
         from .launcher import validate_runtime
         validate_runtime(vault, values["tools"]["srt"]["version"], values["tools"]["node"]["version"])
-    values["config_sha256"] = _config_receipt(vault, relevant)
+    values["config_sha256"] = _config_receipt(vault, relevant, recovery=name in {"offline-recovery", "launchd"})
     return values
 
 

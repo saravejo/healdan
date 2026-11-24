@@ -46,14 +46,27 @@ def schedule(vault, *, activate=False):
         return _schedule(vault, activate=activate)
 
 
+def run_scheduled(vault, job, expected_vault):
+    from .setup import doctor
+    from .linting import lint
+
+    require(job in {"lint", "daily"}, "Unknown scheduled job", 2)
+    require(expected_vault == vault.identity and vault.root == vault.repository.primary,
+            "The scheduled command must name its vault identity and primary worktree", 5)
+    with vault.locked():
+        vault.refresh_settings()
+        require(doctor(vault)["ready"], "Configuration and native trials must pass before running a scheduled job", 5)
+        return lint(vault) if job == "lint" else daily(vault)
+
+
 def schedule_definitions(vault, build=None):
     build = build if build is not None else active(vault)
     definitions = []
     for job, calendar in vault.policy["schedules"].items():
         label = f"org.healdan.{vault.identity}.{job}"
-        command = ["lint"] if job == "lint" else ["maintenance", "daily"]
         definitions.append({"Label": label, "ProgramArguments": [str(build.entry_point), "--vault", str(vault.repository.primary),
-                 "--state", str(vault.state), "--vault-id", vault.identity, *command], "StartCalendarInterval": calendar,
+                 "--state", str(vault.state), "--vault-id", vault.identity, "maintenance", "run-scheduled", job],
+                 "StartCalendarInterval": calendar,
                  "StandardOutPath": str(vault.state / (job + ".out")),
                  "StandardErrorPath": str(vault.state / (job + ".err"))})
     return definitions

@@ -13,6 +13,11 @@ CONFIG_PATHS = ("allowed_signers", "signing_key", "age_identity", "backup_signin
 CONFIG_ROOTS = ("storage_roots", "backup_destinations")
 
 
+def git_location(directory, value):
+    path = Path(value)
+    return (path if path.is_absolute() else directory / path).resolve()
+
+
 @dataclass(frozen=True)
 class Repository:
     root: Path
@@ -39,11 +44,23 @@ class Repository:
     def default_state(self):
         return (Path.home() / ".local/share/healdan" / digest(str(self.common))[:20]).resolve()
 
+    def linked_worktrees(self):
+        for admin in sorted(safe_path(self.common, "worktrees").glob("*")):
+            pointer = safe_path(self.common, f"worktrees/{admin.name}/gitdir", exists=True)
+            linked = git_location(admin, pointer.read_text(encoding="utf-8").rstrip("\r\n"))
+            require(linked.name == ".git", "Invalid linked worktree Git metadata", 5)
+            yield admin, linked
+
+    def worktree_roots(self):
+        return {self.root, self.primary, *(path.parent for _, path in self.linked_worktrees())}
+
     def location(self, state):
         state = Path(state).resolve()
         require(all(not state.is_relative_to(p) and not p.is_relative_to(state)
                     for p in (self.primary, self.common)),
-                "Controller state must be separate from the primary vault and Git common directory")
+                "Controller state must be separate from the primary vault and Git common directory", 5)
+        require(not any(state.is_relative_to(root) for root in self.worktree_roots()),
+                "Controller state must be outside every registered vault worktree", 5)
         require(not state.exists() or state.is_dir(), "Controller state must be a directory")
         return dict(root=str(self.primary), common=str(self.common), state=str(state))
 

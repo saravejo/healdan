@@ -3,9 +3,11 @@ from concurrent.futures import ThreadPoolExecutor
 import csv
 import hashlib
 from io import StringIO
+import os
 from pathlib import Path
 import sys
 from unittest.mock import patch
+import venv
 import zipfile
 
 from support import VaultTest
@@ -69,8 +71,27 @@ class ImmutableInstallation(VaultTest):
         self.assertEqual(self.identity(a.entry_point), a.identity)
         self.assertEqual(self.identity(a.entry_point, sibling), b.identity)
         self.assertEqual(self.identity(b.entry_point), a.identity)
-        self.assertEqual(maintenance.schedule_definitions(self.vault)[0]["ProgramArguments"][0], str(a.entry_point))
+        scheduled = next(row["ProgramArguments"] for row in maintenance.schedule_definitions(self.vault)
+                         if row["ProgramArguments"][-1] == "lint")
+        self.assertEqual(scheduled[0], str(a.entry_point))
+        self.assertEqual(scheduled[-3:], ["maintenance", "run-scheduled", "lint"])
         self.assertEqual(maintenance.schedule_definitions(Vault(sibling))[0]["ProgramArguments"][0], str(b.entry_point))
+        stale = Vault(self.root)
+        stale.controller_selection = build.read_selection(stale.control, stale.identity)
+        self.activate(b)
+        before = {path: path.read_bytes() for path in stale.control.rglob("*") if path.is_file()}
+        result = run(scheduled, cwd=self.root, env=installation.isolated_environment(), check=False)
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("native trials must pass", decode(result.stdout)["error"])
+        self.assertEqual({path: path.read_bytes() for path in stale.control.rglob("*") if path.is_file()}, before)
+        with patch("healdan.setup.doctor") as doctor:
+            with self.assertRaisesRegex(Blocked, "Controller selection changed"):
+                maintenance.run_scheduled(stale, "lint", stale.identity)
+        doctor.assert_not_called()
+        manual = run([a.entry_point, "--vault", self.root, "lint"], cwd=self.root,
+                     env=installation.isolated_environment(), check=False)
+        self.assertIn(manual.returncode, (0, 5))
+        self.assertTrue((stale.control / "lint-state.json").exists())
         verifier = Path(__file__).resolve().parent.parent / "scripts/release_check.py"
         release = run([sys.executable, "-I", verifier, "--vault", sibling], cwd=verifier.parent.parent, check=False)
         self.assertEqual(release.returncode, 5)
@@ -81,9 +102,14 @@ class ImmutableInstallation(VaultTest):
 
     def test_concurrent_repeat_reuses_verified_environment(self):
         wheel = wheel_fixture(self.base / "same wheel", "same")
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            a, b = list(pool.map(lambda _: installation.prepare(wheel, self.store), range(2)))
+        make_venv = venv.EnvBuilder
+        with patch("healdan.installation.venv.EnvBuilder",
+                   side_effect=lambda **kwargs: make_venv(symlinks=os.name != "nt", **kwargs)):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                a, b = list(pool.map(lambda _: installation.prepare(wheel, self.store), range(2)))
         self.assertEqual(a, b)
+        if os.name != "nt":
+            self.assertTrue(a.python.is_symlink())
         receipt = (a.prefix / build.BUILD_RECEIPT).read_bytes()
         with patch("healdan.installation._install") as install:
             self.assertEqual(a, installation.prepare(wheel, self.store))
@@ -145,10 +171,33 @@ class ImmutableInstallation(VaultTest):
             else:
                 path.unlink()
         tampered = b.prefix / b.manifest["layout"]["site_packages"] / "healdan/defaults.json"
+        default_bytes = tampered.read_bytes()
         atomic(tampered, b"tampered")
         with self.assertRaisesRegex(Blocked, "differs from the wheel"):
             self.activate(b, Vault(self.root))
         self.assertEqual(selected.read_bytes(), selector)
+        atomic(tampered, default_bytes)
+        site = b.prefix / b.manifest["layout"]["site_packages"]
+        run([b.python, "-I", "-c", "import healdan"], env=installation.isolated_environment())
+        self.assertTrue((site / "healdan/__pycache__").is_dir())
+        self.assertEqual(build.verify_build(b.prefix).identity, b.identity)
+        for startup in (site / "fixture.pth", site / "sitecustomize.py", b.python.with_name("python._pth")):
+            atomic(startup, b"# Synthetic startup fixture\n")
+            with self.assertRaisesRegex(Blocked, "does not match the verified wheel and environment"):
+                self.activate(b, Vault(self.root))
+            self.assertEqual(selected.read_bytes(), selector)
+            startup.unlink()
+        if b.python.is_symlink():
+            b.python.unlink()
+        b.python.write_bytes(b"synthetic damaged executable")
+        if os.name != "nt":
+            b.python.chmod(0o700)
+        with self.assertRaisesRegex(Blocked, "does not match the verified wheel and environment"):
+            build.verify_build(b.prefix)
+        with self.assertRaisesRegex(Blocked, "does not match the verified wheel and environment"):
+            self.activate(b, Vault(self.root))
+        self.assertEqual(selected.read_bytes(), selector)
+        self.assertEqual(self.identity(a.entry_point), a.identity)
 
     def test_migrating_one_vault_preserves_shared_legacy_environment(self):
         legacy_home = self.base / "legacy controller home"
@@ -175,6 +224,21 @@ class ImmutableInstallation(VaultTest):
         git(self.root, "worktree", "add", "--detach", str(branch))
         task = tasks.create(self.vault, "Task with a divergent registry")
         selection = (self.vault.control / build.SELECTION).read_bytes()
+        nested = branch / "nested build store"
+        wheel = b.prefix / "artifact" / b.manifest["wheel"]
+        code, result = self.cli("build", "prepare", wheel, "--store", nested)
+        self.assertEqual(code, 5)
+        self.assertIn("outside all vault worktrees", result["error"])
+        script = Path(__file__).resolve().parent.parent / "scripts/setup.py"
+        result = run([sys.executable, "-I", script, "--vault", self.root, "--wheel", wheel, "--store", nested,
+                      "--prepare-only", "--no-interactive"], check=False)
+        self.assertEqual(result.returncode, 5)
+        self.assertFalse(nested.exists())
+        attempted = installation.prepare(wheel, nested)
+        for target in (self.root, branch):
+            with self.assertRaisesRegex(Blocked, "outside all vault worktrees"):
+                build.activate(Vault(target), attempted.identity["sha256"], nested)
+            self.assertEqual((self.vault.control / build.SELECTION).read_bytes(), selection)
         for target in (self.root, Path(task["worktree"])):
             registry = target / "wiki/control/query-cases.jsonl"
             original = registry.read_bytes()

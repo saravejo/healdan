@@ -134,6 +134,8 @@ def parser():
     execute.add_argument("plan")
     schedule = maintenance.add_parser("schedule")
     schedule.add_argument("--activate", action="store_true")
+    scheduled = maintenance.add_parser("run-scheduled", help=argparse.SUPPRESS)
+    scheduled.add_argument("job", choices=("lint", "daily"))
     attest = maintenance.add_parser("attest")
     attest.add_argument("trial")
     attest.add_argument("evidence", type=Path)
@@ -185,6 +187,8 @@ def dispatch(args):
         return change(args.vault, args.state, args.confirm)
     if args.command == "build" and args.action == "prepare":
         from .installation import prepare
+        if (Path(args.vault).resolve() / ".git").exists() or args.state is not None:
+            build.validate_store(args.store if args.store is not None else build.store_path(), args.vault, args.state)
         prepared = prepare(args.wheel, args.store)
         return {"build": prepared.identity, "controller": str(prepared.entry_point)}
     external_recovery = (args.command, getattr(args, "action", None)) in {
@@ -309,6 +313,9 @@ def dispatch(args):
     if args.command == "apply":
         return transactions.apply(vault, args.package, recover=args.recover)
     if args.command == "maintenance":
+        if args.action == "run-scheduled":
+            result = maintenance.run_scheduled(vault, args.job, args.vault_id)
+            return result, 5 if args.job == "lint" and (result["status"] != "complete" or result["findings"]) else 0
         if args.action == "daily":
             return maintenance.daily(vault)
         if args.action == "plan":

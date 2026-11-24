@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
+from hashlib import file_digest
 from io import BytesIO
 import os
 from pathlib import Path, PurePosixPath
@@ -29,8 +30,20 @@ def store_path():
 def external(prefix, repository, state):
     resolved = Path(prefix).resolve()
     require(all(not resolved.is_relative_to(path) and not path.is_relative_to(resolved)
-                for path in (repository.primary, repository.common, Path(state))),
-            "Controller installations must stay outside the vault and external state", 5)
+                for path in {*repository.worktree_roots(), repository.common, Path(state).resolve()}),
+            "Controller installations must stay outside all vault worktrees and external state", 5)
+
+
+def validate_store(store, root, state):
+    from .binding import Repository, marker
+
+    root = Path(root).resolve()
+    repository = Repository.open(root) if (root / ".git").exists() else Repository(root, root, root / ".git")
+    existing = marker(repository.control)
+    selected = existing["location"]["state"] if existing else repository.default_state
+    external(store, repository, selected)
+    if state is not None and Path(state).resolve() != Path(selected):
+        external(store, repository, state)
 
 
 def program(prefix, command):
@@ -84,7 +97,32 @@ def _wheel_details(filename, body):
             "capabilities": caps, "files": files}
 
 
-def installed_layout(prefix, details):
+def _binary_identity(path):
+    path = Path(path).resolve()
+    require(path.is_file() and (os.name == "nt" or os.access(path, os.X_OK)),
+            "Controller interpreter is unavailable", 5)
+    with path.open("rb") as stream:
+        return {"path": str(path), "sha256": file_digest(stream, "sha256").hexdigest()}
+
+
+def _startup_files(prefix, site_packages, python):
+    files = {}
+    for path in sorted(site_packages.iterdir()):
+        name = path.name.lower()
+        if name.endswith(".pth") or name.split(".", 1)[0] in {"sitecustomize", "usercustomize"}:
+            require(path.is_file(), "Unexpected Python startup directory: " + path.name, 5)
+            relative = path.relative_to(prefix)
+            files[relative.as_posix()] = digest(safe_path(prefix, relative, exists=True).read_bytes())
+    for directory in {prefix, python.parent}:
+        for path in sorted(directory.iterdir()):
+            name = path.name.lower()
+            if name.endswith("._pth") or (directory != prefix and name == "pyvenv.cfg"):
+                relative = path.relative_to(prefix)
+                files[relative.as_posix()] = digest(safe_path(prefix, relative, exists=True).read_bytes())
+    return files
+
+
+def installed_layout(prefix, details, base_executable):
     candidates = ([prefix / "Lib/site-packages"] if os.name == "nt" else
                   list((prefix / "lib").glob("python*/site-packages")))
     candidates = [p for p in candidates if p.is_dir()]
@@ -99,10 +137,17 @@ def installed_layout(prefix, details):
             "Installed controller has unexpected files", 5)
     cfg = safe_path(prefix, "pyvenv.cfg", exists=True)
     entry = program(prefix, "healdan")
-    require(program(prefix, "python").is_file(), "Controller interpreter is unavailable", 5)
+    require(os.access(entry, os.X_OK), "Controller entry point is unavailable", 5)
+    python = program(prefix, "python")
+    safe_path(prefix, python.parent.relative_to(prefix))
+    base = _binary_identity(base_executable)
+    binaries = {"program": _binary_identity(python), "base": base}
+    if os.name == "nt":
+        binaries["windows_runtime"] = {p.name: _binary_identity(p) for p in sorted(Path(base["path"]).parent.glob("python3*.dll"))}
     return {"site_packages": site_packages.relative_to(prefix).as_posix(),
             "venv_config_sha256": digest(cfg.read_bytes()),
-            "entry_point_sha256": digest(safe_path(prefix, entry.relative_to(prefix), exists=True).read_bytes())}
+            "entry_point_sha256": digest(safe_path(prefix, entry.relative_to(prefix), exists=True).read_bytes()),
+            "python": binaries, "startup_files": _startup_files(prefix, site_packages, python)}
 
 
 @dataclass(frozen=True)
@@ -139,7 +184,10 @@ def verify_build(prefix):
     data = wheel.read_bytes()
     require(digest(data) == prefix.name, "Saved wheel digest differs from the selected controller", 5)
     details = wheel_details(wheel.name, data)
-    require(dict(details, layout=installed_layout(prefix, details)) == manifest,
+    base_executable = manifest.get("layout", {}).get("python", {}).get("base", {}).get("path")
+    require(isinstance(base_executable, str) and Path(base_executable).is_absolute(),
+            "Controller build manifest has no verified base interpreter", 5)
+    require(dict(details, layout=installed_layout(prefix, details, base_executable)) == manifest,
             "Controller build manifest does not match the verified wheel and environment", 5)
     return Build(prefix, manifest)
 
@@ -190,9 +238,9 @@ def activate(vault, sha256, store=None):
 
     require(SHA256.fullmatch(sha256), "Expected the prepared controller SHA-256", 2)
     prefix = Path(store if store is not None else store_path()).resolve() / sha256
-    external(prefix, vault.repository, vault.state)
-    build = verify_build(prefix)
     with vault.locked():
+        external(prefix, vault.repository, vault.state)
+        build = verify_build(prefix)
         previous = read_selection(vault.control, vault.identity)
         check(vault, build.manifest["capabilities"])
         selection = {"format": SELECTION_FORMAT, "vault_id": vault.identity, "prefix": str(build.prefix),

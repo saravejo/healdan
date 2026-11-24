@@ -66,8 +66,9 @@ trials in `docs/acceptance.md`. Record evidence with signed trial receipts.
 Open the repository directory in Obsidian. No community plugin is required.
 Use an external shell for controller commands, not the sandboxed agent shell.
 Only activate schedules after configuration and verified recovery using
-`healdan maintenance schedule`. Schedules use local calendar time; deadlines
-use elapsed UTC time. The daily job runs retention before backup.
+`healdan maintenance schedule --activate`. Each scheduled run checks the
+readiness of the active build. Schedules use local calendar time. Deadlines use
+elapsed UTC time. The daily job runs retention before backup.
 
 Troubleshooting: check `healdan status`, `healdan doctor`, the external state
 path, executable PATH, and the run receipt. An inaccessible backup destination

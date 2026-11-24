@@ -10,7 +10,7 @@ if sys.version_info < (3, 12):
 
 SOURCE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SOURCE / "src"))
-from healdan.build import store_path
+from healdan.build import store_path, validate_store
 from healdan.core import Blocked, canonical, require, run
 from healdan.installation import prepare, run_installed
 
@@ -25,9 +25,7 @@ def main():
     parser.add_argument("--interactive", action=argparse.BooleanOptionalAction, default=sys.stdin.isatty())
     args = parser.parse_args()
     try:
-        require(not args.store.resolve().is_relative_to(args.vault.resolve()) and
-                (args.state is None or not args.store.resolve().is_relative_to(args.state.resolve())),
-                "Controller installations must stay outside the vault and external state", 5)
+        validate_store(args.store, args.vault, args.state)
         if args.wheel:
             build = prepare(args.wheel, args.store)
         else:

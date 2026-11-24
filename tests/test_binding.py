@@ -55,6 +55,13 @@ class VaultBinding(VaultTest):
                              (self.vault.identity, self.vault.common, self.state))
         sibling = self.base / "another vault"
         git(self.root, "clone", "--no-local", str(self.root), str(sibling))
+        sibling_linked = self.base / "unbound linked worktree"
+        git(sibling, "worktree", "add", "--detach", str(sibling_linked))
+        nested_state = sibling_linked / "versionable state"
+        for root in (sibling, sibling_linked):
+            with self.assertRaisesRegex(Blocked, "outside every registered vault worktree"):
+                initialize(root, nested_state)
+            self.assertFalse(nested_state.exists())
         initialize(sibling, self.base / "other vault state")
         sibling_id = Vault(sibling).identity
         self.assertNotEqual(sibling_id, self.vault.identity)

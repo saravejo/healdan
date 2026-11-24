@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import venv
 
 from .build import BUILD_RECEIPT, Build, installed_layout, program, store_path, verify_build, wheel_details
@@ -28,10 +29,12 @@ def _smoke(prefix, details):
     env = isolated_environment()
     actual = run([command, "--version"], cwd=prefix, env=env).stdout.decode().strip()
     require(actual == details["version"], "Prepared controller entry point reports a different version", 5)
-    check = "import healdan, sys; print(sys.prefix); print(healdan.__file__)"
+    check = "import healdan, sys; print(sys.prefix); print(healdan.__file__); print(sys._base_executable)"
     lines = run([program(prefix, "python"), "-I", "-B", "-c", check], cwd=prefix, env=env).stdout.decode().splitlines()
-    require(len(lines) == 2 and Path(lines[0]).resolve() == prefix and
-            Path(lines[1]).resolve().is_relative_to(prefix), "Prepared controller did not load from the final venv", 5)
+    require(len(lines) == 3 and Path(lines[0]).resolve() == prefix and
+            Path(lines[1]).resolve().is_relative_to(prefix) and
+            Path(lines[2]).resolve() == Path(sys._base_executable).resolve(),
+            "Prepared controller did not load from the final venv with its recorded base interpreter", 5)
 
 
 def prepare(wheel, store=None):
@@ -57,8 +60,10 @@ def prepare(wheel, store=None):
         copied = prefix / "artifact" / wheel.name
         atomic(copied, data)
         _install(prefix, copied)
-        layout = installed_layout(prefix, details)
+        layout = installed_layout(prefix, details, sys._base_executable)
         _smoke(prefix, details)
+        require(installed_layout(prefix, details, sys._base_executable) == layout,
+                "Controller environment changed during the smoke test", 5)
         manifest = dict(details, layout=layout)
         atomic(manifest_path, manifest)
         pending.unlink()

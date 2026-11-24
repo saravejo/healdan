@@ -249,7 +249,7 @@ REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/contro
 
 class Vault:
     def __init__(self, root, state=None, *, operational=True):
-        from .binding import Repository, bound, project_config
+        from .binding import Repository, bound
         self.repository = Repository.open(root)
         self.root = self.repository.root
         self.common = self.repository.common
@@ -260,6 +260,14 @@ class Vault:
         self.config_path = self.state / "config.json"
         self._lock = threading.local()
         with self.locked():
+            self.refresh_settings()
+            if operational:
+                self.check_registries()
+
+    def refresh_settings(self):
+        from .binding import project_config
+
+        with self.locked():
             self.config = project_config(read_json(safe_path(self.state, "config.json"), {}), self.binding)
             self.policy = read_json(Path(__file__).with_name("defaults.json"))
             if "context_bytes" in self.config:
@@ -267,8 +275,6 @@ class Vault:
                 require(set(limits) == set(self.policy["context_bytes"]) and
                         all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
                 self.policy["context_bytes"] = limits
-            if operational:
-                self.check_registries()
 
     @contextlib.contextmanager
     def locked(self):

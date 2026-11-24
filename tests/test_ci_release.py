@@ -8,7 +8,7 @@ import zipfile
 
 from support import VaultTest
 from healdan.core import Blocked, atomic, canonical, decode, digest, git, run
-from scripts import ci_evidence as ci
+from scripts import audit_publication, ci_evidence as ci
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -171,6 +171,20 @@ class PublicationHistory(VaultTest):
         self.assertFalse(report["publication_audit"])
         self.assertFalse(report["stable_release_allowed"])
         self.assertTrue(all(not row["passed"] for row in report["trials"]))
+        failures = []
+        audit_publication.check("earlier-alias.md", body, failures, reference_hash=None)
+        self.assertEqual(failures, [])
+        audit_publication.check("earlier-alias.md", body, failures, reference_hash=digest(body))
+        self.assertEqual(failures, ["Local reference content found under: earlier-alias.md"])
+        linked = self.base / "history worktree"
+        git(self.root, "worktree", "add", "--detach", str(linked))
+        head = self.vault.head()
+        atomic(self.vault.common / "info/grafts", (head + "\n").encode())
+        self.assertEqual(git(self.root, "log", "--format=%H").splitlines(), [head])
+        for target in (self.root, linked):
+            result = self.audit(target, "--expected-commit", head)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b"local grafts", result.stdout)
 
     def test_extra_branch_and_detached_head_are_both_audited(self):
         git(self.root, "checkout", "--detach")

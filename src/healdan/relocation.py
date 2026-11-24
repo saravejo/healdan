@@ -5,15 +5,10 @@ from pathlib import Path
 import platform
 import plistlib
 
-from .binding import CONFIG_PATHS, CONFIG_ROOTS, relocated_path
+from .binding import CONFIG_PATHS, CONFIG_ROOTS, git_location, relocated_path
 from .core import atomic, digest, executable, git, read_json, require, run, safe_path
 
 SESSION_PATHS = ("proposal", "active_profile", "recovery_profile")
-
-
-def _absolute(base, value):
-    path = Path(value)
-    return (path if path.is_absolute() else base / path).resolve()
 
 
 def _records(repository, directory):
@@ -21,18 +16,10 @@ def _records(repository, directory):
         yield read_json(safe_path(repository.control, f"{directory}/{path.name}", exists=True))
 
 
-def _metadata(repository):
-    for admin in sorted(safe_path(repository.common, "worktrees").glob("*")):
-        pointer = safe_path(repository.common, f"worktrees/{admin.name}/gitdir", exists=True)
-        linked = _absolute(admin, pointer.read_text(encoding="utf-8").rstrip("\r\n"))
-        require(linked.name == ".git", "Invalid linked worktree Git metadata", 5)
-        yield admin, linked
-
-
 def _backlink(linked):
     text = safe_path(linked.parent, ".git", exists=True).read_text(encoding="utf-8").rstrip("\r\n")
     require(text.startswith("gitdir: "), "Invalid linked worktree backlink: " + str(linked), 5)
-    return _absolute(linked.parent, text.removeprefix("gitdir: "))
+    return git_location(linked.parent, text.removeprefix("gitdir: "))
 
 
 def _materials(repository):
@@ -42,7 +29,7 @@ def _materials(repository):
 def legacy_proof(repository, state):
     """Only a recorded path and independently verifiable evidence establish custom provenance."""
     proof = []
-    linked = {path.parent: admin for admin, path in _metadata(repository)}
+    linked = {path.parent: admin for admin, path in repository.linked_worktrees()}
     for task in _records(repository, "tasks"):
         worktree = Path(task["worktree"])
         require(worktree == state / "tasks" / task["id"] / "worktree",
@@ -75,7 +62,7 @@ def _linked_worktrees(repository, old, new):
     """Validate both ends of every registered link, including links that need repair."""
     worktrees = []
     previous_common = Path(old["location"]["common"])
-    for admin, linked in _metadata(repository):
+    for admin, linked in repository.linked_worktrees():
         target = relocated_path(linked, new)
         expected = previous_common / admin.relative_to(repository.common)
         backlink = _backlink(target)
@@ -172,7 +159,11 @@ def _plists(binding):
             command = command[2:]
         else:
             args[5:5] = ["--vault-id", binding["vault_id"]]
-        require(command in (["lint"], ["maintenance", "daily"]), "Unrecognized launchd command: " + str(path), 5)
+        if command in (["lint"], ["maintenance", "daily"]):
+            args[-len(command):] = ["maintenance", "run-scheduled", command[-1]]
+        else:
+            require(len(command) == 3 and command[:2] == ["maintenance", "run-scheduled"] and command[2] in {"lint", "daily"},
+                    "Unrecognized launchd command: " + str(path), 5)
         args[2] = str(relocated_path(args[2], binding))
         args[4] = str(relocated_path(args[4], binding))
         require(Path(args[2]) == Path(binding["location"]["root"]) and Path(args[4]) == state,
