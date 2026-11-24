@@ -37,6 +37,7 @@
     "test_backup_portable.BackupPortable.test_1_daily_reports_restored_task_and_continues_independent_work",
     "test_backup_portable.BackupPortable.test_1_deleted_replica_proof_after_origin_rebind",
     "test_backup_portable.BackupPortable.test_1_destination_retry_and_verified_bytes",
+    "test_backup_portable.BackupPortable.test_1_historical_falsy_native_trial_profiles_are_preserved",
     "test_backup_portable.BackupPortable.test_1_invalid_native_trial_evidence_blocks_backup_publication",
     "test_backup_portable.BackupPortable.test_1_invalid_replica_inventory_does_not_block_fallback",
     "test_backup_portable.BackupPortable.test_1_invalid_replica_or_manifest",

@@ -16,6 +16,7 @@ TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", 
 RECEIPT_FOLDERS = ("trials", "trials/v2")
 RECEIPTS = {f"{folder}/{name}.json": (name, folder == "trials/v2") for folder in RECEIPT_FOLDERS for name in TRIALS}
 PROFILE_TRIALS = frozenset(TRIALS[:3])
+DEFAULT_PROFILE = "authentication"
 PROFILE_POLICY_FIELDS = {"srt_version", "cleanupPeriodDays", "context_bytes"}
 PROFILE_OPTIONAL_FILES = (".claude.json", "settings.local.json")
 PROFILE_TOOLS = ("claude", "node", "srt")
@@ -62,7 +63,7 @@ def _profile(vault, name, requested):
     if requested is not None:
         requested = _profile_directory(vault, requested)
     require(configured is None or requested is None or requested == configured, "Trial used a different configured profile", 5)
-    path = configured or requested or _profile_directory(vault, vault.state / "authentication")
+    path = configured or requested or _profile_directory(vault, vault.state / DEFAULT_PROFILE)
     settings = safe_path(path, "settings.json", exists=True)
     files = {"settings.json": digest(settings.read_bytes())}
     for name in PROFILE_OPTIONAL_FILES:
@@ -291,8 +292,12 @@ def check_preserved_evidence(payload, name, *, versioned):
         require(measured_environment_shape(measured) and measured["profile"]["trial"] == name,
                 "Invalid measured trial environment", 5)
         requested = payload.get("profile")
-        require(requested is None or name in PROFILE_TRIALS and _absolute_path(requested) == _absolute_path(measured["profile"]["path"]),
-                "Invalid measured trial profile", 5)
+        if requested is not None:
+            require(name in PROFILE_TRIALS, "Invalid measured trial profile", 5)
+            measured_path = _absolute_path(measured["profile"]["path"])
+            # The first v2 producer selected the default profile for false JSON values.
+            matches = _absolute_path(requested) == measured_path if requested else measured_path.name == DEFAULT_PROFILE
+            require(matches, "Invalid measured trial profile", 5)
         paths = [_absolute_path(artifact["path"]) for artifact in artifacts]
         require(None not in paths and len(set(paths)) == len(paths), "Invalid measured trial artifact paths", 5)
 

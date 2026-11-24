@@ -1136,6 +1136,40 @@ class BackupPortable(VaultTest):
             measurements = trials.environment(vault, name, build=build)
         return artifact, evidence, measurements
 
+    def test_1_historical_falsy_native_trial_profiles_are_preserved(self):
+        self.configure()
+        nominal_bytes, mirror_bytes = {}, {}
+        # The first v2 producer used the default profile for these JSON values.
+        for name, nominal_profile, former_profile in (
+            ("claude-auth", "", []), ("native-resume", False, {}), ("native-cleanup", 0, 0.0),
+        ):
+            _, evidence, measured = self.trial_evidence(name)
+            self.assertEqual(Path(measured["profile"]["path"]), self.state / "authentication")
+            payload = {**evidence, "name": name, "format": trials.TRIAL_FORMAT, "environment": measured}
+            former = human_sign(self.vault, {**payload, "profile": former_profile}, "trial")
+            nominal = human_sign(self.vault, {**payload, "profile": nominal_profile}, "trial")
+            path = f"trials/v2/{name}.json"
+            nominal_bytes[path] = b"\n" + canonical(nominal) + b"\r\n"
+            atomic(self.vault.control / path, nominal_bytes[path])
+            for receipt in (self.vault.control / "receipts").glob("*.json"):
+                if read_json(receipt).get("payload") in (former, nominal):
+                    mirror_bytes[f"receipts/{receipt.name}"] = receipt.read_bytes()
+        self.assertEqual(len(mirror_bytes), 6)
+
+        record = self.create()
+        plain = custody.decrypt(self.vault, self.paths(record)[1].read_bytes())
+        contents = backup_snapshot.check_entries(decode(plain), record["approval"]["payload"])
+        outcome = self.restore(record)
+        restored = Vault(outcome["destination"], outcome["state"])
+        for path, body in nominal_bytes.items():
+            self.assertEqual(contents[backup_snapshot.STATE + path], body)
+            self.assertEqual((restored.control / "historical" / path).read_bytes(), body)
+            self.assertFalse((restored.control / path).exists())
+        for path, body in mirror_bytes.items():
+            self.assertEqual(contents[backup_snapshot.STATE + path], body)
+            self.assertEqual((restored.control / path).read_bytes(), body)
+        self.assertFalse(any(row["passed"] for row in trials.status(restored)))
+
     def test_1_native_trial_receipts_survive_as_inactive_history(self):
         self.configure()
         name = "offline-recovery"
@@ -1378,6 +1412,7 @@ class BackupPortable(VaultTest):
             (self.signed({**payload, "environment": {**measured, "tools": unrelated_tool}}, "trial"), "measured trial environment"),
             (self.signed({**payload, "procedure": {"steps": ["Disposable"]}}, "trial"), "a procedure"),
             (self.signed({**payload, "procedure": " \t"}, "trial"), "a procedure"),
+            (self.signed({**payload, "profile": False}, "trial"), "measured trial profile"),
             (self.signed({**payload, "artifacts": [{"path": "/origin/fixture", "sha256": "invalid"}]}, "trial"), "artifact inventory"),
             (self.signed({**payload, **legacy_extras, "artifacts": evidence["artifacts"] * 2}, "trial"), "measured trial artifact paths"),
             (self.signed({**payload, "completed_at": "2026-01-01T00:00:00Z"}, "trial"), "Invalid trial times"),
