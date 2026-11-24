@@ -15,35 +15,81 @@ TRIAL_MARKER = "launchd-trial.json"
 
 
 def daily(vault, now=None):
-    from . import backups, retention
-    from .tasks import all_tasks, reconcile_clock, reconcile_expired, preserve_and_close
-    notices = []
+    from . import retention
+    from .tasks import all_tasks, get_task, reconcile_clock, reconcile_expired, preserve_and_close
+
+    now = utc(now)
+    notices, pending, results = [], [], []
     for task in all_tasks(vault):
-        if task.get("capacity_held"):
-            with vault.locked():
+        with vault.locked():
+            task = get_task(vault, task["id"])
+            if task.get("capacity_held"):
                 updates = reconcile_clock(vault, task, now)
                 notices.extend({"task": task["id"], "notice": update} for update in updates)
-            try:
-                if task.get("closure_pending"):
-                    preserve_and_close(vault, task["id"], reason="human_timeout")
-                elif task.get("worktree_expired"):
-                    reconcile_expired(vault, task["id"])
-            except Blocked as exc:
-                return {"status": "pending", "task": task["id"], "reason": str(exc), "backup": None, "notices": notices}
+                try:
+                    if task.get("closure_pending"):
+                        preserve_and_close(vault, task["id"], reason="human_timeout")
+                    elif task.get("worktree_expired"):
+                        reconcile_expired(vault, task["id"], now=now)
+                except (Blocked, OSError) as exc:
+                    pending.append({"task": task["id"], "reason": str(exc)})
     with vault.locked():
         vault.no_transaction()
-        for task in all_tasks(vault):
-            reconcile_clock(vault, task, now)
-        pending = [read_json(p) for p in (vault.control / "deletions").glob("*.json")
-                   if read_json(p)["status"] != "complete"]
-        deletion = pending[0] if pending else retention.plan(vault, now)
-    result = retention.execute(vault, deletion["id"], now)
-    if result["status"] != "complete":
-        return {"status": "pending", "retention": result["id"], "backup": None, "notices": notices}
-    lifetime = vault.config.get("backup_generation_days")
-    require(type(lifetime) is int and lifetime > 0, "Approved backup generation lifetime is required", 5)
-    backup = backups.create(vault, "long", utc(now) + timedelta(days=lifetime), now=now)
-    return {"status": "complete", "retention": result["id"], "backup": backup["id"], "notices": notices}
+        plans = retention.pending_plans(vault)
+        exclude = {retention.slot(entry) for plan in plans for entry in plan["entries"]
+                   if entry["status"] not in retention.RESOLVED}
+        try:
+            discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans))
+            if discovered is not None:
+                plans.append(discovered)
+        except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
+            pending.append({"retention": "discovery", "reason": str(exc)})
+        for plan in plans:
+            try:
+                result = retention.execute(vault, plan["id"], now)
+                results.append(result)
+            except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
+                results.append({"id": plan["id"], "status": "pending", "pending": [{"reason": str(exc)}]})
+        for index, result in enumerate(results):
+            if any(item.get("reason") == retention.NATIVE_REPLICAS_PENDING for item in result.get("pending", [])):
+                results[index] = retention.execute(vault, result["id"], now)
+        pending.extend({"plan": result["id"], **item} for result in results for item in result.get("pending", []))
+        backup = backup_round(vault, now)
+        if backup["status"] == "pending":
+            pending.append({"backup": backup["reason"]})
+    legacy = pending[0] if pending and "task" in pending[0] else {}
+    return {**legacy, "status": "pending" if pending else "complete", "notices": notices,
+            "retention": results[0]["id"] if results else None, "plans": results, "pending": pending,
+            "backup": backup.get("id"), "backup_result": backup}
+
+
+def backup_round(vault, now):
+    from . import backups, storage_policy
+    from .custody import materials
+
+    try:
+        policy = storage_policy.effective(vault)
+        mode = policy["backup"]["mode"]
+        if mode in {"off", "manual"}:
+            return {"status": "disabled" if mode == "off" else "manual", "mode": mode}
+        status, reason = storage_policy.backup_status(vault, policy, scheduled=True)
+        if status != "configured":
+            return {"status": "pending", "configuration": status, "reason": reason}
+        interval = timedelta(hours=storage_policy.backup_interval(vault, policy))
+        for record in materials(vault).values():
+            if (record.get("kind") == "backup" and record.get("generation") == "long" and record.get("verified_at") and
+                    utc(record["verified_at"]) <= now < utc(record["verified_at"]) + interval):
+                try:
+                    backups.verify_backup(vault, record["id"])
+                    return {"status": "not_due", "mode": mode, "last_generation": record["id"]}
+                except (Blocked, OSError):
+                    continue
+        days = vault.config["backup_generation_days"]
+        expiry = "permanent" if days == "permanent" else now + timedelta(days=days)
+        record = backups.create(vault, "long", expiry, now=now, scheduled=True)
+        return {"status": "complete", "id": record["id"], "mode": mode}
+    except (Blocked, OSError, KeyError, ValueError, TypeError, OverflowError) as exc:
+        return {"status": "pending", "reason": str(exc)}
 
 
 def prepare_launchd_trial(vault, directory):

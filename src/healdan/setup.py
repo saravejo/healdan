@@ -6,7 +6,7 @@ import sys
 
 from .core import REQUIRED_REGISTRIES, Blocked, Vault, atomic, executable, git, read_json, require, run
 from .binding import setup_binding
-from . import admission, originals
+from . import admission, custody, originals, storage_policy
 
 DIRECTORIES = ("inbox", "projects", "wiki/topics", "archive", "control/tasks", "templates")
 
@@ -75,13 +75,15 @@ def _initialize(vault, interactive):
                   "backup_destinations": "Backup directories (comma separated)",
                   "backup_signing_key": "Separate external backup SSH key path", "backup_signing_identity": "Backup signer identity",
                   "backup_allowed_signers": "External backup allowed-signers file",
-                  "backup_interval_hours": "Approved backup interval in hours", "backup_generation_days": "Long generation lifetime in days"}
+                  "backup_interval_hours": "Approved backup interval in hours",
+                  "backup_generation_days": "Long generation lifetime in days or permanent"}
         for key, label in fields.items():
             if not config.get(key):
                 answer = input(label + " (blank leaves pending): ").strip()
                 if answer:
                     config[key] = [v.strip() for v in answer.split(",")] if isinstance(config[key], list) else (
-                        int(answer) if key in {"backup_interval_hours", "backup_generation_days"} else answer)
+                        int(answer) if key in {"backup_interval_hours", "backup_generation_days"} and
+                        (key != "backup_generation_days" or answer != "permanent") else answer)
         atomic(vault.config_path, config)
         for key in ("name", "email"):
             if config.get("git_" + key) and not git(root, "config", "--get", "user." + key, check=False):
@@ -137,13 +139,22 @@ def doctor(vault):
     except Blocked as exc:
         check("external_controller", False, str(exc))
     for name in ("git_name", "git_email", "signing_identity", "signing_key", "allowed_signers", "age_identity",
-                 "age_recipients", "offline_recipients", "backup_destinations", "backup_interval_hours", "backup_generation_days",
-                 "backup_signing_key", "backup_signing_identity", "backup_allowed_signers"):
+                 "age_recipients", "offline_recipients"):
         check("config:" + name, vault.config.get(name), "Configured" if vault.config.get(name) else "Required configuration missing")
     for name in ("signing_key", "allowed_signers", "age_identity"):
         value = vault.config.get(name)
         valid = value and Path(value).is_absolute() and Path(value).is_file() and not Path(value).resolve().is_relative_to(vault.root)
         check("external:" + name, valid, "Must be an existing external file")
+    try:
+        policy = storage_policy.effective(vault)
+        status, detail = storage_policy.backup_status(vault, policy, scheduled=True)
+        check("backup:policy", status in {"configured", "disabled"}, detail)
+        checks[-1]["status"] = status
+        check("retention:policy", True, policy["retention"]["mode"])
+    except (Blocked, OSError, TypeError, ValueError) as exc:
+        check("storage:policy", False, str(exc))
+    for material, problem in custody.integrity_findings(vault):
+        check("custody:" + material, False, problem)
     if shutil.which("srt") and platform.system() == "Darwin":
         try:
             from .launcher import runtime_version

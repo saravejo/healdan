@@ -142,6 +142,20 @@ def parser():
     maintenance.add_parser("plan")
     execute = maintenance.add_parser("execute")
     execute.add_argument("plan")
+    policy = maintenance.add_parser("policy").add_subparsers(dest="decision", required=True)
+    policy.add_parser("show")
+    policy_sign = policy.add_parser("sign")
+    policy_sign.add_argument("input", type=Path)
+    policy_sign.add_argument("--output", type=Path, required=True)
+    policy.add_parser("apply").add_argument("approval", type=Path)
+    preservation = maintenance.add_parser("preserve-backup").add_subparsers(dest="decision", required=True)
+    preservation_sign = preservation.add_parser("sign")
+    preservation_sign.add_argument("generation")
+    preservation_sign.add_argument("--reason", required=True)
+    preservation_sign.add_argument("--output", type=Path, required=True)
+    preservation_apply = preservation.add_parser("apply")
+    preservation_apply.add_argument("generation")
+    preservation_apply.add_argument("approval", type=Path)
     schedule = maintenance.add_parser("schedule")
     schedule.add_argument("--activate", action="store_true")
     schedule.add_argument("--trial", action="store_true", help="Use a disposable launchd trial vault")
@@ -334,16 +348,35 @@ def dispatch(args):
     if args.command == "maintenance":
         if args.action == "run-scheduled":
             result = maintenance.run_scheduled(vault, args.job, args.vault_id, trial=args.trial)
-            return result, 5 if args.job == "lint" and (result["status"] != "complete" or result["findings"]) else 0
+            return result, 5 if result["status"] != "complete" or (args.job == "lint" and result["findings"]) else 0
         if args.action == "daily":
-            return maintenance.daily(vault)
+            result = maintenance.daily(vault)
+            return result, 0 if result["status"] == "complete" else 5
         if args.action == "plan":
             from .retention import plan
             with vault.locked():
                 return plan(vault)
         if args.action == "execute":
             from .retention import execute
-            return execute(vault, args.plan)
+            result = execute(vault, args.plan)
+            return result, 0 if result["status"] == "complete" else 5
+        if args.action == "policy":
+            from . import storage_policy
+            if args.decision == "show":
+                with vault.reading():
+                    return {"policy": storage_policy.effective(vault), "history": storage_policy.history(vault)}
+            if args.decision == "apply":
+                return storage_policy.apply_policy(vault, read_json(args.approval))
+            approval = storage_policy.policy_request(vault, read_json(args.input))
+            atomic(args.output, approval)
+            return {"output": str(args.output), "digest": approval["digest"]}
+        if args.action == "preserve-backup":
+            from . import storage_policy
+            if args.decision == "apply":
+                return storage_policy.apply_preservation(vault, args.generation, read_json(args.approval))
+            approval = storage_policy.preservation_request(vault, args.generation, args.reason)
+            atomic(args.output, approval)
+            return {"output": str(args.output), "digest": approval["digest"]}
         if args.action == "schedule":
             return maintenance.schedule(vault, activate=args.activate, trial=args.trial)
         if args.action == "prepare-launchd-trial":

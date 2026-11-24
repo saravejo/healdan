@@ -512,7 +512,7 @@ class OriginalAdmission(VaultTest):
         inbox.archive_empty(self.vault, sha)
         (self.root / f"archive/{sha}/second.txt").unlink()
         plan = retention.plan(self.vault, now)
-        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "pending")
         findings(expected)
 
     def test_linked_inbox_lint_distinguishes_reused_path_by_content(self):
@@ -893,7 +893,7 @@ class OriginalAdmission(VaultTest):
         destination.unlink()
         self.assertFalse(inbox.archive_complete(self.vault, item))
         plan = retention.plan(self.vault, now)
-        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "pending")
         copies = custody.materials(self.vault)["archive-repeat"]["copies"]
         self.assertEqual(copies[1]["verified_archive_sha256"], sha)
         self.assertNotIn("verified_archive_sha256", copies[3])
@@ -1015,15 +1015,17 @@ class OriginalAdmission(VaultTest):
         plan = retention.plan(self.vault, now)
         destination = self.root / "archive" / sha / "nota.txt"
         destination.unlink()
-        with patch("healdan.retention.save_material", side_effect=OSError("Interrupted absent-copy reconciliation")):
-            result = retention.execute(self.vault, plan["id"], now)
-        self.assertEqual(result["entries"][0]["status"], "deleting")
+        result = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(result["entries"][0]["status"], "pending")
+        self.assertIn("without verified deletion intent", result["entries"][0]["error"])
         atomic(self.root / second, b"")
         inbox.inventory(self.vault)
         with self.assertRaisesRegex(Blocked, "Resume retention first"):
             inbox.archive_empty(self.vault, sha)
         self.assertTrue((self.root / second).exists())
         self.assertFalse(destination.exists())
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "pending")
+        atomic(destination, b"")
         self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
         inbox.archive_empty(self.vault, sha)
         self.assertEqual(destination.read_bytes(), b"")

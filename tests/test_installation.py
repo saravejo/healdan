@@ -428,8 +428,12 @@ class ImmutableInstallation(VaultTest):
             with self.assertRaisesRegex(Blocked, "destinations must stay"):
                 maintenance.run_scheduled(trial, "daily", trial.identity, trial=True)
             workspace = Path(report["workspace"])
+            key, signers = workspace / "backup-key", workspace / "backup-signers"
+            atomic(key, b"trial configuration fixture")
+            atomic(signers, b"trial configuration fixture")
             atomic(trial.config_path, {**trial.config, "backup_destinations": [str(workspace / "backups")],
-                                      "backup_generation_days": 2})
+                                      "backup_generation_days": 2, "backup_signing_key": str(key),
+                                      "backup_allowed_signers": str(signers), "backup_signing_identity": "fixture"})
             launchctl.assert_not_called()
             plists = maintenance.schedule(trial, activate=True, trial=True)
             self.assertEqual(len(plists["plists"]), 2)

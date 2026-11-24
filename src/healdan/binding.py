@@ -252,12 +252,12 @@ def project_config(config, binding):
     require(isinstance(config, dict), "Controller configuration must be an object")
     projected = dict(config)
     for name in CONFIG_PATHS:
-        if config.get(name):
+        if isinstance(config.get(name), str) and config[name]:
             path = relocated_path(config[name], binding)
             if path != Path(config[name]):
                 projected[name] = str(path)
     for name in CONFIG_ROOTS:
-        if name in config:
+        if isinstance(config.get(name), list) and all(isinstance(value, str) for value in config[name]):
             projected[name] = [str(relocated_path(value, binding)) for value in config[name]]
     return projected
 
