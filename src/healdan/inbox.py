@@ -35,24 +35,28 @@ def ordinary_paths(root, on_error):
         if not directory:
             yield relative
             continue
+        entries = []
         try:
             path = safe_path(root, relative)
             metadata = path.lstat()
             require(stat.S_ISDIR(metadata.st_mode) and not junction(metadata),
                     "Inbox directory is unsafe: " + relative, 5)
             with os.scandir(path) as scan:
-                entries = sorted(scan, key=lambda entry: entry.name, reverse=True)
+                for entry in scan:
+                    entries.append(entry)
         except (Blocked, OSError) as exc:
             on_error(relative, exc)
-            continue
-        for entry in entries:
+        for entry in sorted(entries, key=lambda entry: entry.name, reverse=True):
             name = f"{relative}/{entry.name}"
-            if name == "inbox/tasks" or not ordinary(name):
+            if name == "inbox/tasks":
                 continue
             try:
-                pending.append((name, entry.is_dir(follow_symlinks=False)))
+                is_directory = entry.is_dir(follow_symlinks=False)
             except OSError as exc:
                 on_error(name, exc)
+                continue
+            if is_directory or ordinary(name):
+                pending.append((name, is_directory))
 
 
 def read_ordinary_file(root, relative):

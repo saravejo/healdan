@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -764,6 +765,54 @@ class OriginalAdmission(VaultTest):
         complete = linting.lint(self.vault, now)
         self.assertEqual(complete["status"], "complete")
         self.assertIn("inbox:inbox/denied/empty.txt", complete["findings"])
+
+    def test_lint_keeps_entries_returned_before_directory_iterator_failure(self):
+        linked = self.base / "linked vault"
+        git(self.root, "worktree", "add", "--detach", linked, "HEAD")
+        linked_vault = Vault(linked, self.state)
+        partial_dir = "inbox/incomplete"
+        visible = [f"{partial_dir}/already-visible.txt", f"{partial_dir}/branch/nested.txt", "inbox/other/readable.txt"]
+        unlisted = f"{partial_dir}/not-returned.txt"
+        for relative in [*visible, unlisted]:
+            atomic(linked / relative, b"Regular Inbox fixture")
+        baseline = linting.lint(self.vault)
+        self.assertEqual(baseline["status"], "complete")
+        state = self.vault.control / "lint-state.json"
+        saved = state.read_bytes()
+        tasks_path = self.vault.control / "followups.json"
+        prior = read_json(tasks_path)["inbox"]["id"]
+        scandir = os.scandir
+
+        @contextmanager
+        def interrupted_scan(path):
+            with scandir(path) as entries:
+                by_name = {entry.name: entry for entry in entries}
+
+                def interrupted():
+                    yield by_name["already-visible.txt"]
+                    yield by_name["branch"]
+                    raise PermissionError("Fixture scan interrupted after delivering two entries")
+
+                yield interrupted()
+
+        def partial_scan(path):
+            return interrupted_scan(path) if Path(path) == linked / partial_dir else scandir(path)
+
+        with patch("healdan.inbox.os.scandir", side_effect=partial_scan):
+            for vault in (self.vault, linked_vault):
+                partial = linting.lint(vault)
+                self.assertEqual(partial["status"], "partial")
+                self.assertEqual([(e["category"], e["worktree"], e["path"]) for e in partial["errors"]],
+                                 [("inbox", str(linked), partial_dir)])
+                self.assertCountEqual([row["key"] for row in partial["findings"].values() if row["category"] == "inbox"], visible)
+                self.assertEqual(partial["delta"]["resolved"], [])
+                self.assertEqual(state.read_bytes(), saved)
+                followup = read_json(tasks_path)["inbox"]
+                self.assertEqual((followup["id"], followup["state"]), (prior, "open"))
+            with self.assertRaisesRegex(PermissionError, "Fixture scan interrupted"):
+                inbox.inventory(linked_vault)
+        self.assertFalse((self.vault.control / "inbox.json").exists())
+        self.assertIn("inbox:" + unlisted, linting.lint(self.vault)["findings"])
 
     def test_shared_archive_deletion_recovers_all_verified_custody_slots(self):
         first, second = "inbox/a/shared.txt", "inbox/b/shared.txt"

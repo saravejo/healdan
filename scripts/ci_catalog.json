@@ -146,6 +146,7 @@
     "test_original_admission.OriginalAdmission.test_legacy_archive_receipt_accepts_unique_verified_destination",
     "test_original_admission.OriginalAdmission.test_legacy_attributes_and_blob_require_verified_raw_reconciliation",
     "test_original_admission.OriginalAdmission.test_linked_inbox_lint_distinguishes_reused_path_by_content",
+    "test_original_admission.OriginalAdmission.test_lint_keeps_entries_returned_before_directory_iterator_failure",
     "test_original_admission.OriginalAdmission.test_lint_keeps_followup_open_for_pending_linked_inbox_paths",
     "test_original_admission.OriginalAdmission.test_lint_reports_directory_failures_and_keeps_readable_inbox_branches",
     "test_original_admission.OriginalAdmission.test_lint_requires_archive_bytes_or_verified_retention_deletion",

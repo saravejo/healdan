@@ -110,11 +110,18 @@ class Tasks(VaultTest):
 
 class InboxLint(VaultTest):
     def test_operational_exclusions_and_unknown_entry(self):
-        for path in ("inbox/a.txt", "inbox/tasks/a.txt", "inbox/agent-dashboard.html", "inbox/agent-activities-today.md", "control/tasks/a.txt"):
+        ordinary = ["inbox/a.txt", "inbox/manual-activities-today.md/ordinary.txt", "inbox/holding/.gitkeep/ordinary.txt",
+                    "inbox/holding/agent-dashboard.html"]
+        excluded = ["inbox/tasks/a.txt", "inbox/agent-dashboard.html", "inbox/agent-activities-today.md",
+                    "inbox/holding/ignored/.gitkeep", "control/tasks/a.txt"]
+        for path in ordinary + excluded:
             atomic(self.root / path, b"fixture")
+        found, errors = linting.collect(self.vault)
+        self.assertEqual(errors, [])
+        self.assertCountEqual([row["key"] for row in found.values() if row["category"] == "inbox"], ordinary)
         items = inbox.inventory(self.vault)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["paths"], ["inbox/a.txt"])
+        self.assertCountEqual(items[0]["paths"], ordinary)
         self.assertIsNone(items[0]["entered_at"])
         self.assertIn("unknown_entry_time", inbox.findings(items[0]))
 
