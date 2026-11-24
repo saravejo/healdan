@@ -146,12 +146,6 @@ class Knowledge:
         kind, refs, claims = self.lineage.parents(identifier)
         self.classification.require_use(source, self.lineage.restriction_hashes(identifier))
         if kind in {"observation", "legacy"}:
-            copies = [other_id for other_id, other in self.lineage.sources.items()
-                      if other_id != identifier and other["sha256"] == source["sha256"] and
-                      (other.get("origin") or {}).get("kind") == "derived"]
-            if copies:
-                require(len(copies) == 1, label + ": copy has ambiguous conversion origins", 5)
-                return self.source_support(copies[0], cutoff, (*chain, identifier))
             return ({source["sha256"]}, False) if kind == "observation" else (set(), True)
         roots, unknown = set(), False
         if claims:

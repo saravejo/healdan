@@ -115,6 +115,15 @@ def extend_jsonl(data, rows):
     return data + separator + addition
 
 
+def sync_directory(path):
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,12 +137,7 @@ def atomic(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
-        if os.name != "nt":
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -252,6 +256,7 @@ REGISTRY_PREFIXES = {
 REGISTRIES = tuple(REGISTRY_PREFIXES)
 REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
                        "wiki/control/aliases.jsonl", "control/approvals/packages.jsonl")
+INGEST_JOURNAL = "source-ingest.json"
 
 
 class Vault:
@@ -370,10 +375,13 @@ class Vault:
             atomic(self.control / "receipts" / (identifier + ".json"), value)
         return identifier
 
-    def no_transaction(self):
+    def no_transaction(self, *, allow_ingest=False):
         pending = read_json(safe_path(self.control, "transaction.json"))
         require(not pending or pending["status"] in {"complete", "aborted"},
                 "An integration needs recovery", 5)
+        if not allow_ingest:
+            ingestion = read_json(safe_path(self.control, INGEST_JOURNAL), {})
+            require(ingestion.get("status") != "writing", "An Inbox ingestion needs recovery", 5)
         return pending
 
     def clean_inputs(self):

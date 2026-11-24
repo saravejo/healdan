@@ -1,9 +1,11 @@
 """Admission policy for preserved originals and their registered copies."""
+import base64
+import os
 from pathlib import Path
 from uuid import uuid4
 
-from .core import Blocked, atomic, digest, extend_jsonl, read_json, require, safe_path, stamp
-from .custody import materials, retention_deadline, validate_purpose
+from .core import INGEST_JOURNAL, Blocked, atomic, digest, extend_jsonl, parse_jsonl, read_json, require, safe_path, stamp, sync_directory
+from .custody import decrypt, materials, retention_deadline, validate_purpose
 from .ids import next_ids, registry_records, reserve
 from .lineage import Lineage, PageHistory, sha256
 from .originals import REGISTRY, committed_sources, source_path, verify_body, verify_committed, verify_storage
@@ -28,7 +30,13 @@ def published_rows(vault):
     transaction = read_json(vault.control / "transaction.json", {})
     if transaction.get("status") == "writing" and vault.head() == transaction["base"]:
         return committed_sources(vault.root, transaction["base"])
-    return source_rows(vault)
+    rows = source_rows(vault)
+    pending = read_json(vault.control / INGEST_JOURNAL, {})
+    if pending.get("status") == "writing" and vault.relocated_path(pending["worktree"]) == vault.root:
+        row = pending["record"]
+        if rows.get(row["id"]) == row:
+            del rows[row["id"]]
+    return rows
 
 
 def classification_token(vault):
@@ -212,6 +220,7 @@ def sign_reclassification(vault, sha, request):
         actor = vault.config.get("signing_identity")
         authority = policy.policy()
         require(actor in authority["authorities"], "No verifiable source-classification authority for the operator", 5)
+        require_origin_classification(policy, sha, request["classification"])
         history = policy.history.get(sha, [])
         previous = history[-1]["approval"]["digest"] if history else None
         decision = {"format": RECLASSIFICATION, "vault": vault.identity, "sha256": sha,
@@ -240,6 +249,7 @@ def reclassify(vault, envelope):
                 "Reclassification refers to a stale material revision", 5)
         require(decision["to"] in PUBLISHABLE and classes != [decision["to"]] and
                 isinstance(decision["reason"], str) and decision["reason"].strip(), "Invalid reclassification decision", 5)
+        require_origin_classification(policy, sha, decision["to"])
         event = {"approval": envelope, "receipt": vault.receipt("source-reclassification", envelope, at=decision["at"])}
         history.append(event)
         atomic(vault.control / DECISIONS, policy.history)
@@ -250,6 +260,15 @@ def require_triage(vault, sha, classification):
     current, _ = Classification(vault, published_rows(vault)).current(sha)
     require(current is None or current == classification,
             f"Source {sha} is {current}; an authorized reclassification to {classification} is required", 5)
+
+
+def require_origin_classification(policy, sha, classification):
+    lineage = Lineage(policy.vault, policy.sources, PageHistory(policy.vault))
+    for row in policy.by_hash.get(sha, []):
+        for origin in lineage.restriction_hashes(row["id"]) - {sha}:
+            current, _ = policy.current(origin)
+            require(current in {"common", classification},
+                    f"{row['id']}: derivative inherits {current} restriction from {origin}", 5)
 
 
 def plan(vault, candidate, baseline, *, reviewed, check_storage=True):
@@ -413,42 +432,188 @@ def publication(vault, admissions, status, *, at):
         atomic(inbox_path, inbox)
 
 
+def ingest_plan(vault, row, data, before):
+    from .transactions import Candidate
+    after = extend_jsonl(before, [row])
+    baseline = registry_records(REGISTRY, parse_jsonl(before, REGISTRY))
+    files = {row["path"]: base64.b64encode(data).decode(), REGISTRY: base64.b64encode(after).decode()}
+    with Candidate(vault, files) as candidate:
+        return plan(vault, candidate, baseline, reviewed=False), after
+
+
+def ingest_paths(vault, journal):
+    row = journal["record"]
+    relative = Path(row["path"])
+    parent = safe_path(vault.root, relative.parent)
+    stage = parent / (".healdan-ingest-" + journal["operation"])
+    target = parent / relative.name
+    require(not target.is_symlink() and not stage.is_symlink(), "Symlink in pending source publication", 5)
+    return target, stage
+
+
+def reconcile_ingest_link(journal_path, journal, target, stage):
+    if stage.is_file() and target.is_file() and stage.samefile(target):
+        require(stage.stat().st_nlink == 2, "Pending source publication has an unexpected hard link", 5)
+        verify_body(journal["record"], stage.read_bytes())
+        if journal.get("file") != "created":
+            journal["file"] = "created"
+            atomic(journal_path, journal)
+        stage.unlink()
+        sync_directory(stage.parent)
+
+
+def publish_ingest_file(vault, journal_path, journal, target, stage, data):
+    row = journal["record"]
+    if not target.exists():
+        if stage.exists():
+            verify_body(row, safe_path(vault.root, stage.relative_to(vault.root), exists=True).read_bytes())
+        else:
+            atomic(stage, data)
+        try:
+            os.link(stage, target)
+        except FileExistsError:
+            pass
+        reconcile_ingest_link(journal_path, journal, target, stage)
+    require(safe_path(vault.root, row["path"], exists=True).read_bytes() == data,
+            "Concurrent edit conflicts with the Inbox source destination: " + row["path"], 5)
+    if not journal.get("file"):
+        journal["file"] = "reused"
+        atomic(journal_path, journal)
+    if stage.exists():
+        verify_body(row, safe_path(vault.root, stage.relative_to(vault.root), exists=True).read_bytes())
+        stage.unlink()
+        sync_directory(stage.parent)
+
+
+def withdraw_ingest(vault, journal_path, journal, target, stage, before, current, failure):
+    row = journal["record"]
+    if target.exists() and journal.get("file") == "created":
+        verify_body(row, safe_path(vault.root, row["path"], exists=True).read_bytes())
+    if stage.exists():
+        verify_body(row, safe_path(vault.root, stage.relative_to(vault.root), exists=True).read_bytes())
+        stage.unlink()
+    if current != before:
+        atomic(vault.root / REGISTRY, before)
+    if target.exists() and journal.get("file") == "created":
+        target.unlink()
+    if target.parent.is_dir():
+        sync_directory(target.parent)
+    publication(vault, journal["admissions"], "withdrawn", at=journal["at"])
+    journal.update(status="aborted", reason=str(failure))
+    atomic(journal_path, journal)
+    vault.receipt("source-ingest-withdrawn", {"source": row["id"], "reason": str(failure)}, at=journal["at"])
+
+
+def verified_quarantine(vault, row):
+    for material in materials(vault).values():
+        if material.get("classification") != "secret" or not material.get("quarantine_receipt"):
+            continue
+        try:
+            if row["sha256"] not in material_hashes(vault, material):
+                continue
+            for copy in material["copies"]:
+                if copy["kind"] != "ciphertext" or copy["status"] != "present":
+                    continue
+                root = vault.relocated_path(copy["root"])
+                encrypted = safe_path(root, copy["path"], exists=True).read_bytes()
+                if digest(encrypted) == copy["sha256"]:
+                    verify_body(row, decrypt(vault, encrypted))
+                    return True
+        except (Blocked, OSError):
+            continue
+    return False
+
+
 def ingest(vault, path, *, provenance, captured_at, classification, derived=None):
     from .inbox import ordinary
 
     require(ordinary(path), "Ingest expects an ordinary Inbox path", 2)
     require(isinstance(provenance, str) and provenance.strip(), "Ingest requires source provenance", 2)
+    request = {"path": path, "provenance": provenance, "captured_at": stamp(captured_at),
+               "classification": classification, "derived": derived}
     with vault.locked():
-        vault.no_transaction()
+        vault.no_transaction(allow_ingest=True)
+        journal_path = safe_path(vault.control, INGEST_JOURNAL)
+        journal = read_json(journal_path, {})
+        active = journal.get("status") == "writing"
+        same_worktree = bool(journal) and vault.relocated_path(journal["worktree"]) == vault.root
+        require(not active or same_worktree, "Retry the pending Inbox ingestion in its original worktree", 5)
+        require(not active or journal["request"] == request,
+                "Retry the pending Inbox ingestion for " + journal.get("request", {}).get("path", path), 5)
+        revision = vault.head()
+        verify_committed(vault.root, revision, committed_sources(vault.root, revision).values())
+        manifest = safe_path(vault.root, REGISTRY, exists=True)
+        current = manifest.read_bytes()
+        input_path = safe_path(vault.root, path)
+        if active:
+            record = journal["record"]
+            require(revision == journal["base"], "Git revision changed during Inbox ingestion", 5)
+            before = base64.b64decode(journal["manifest_before"], validate=True)
+            require(current in {before, extend_jsonl(before, [record])}, "Source manifest changed during Inbox ingestion", 5)
+            target, stage = ingest_paths(vault, journal)
+            if not input_path.is_file():
+                require(verified_quarantine(vault, record),
+                        "Pending capture is missing from the Inbox; no verified quarantine copy of the original", 5)
+                failure = AdmissionBlocked("Pending Inbox ingestion withdrawn after verified quarantine", 5)
+                reconcile_ingest_link(journal_path, journal, target, stage)
+                withdraw_ingest(vault, journal_path, journal, target, stage, before, current, failure)
+                raise failure
         data = safe_path(vault.root, path, exists=True).read_bytes()
-        baseline = source_rows(vault)
-        verify_committed(vault.root, vault.head(), committed_sources(vault.root, vault.head()).values())
-        identifier, = next_ids(vault, "F", 1)
-        target = f"resources/sources/{identifier}/original{Path(path).suffix}"
-        history = PageHistory(vault)
-        origin = history.origin(data, path, derived)
-        # A byte-for-byte copy of an earlier conversion keeps its source references.
-        if origin["kind"] == "observation" and derived is None:
-            known = [s for s in baseline.values() if s["sha256"] == digest(data) and
-                     (s.get("origin") or {}).get("kind") == "derived"]
-            if known:
-                first = known[0]["origin"]
-                require(all(s["origin"]["sources"] == first["sources"] for s in known), "Copy has ambiguous conversion origins", 5)
-                origin = dict(first, path=path)
-        record = {"id": identifier, "path": target, "sha256": digest(data), "size": len(data),
-                  "captured_at": stamp(captured_at), "provenance": provenance,
-                  "classification": classification, "origin": origin}
-        from .transactions import Candidate
-        import base64
-        manifest = append_sources(vault, [record])
-        with Candidate(vault, {target: base64.b64encode(data).decode(),
-                               REGISTRY: base64.b64encode(manifest).decode()}) as candidate:
-            admissions = plan(vault, candidate, baseline, reviewed=False)
-        destination = safe_path(vault.root, target)
-        require(not destination.exists(), "Source destination already exists: " + target, 5)
-        require(reserve(vault, "F", 1, str(uuid4()), locked=True) == [identifier], "Source reservation changed", 5)
-        atomic(destination, data)
-        atomic(vault.root / REGISTRY, manifest)
-        publication(vault, admissions, "present", at=stamp())
-        vault.receipt("source-ingest", record)
+        sha = digest(data)
+        if (same_worktree and journal.get("status") == "complete" and journal["request"] == request and
+                journal["record"]["sha256"] == sha):
+            record = journal["record"]
+            rows = source_rows(vault)
+            require(rows.get(record["id"]) == record, "Completed ingestion differs from the source manifest", 5)
+            policy = Classification(vault, rows)
+            require(policy.current(sha)[0] == classification, "Completed ingestion has a different current classification", 5)
+            require_origin_classification(policy, sha, classification)
+            verify_body(record, safe_path(vault.root, record["path"], exists=True).read_bytes())
+            return record
+        if active:
+            verify_body(record, data)
+            reconcile_ingest_link(journal_path, journal, target, stage)
+            try:
+                admissions, after = ingest_plan(vault, record, data, before)
+                started, = journal["admissions"]
+                latest, = admissions
+                if dict(started, state=latest["state"]) != latest:
+                    raise AdmissionBlocked("Source admission changed during Inbox ingestion", 5)
+            except AdmissionBlocked as exc:
+                withdraw_ingest(vault, journal_path, journal, target, stage, before, current, exc)
+                raise
+        else:
+            rows = source_rows(vault)
+            identifier, = next_ids(vault, "F", 1)
+            relative = f"resources/sources/{identifier}/original{Path(path).suffix}"
+            history = PageHistory(vault)
+            origin = history.origin(data, path, derived)
+            if origin["kind"] == "observation":
+                known = Lineage(vault, rows, history).known_conversion(sha)
+                if known:
+                    origin = dict(known, path=path)
+            record = {"id": identifier, "path": relative, "sha256": sha, "size": len(data),
+                      "captured_at": request["captured_at"], "provenance": provenance,
+                      "classification": classification, "origin": origin}
+            admissions, after = ingest_plan(vault, record, data, current)
+            destination = safe_path(vault.root, relative)
+            require(not destination.exists(), "Source destination already exists: " + relative, 5)
+            operation = str(uuid4())
+            require(reserve(vault, "F", 1, operation, locked=True) == [identifier], "Source reservation changed", 5)
+            journal = {"status": "writing", "request": request, "record": record, "operation": operation,
+                       "manifest_before": base64.b64encode(current).decode(), "base": revision, "worktree": str(vault.root),
+                       "admissions": admissions, "at": stamp()}
+            atomic(journal_path, journal)
+            target, stage = ingest_paths(vault, journal)
+        publication(vault, journal["admissions"], "planned", at=journal["at"])
+        publish_ingest_file(vault, journal_path, journal, target, stage, data)
+        require(input_path.is_file() and input_path.read_bytes() == data, "Inbox capture changed during ingestion", 5)
+        require(manifest.read_bytes() == current, "Source manifest changed during Inbox ingestion", 5)
+        if current != after:
+            atomic(manifest, after)
+        verify_body(record, safe_path(vault.root, record["path"], exists=True).read_bytes())
+        publication(vault, journal["admissions"], "present", at=journal["at"])
+        vault.receipt("source-ingest", record, at=journal["at"])
+        journal["status"] = "complete"
+        atomic(journal_path, journal)
         return record

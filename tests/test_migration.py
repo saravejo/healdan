@@ -39,6 +39,7 @@ class Migration(VaultTest):
         cases_path = self.root / regression.CASE_REGISTRY
         first_row = b" \t" + canonical(reported) + b" \r\n"
         atomic(cases_path, first_row + canonical(factual))
+        git(self.root, "add", "--", "resources/sources/F-0001/original.txt")
         git(self.root, "commit", "-am", "Preserve archived signed cases and sampled approval")
         self.assertEqual(ids.reserve(self.vault, "Q", 1, str(uuid4())), ["Q-0003"])
 

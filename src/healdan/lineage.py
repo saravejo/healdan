@@ -1,10 +1,11 @@
 """Source revisions and dependencies of captured wiki output."""
 import base64
+from collections import defaultdict
 import re
 
 from .core import Blocked, digest, git, git_bytes, parse_jsonl, require, safe_path
 from .ids import aliases, registry_records
-from .originals import REGISTRY, git_blob
+from .originals import REGISTRY, git_blob, verify_body
 from .signing import trusted_signers, verify
 
 ORIGIN = "healdan-source-origin-v1"
@@ -151,6 +152,10 @@ class Lineage:
         self.page_history = page_history
         self.bodies = bodies or {}
         self.aliases = None
+        self.by_digest = defaultdict(list)
+        self.conversions = {}
+        for identifier, row in sources.items():
+            self.by_digest[row["sha256"]].append(identifier)
 
     def source_id(self, identifier):
         if identifier in self.sources:
@@ -159,11 +164,47 @@ class Lineage:
             self.aliases = aliases(self.vault)
         return self.aliases.get(identifier, identifier)
 
+    def body(self, identifier):
+        row = self.sources[identifier]
+        if identifier not in self.bodies:
+            body = safe_path(self.vault.root, row["path"], exists=True).read_bytes()
+            self.bodies[identifier] = verify_body(row, body)
+        return self.bodies[identifier]
+
+    def known_conversion(self, sha):
+        if sha not in self.conversions:
+            established = None
+            expected = None
+            observations = set()
+            for identifier in self.by_digest.get(sha, []):
+                origin = self.sources[identifier].get("origin")
+                if not isinstance(origin, dict):
+                    continue
+                if origin.get("kind") == "observation":
+                    self.body(identifier)
+                    observations.add(identifier)
+                    continue
+                if origin.get("kind") != "derived":
+                    continue
+                self.body(identifier)
+                require(origin.get("format") == ORIGIN and isinstance(origin.get("method"), str) and
+                        origin["method"].strip(), f"{identifier}: invalid conversion origin", 5)
+                if "path" in origin:
+                    safe_path(self.vault.root, origin["path"])
+                parents = {(self.source_id(ref["id"]), ref["revision"]) for ref in references(origin.get("sources"))}
+                if established is None:
+                    established, expected = origin, parents
+                require(parents == expected, f"{identifier}: identical source bytes have conflicting conversion parents", 5)
+            if established and observations:
+                require(all(parent in observations for parent, _ in expected),
+                        "Identical source bytes conflict with their established observation", 5)
+                established = None
+            self.conversions[sha] = established
+        return self.conversions[sha]
+
     def parents(self, identifier):
         row = self.sources[identifier]
-        body = self.bodies.get(identifier)
-        if body is None:
-            body = self.bodies[identifier] = safe_path(self.vault.root, row["path"], exists=True).read_bytes()
+        body = self.body(identifier)
         origin = row.get("origin")
         pages = self.page_history.pages(body)
         if origin is not None:
@@ -182,18 +223,18 @@ class Lineage:
                 raise UnknownPageOrigin(f"{identifier}: wiki page revision lacks verified claim lineage", 5)
             uses = [claim for page in pages for claim in page["claims"]]
             return "wiki", [ref for claim in uses for ref in claim["sources"]], uses
+        require(kind in {None, "derived", "observation"} and (kind is not None or origin is None),
+                f"{identifier}: unknown source origin kind", 5)
+        conversion = self.known_conversion(row["sha256"])
+        if conversion:
+            return "derived", conversion["sources"], []
         if kind == "derived":
-            require(isinstance(origin.get("method"), str) and origin["method"].strip(),
-                    f"{identifier}: missing conversion method", 5)
-            if "path" in origin:
-                safe_path(self.vault.root, origin["path"])
             return kind, references(origin.get("sources")), []
         if kind == "observation":
             path = origin.get("path")
             require(isinstance(path, str) and path.strip(), f"{identifier}: missing capture origin", 5)
             safe_path(self.vault.root, path)
             return kind, [], []
-        require(origin is None, f"{identifier}: unknown source origin kind", 5)
         return "legacy", [], []
 
     def parent_id(self, ref):
@@ -207,7 +248,7 @@ class Lineage:
         require(identifier not in stack, "Source lineage cycle: " + " -> ".join((*stack, identifier)), 5)
         row = self.sources[identifier]
         try:
-            kind, refs, _ = self.parents(identifier)
+            _, refs, _ = self.parents(identifier)
         except UnknownPageOrigin:
             return {row["sha256"]}
         hashes = {row["sha256"]}
@@ -216,8 +257,4 @@ class Lineage:
             require(parent in self.sources, f"missing source {ref['id']} revision {ref['revision']}", 5)
             hashes.update(self.restriction_hashes(parent, (*stack, identifier)))
             self.parent_id(ref)
-        for other_id, other in self.sources.items():
-            if (other_id != identifier and other_id not in stack and other["sha256"] == row["sha256"] and
-                    (other.get("origin") or {}).get("kind") == "derived" and kind != "derived"):
-                hashes.update(self.restriction_hashes(other_id, (*stack, identifier)))
         return hashes

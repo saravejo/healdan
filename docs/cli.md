@@ -76,6 +76,13 @@ destination can be reused; a different destination is a conflict that preserves
 both paths. Repeating an interrupted movement reconciles its recorded intent
 and receipt. Whitespace-only files are not empty files.
 
+To resume an interrupted `inbox ingest`, repeat the same command in the
+original worktree with the same Inbox bytes. The controller checks the current
+classification and keeps the reserved source ID. Concurrent edits to the
+destination or manifest produce a conflict. If the Inbox copy moved into
+quarantine, withdrawal requires verifying the encrypted copy of the same
+capture and removes only bytes placed by that ingestion.
+
 `setup` appends protection for preserved originals to `.gitattributes` without
 replacing unrelated rules. `doctor` reports effective attributes, filters and
 committed source bytes. A higher-priority Git conversion rule must be corrected

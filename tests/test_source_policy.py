@@ -1,5 +1,6 @@
 import base64
 import copy
+import os
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -7,7 +8,7 @@ from uuid import uuid4
 from support import VaultTest
 import test_transactions
 from healdan import admission, custody, inbox, incidents, originals, pages, tasks, transactions
-from healdan.core import Blocked, atomic, digest, git, jsonl, read_json
+from healdan.core import INGEST_JOURNAL, Blocked, atomic, digest, git, jsonl, read_json
 from healdan.ids import reserve
 from healdan.knowledge import query
 from healdan.lineage import ORIGIN
@@ -109,6 +110,44 @@ class SourcePolicy(VaultTest):
         self.assertEqual(answer["code"], 20, answer)
         self.assertEqual(answer["observations"], [root["sha256"]])
         self.assertIn("1 verified observations, 2 required", " ".join(answer["diagnostics"]))
+
+    def test_identical_conversions_cannot_change_established_parents(self):
+        first = self.capture("first.txt", b"First independent capture")
+        second = self.capture("second.txt", b"Second independent capture")
+        body = b"Identical conversion result"
+        original = self.capture("converted.txt", body, [first])
+        copy_row = self.capture("copy.txt", body)
+        self.assertEqual(copy_row["origin"]["sources"], original["origin"]["sources"])
+        self.knowledge([self.claim_for([original, copy_row], minimum_observations=2)])
+        result = query(self.vault, {}, CUT)
+        self.assertEqual(result["code"], 20, result)
+        self.assertEqual(result["observations"], [first["sha256"]])
+        manifest = (self.root / originals.REGISTRY).read_bytes()
+        with self.assertRaisesRegex(Blocked, "identical source bytes have conflicting conversion parents"):
+            self.capture("conflicting.txt", body, [second])
+        self.assertEqual((self.root / originals.REGISTRY).read_bytes(), manifest)
+        self.assertFalse((self.root / "resources/sources/F-0005").exists())
+
+        # A signed record from an older installation remains intact and ineligible when its origins disagree.
+        disputed = {**copy_row, "origin": {**copy_row["origin"], "sources": [self.ref(second)]}}
+        self.rows(originals.REGISTRY, [first, second, original, disputed])
+        self.knowledge([self.claim_for([original, disputed], minimum_observations=2)])
+        approval = (self.root / transactions.LEDGER).read_bytes()
+        result = query(self.vault, {}, CUT)
+        self.assertEqual(result["code"], 20, result)
+        self.assertEqual(result["observations"], [])
+        self.assertIn("conflicting conversion parents", " ".join(result["diagnostics"]))
+        self.assertEqual((self.root / transactions.LEDGER).read_bytes(), approval)
+
+        # The reviewed proposal route uses the same byte identity rule.
+        self.rows(originals.REGISTRY, [first, second, original, copy_row])
+        self.rows("wiki/claims.jsonl", [])
+        git(self.root, "add", "--", "resources/sources", "wiki", "control/approvals")
+        git(self.root, "commit", "-m", "Preserve the expected conversion lineage")
+        proposed = self.proposal(body, origin=disputed["origin"])
+        with self.assertRaisesRegex(Blocked, "identical source bytes have conflicting conversion parents"):
+            transactions.prepare(self.vault, self.source_task["id"], cutoff=CUT)
+        self.assertFalse((self.root / proposed["path"]).exists())
 
     def test_independent_capture_and_derivative_stay_eligible(self):
         first = self.capture("earlier.txt", b"First apparatus")
@@ -292,6 +331,170 @@ class SourcePolicy(VaultTest):
         material = custody.materials(self.vault)[purpose["link"]]
         self.assertEqual(custody.retention_deadline(material), custody.retention_deadline(initial))
         self.assertIn(public["path"], [copy["path"] for copy in material["copies"]])
+
+    def test_reclassification_of_derivative_checks_current_origin_restriction(self):
+        parent = self.capture("parent.txt", b"Observation initially common")
+        git(self.root, "add", "--", "resources/sources")
+        git(self.root, "commit", "-m", "Preserve observation")
+        body = b"Reviewed extract registered under restricted terms"
+        _, purpose = self.triage("extract.txt", body, "sensitive")
+        self.vault.config["source_classification_authorities"] = ["human"]
+        atomic(self.vault.config_path, self.vault.config)
+        self.proposal(body, "sensitive", purpose=purpose,
+                      origin={"format": ORIGIN, "kind": "derived", "method": "extract", "sources": [self.ref(parent)]})
+        transactions.apply(self.vault, self.approved())
+        downgrade = {"classification": "common", "reason": "Permission would allow common reuse"}
+        previous = admission.sign_reclassification(self.vault, digest(body), downgrade)
+        parent_decision = admission.sign_reclassification(self.vault, parent["sha256"],
+            {"classification": "sensitive", "reason": "Source requires restricted handling"})
+        admission.reclassify(self.vault, parent_decision)
+        decision_path = self.vault.control / admission.DECISIONS
+        decisions = decision_path.read_bytes()
+        receipts = set((self.vault.control / "receipts").glob("*.json"))
+        with self.assertRaisesRegex(Blocked, "derivative inherits sensitive"):
+            admission.sign_reclassification(self.vault, digest(body), downgrade)
+        with self.assertRaisesRegex(Blocked, "derivative inherits sensitive"):
+            admission.reclassify(self.vault, previous)
+        self.assertEqual(decision_path.read_bytes(), decisions)
+        self.assertEqual(set((self.vault.control / "receipts").glob("*.json")), receipts)
+        self.assertEqual(admission.Classification(self.vault, admission.source_rows(self.vault)).current(digest(body)),
+                         ("sensitive", None))
+
+    def test_ingestion_resumes_original_identity_before_manifest_and_receipt(self):
+        journal_path = self.vault.control / INGEST_JOURNAL
+        for number, phase in enumerate(("link", "manifest", "receipt"), 1):
+            with self.subTest(phase=phase):
+                body = f"Exact capture {phase}\r\n".encode()
+                name = phase + ".txt"
+                if phase == "link":
+                    original_link = os.link
+                    def interrupted(source, destination):
+                        original_link(source, destination)
+                        raise OSError("Interrupted after original publication")
+                    fault = patch("healdan.admission.os.link", side_effect=interrupted)
+                elif phase == "manifest":
+                    def interrupted(path, data):
+                        if Path(path) == self.root / originals.REGISTRY:
+                            raise OSError("Interrupted after original publication")
+                        return atomic(path, data)
+                    fault = patch("healdan.admission.atomic", side_effect=interrupted)
+                else:
+                    receipt = self.vault.receipt
+                    def interrupted(kind, payload, **kwargs):
+                        if kind == "source-ingest":
+                            raise OSError("Interrupted after original publication")
+                        return receipt(kind, payload, **kwargs)
+                    fault = patch.object(self.vault, "receipt", side_effect=interrupted)
+                with fault, self.assertRaisesRegex(OSError, "Interrupted"):
+                    self.capture(name, body)
+                intent = read_json(journal_path)
+                expected = intent["record"]
+                self.assertEqual(intent["status"], "writing")
+                self.assertEqual((self.root / expected["path"]).read_bytes(), body)
+                resumed = self.capture(name, body)
+                self.assertEqual(resumed, expected)
+                self.assertEqual(resumed["id"], f"F-{number:04d}")
+                self.assertEqual(self.capture(name, body), expected)
+                self.assertEqual(read_json(journal_path)["status"], "complete")
+                self.assertEqual(len(list((self.root / "resources/sources").glob("*/original.txt"))), number)
+                self.assertEqual(len(self.vault.rows(originals.REGISTRY)), number)
+                receipts = [read_json(path) for path in (self.vault.control / "receipts").glob("*.json")]
+                self.assertEqual(sum(r["kind"] == "source-ingest" for r in receipts), number)
+
+    def test_ingestion_preserves_concurrent_original_and_rechecks_current_classification(self):
+        body = b"Capture subject to the current Inbox policy"
+        target = self.root / "resources/sources/F-0001/original.txt"
+        real_link = os.link
+
+        def competing(stage, destination):
+            if Path(destination) == target:
+                atomic(target, b"Concurrent distinct bytes")
+            return real_link(stage, destination)
+
+        with patch("healdan.admission.os.link", side_effect=competing), self.assertRaisesRegex(Blocked, "Concurrent edit"):
+            self.capture("original.txt", body)
+        self.assertEqual(target.read_bytes(), b"Concurrent distinct bytes")
+        self.assertEqual(self.vault.rows(originals.REGISTRY), [])
+        with self.assertRaisesRegex(Blocked, "Concurrent edit"):
+            self.capture("original.txt", body)
+        self.assertEqual(target.read_bytes(), b"Concurrent distinct bytes")
+        target.unlink()
+
+        def interrupt_receipt(kind, payload, **kwargs):
+            if kind == "source-admission":
+                raise OSError("Interrupted after manifest write")
+            return receipt(kind, payload, **kwargs)
+
+        receipt = self.vault.receipt
+        with patch.object(self.vault, "receipt", side_effect=interrupt_receipt), self.assertRaisesRegex(OSError, "Interrupted"):
+            self.capture("original.txt", body)
+        self.assertEqual(target.read_bytes(), body)
+        self.assertEqual(len(self.vault.rows(originals.REGISTRY)), 1)
+        _, purpose = self.triage("original.txt", body, "sensitive")
+        with self.assertRaisesRegex(Blocked, "recorded classification is sensitive"):
+            self.capture("original.txt", body)
+        self.assertEqual(read_json(self.vault.control / INGEST_JOURNAL)["status"], "aborted")
+        self.assertEqual(self.vault.rows(originals.REGISTRY), [])
+        self.assertFalse(target.exists())
+        self.assertEqual((self.root / "inbox/original.txt").read_bytes(), body)
+        self.assertEqual([c["path"] for c in custody.materials(self.vault)[purpose["link"]]["copies"]], ["original.txt"])
+
+    def test_ingestion_withdrawal_after_quarantine_requires_verified_copy_and_ownership(self):
+        self.age()
+        journal_path = self.vault.control / INGEST_JOURNAL
+        link, receipt = os.link, self.vault.receipt
+        for mode in ("created", "reused"):
+            with self.subTest(mode=mode):
+                relative = f"inbox/{mode}.txt"
+                origin = self.root / relative
+                body = f"Synthetic capture for quarantine ({mode})".encode()
+                atomic(origin, body)
+
+                def before_link(stage, destination):
+                    if mode == "reused":
+                        atomic(destination, body)
+                    return link(stage, destination)
+
+                def interrupt(kind, payload, **kwargs):
+                    if kind == "source-admission":
+                        raise OSError("Interrupted before completing ingestion")
+                    return receipt(kind, payload, **kwargs)
+
+                def retry():
+                    return admission.ingest(self.vault, relative, provenance="Disposable evidence",
+                                            captured_at=CAPTURE, classification="common")
+
+                with patch("healdan.admission.os.link", side_effect=before_link), patch.object(
+                        self.vault, "receipt", side_effect=interrupt), self.assertRaisesRegex(OSError, "Interrupted"):
+                    retry()
+                intent = read_json(journal_path)
+                target = self.root / intent["record"]["path"]
+                self.assertEqual(intent["file"], mode)
+                pending_manifest = (self.root / originals.REGISTRY).read_bytes()
+                origin.unlink()
+                with self.assertRaisesRegex(Blocked, "no verified quarantine copy"):
+                    retry()
+                self.assertEqual(target.read_bytes(), body)
+                self.assertEqual((self.root / originals.REGISTRY).read_bytes(), pending_manifest)
+                self.assertEqual(read_json(journal_path)["status"], "writing")
+
+                atomic(origin, body)
+                quarantine = incidents.quarantine(self.vault, relative, "human")
+                record = custody.materials(self.vault)[quarantine["material"]]
+                ciphertext = record["copies"][0]
+                encrypted = Path(ciphertext["root"]) / ciphertext["path"]
+                saved = encrypted.read_bytes()
+                atomic(encrypted, b"Different ciphertext")
+                with self.assertRaisesRegex(Blocked, "no verified quarantine copy"):
+                    retry()
+                self.assertEqual(target.read_bytes(), body)
+                atomic(encrypted, saved)
+                with self.assertRaisesRegex(Blocked, "withdrawn after verified quarantine"):
+                    retry()
+                self.assertEqual(self.vault.rows(originals.REGISTRY), [])
+                self.assertEqual(read_json(journal_path)["status"], "aborted")
+                self.assertEqual(target.exists(), mode == "reused")
+                self.assertEqual(encrypted.read_bytes(), saved)
 
     def test_apply_rechecks_before_effects_and_withdraws_interrupted_writes(self):
         first = b"first signed common capture"
