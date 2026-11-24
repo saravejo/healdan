@@ -7,10 +7,10 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest
-from healdan import admission, backups, custody, inbox, originals, retention, setup, tasks, transactions
+from healdan import admission, backups, custody, inbox, linting, originals, pages, retention, setup, tasks, transactions
 from healdan.core import Blocked, atomic, digest, git, git_bytes, jsonl, read_json, run, stamp, utc
 from healdan.ids import reserve
-from healdan.knowledge import query
+from healdan.knowledge import Knowledge, query
 
 
 class OriginalAdmission(VaultTest):
@@ -36,6 +36,13 @@ class OriginalAdmission(VaultTest):
                               "sha256": digest((root / relative).read_bytes())} for root, relative, kind in copies]}
         custody.save_material(self.vault, record)
         return record
+
+    def track_empty_copy(self, material_id, relative):
+        self.assertEqual((self.root / relative).read_bytes(), b"")
+        record = custody.materials(self.vault)[material_id]
+        record["copies"].append({"root": str(self.root / "inbox"), "path": relative.removeprefix("inbox/"),
+                                 "kind": "export", "status": "present", "sha256": digest(b"")})
+        custody.save_material(self.vault, record)
 
     def source_proposal(self, body):
         identifier, = reserve(self.vault, "F", 1, str(uuid4()))
@@ -159,6 +166,7 @@ class OriginalAdmission(VaultTest):
         self.assertEqual(result["decided_at"], decided["decided_at"])
         self.assertEqual(result["decision"], "resource")
         atomic(self.root / second, b"")
+        self.track_empty_copy(material_id, second)
         inbox.inventory(self.vault)
         save = custody.save_material
 
@@ -279,6 +287,70 @@ class OriginalAdmission(VaultTest):
         self.assertEqual((self.root / "archive" / archived).read_bytes(), b"")
         self.assertEqual(custody.materials(self.vault)[shared["id"]]["holds"], [hold])
 
+    def test_archive_custody_follows_only_exact_origin_and_recovers_shared_copy(self):
+        first, other = "inbox/a/first.txt", "inbox/b/second.txt"
+        sha = self.triage_empty(first)
+        atomic(self.root / other, b"")
+        direct = self.expiring_export("direct", (self.root / "inbox", "a/first.txt", "export"))
+        shared = self.expiring_export("shared", (self.root, first, "export"))
+        sibling = self.expiring_export("sibling", (self.root / "inbox", "b/second.txt", "export"))
+        hold = custody.hold(self.vault, shared["id"], "Keep the shared origin", "human")
+        save = custody.save_material
+
+        def stop_after_direct(vault, record):
+            save(vault, record)
+            if record["id"] == direct["id"]:
+                raise OSError("Interrupted before recording the held shared copy")
+
+        with patch("healdan.custody.save_material", side_effect=stop_after_direct), self.assertRaisesRegex(OSError, "Interrupted"):
+            inbox.archive_empty(self.vault, sha)
+        self.assertEqual(custody.materials(self.vault)[shared["id"]]["copies"][0]["status"], "present")
+        inbox.archive_empty(self.vault, sha)
+        saved = custody.materials(self.vault)
+        self.assertEqual(saved[sibling["id"]], sibling)
+        self.assertEqual((self.root / other).read_bytes(), b"")
+        for identifier in (direct["id"], shared["id"]):
+            self.assertEqual([copy["status"] for copy in saved[identifier]["copies"]], ["moved", "present"])
+            self.assertEqual(saved[identifier]["copies"][1]["path"], f"{sha}/first.txt")
+        self.assertEqual(saved[shared["id"]]["holds"], [hold])
+        self.assertEqual(custody.retention_deadline(saved[shared["id"]]), custody.retention_deadline(shared))
+        with self.assertRaisesRegex(Blocked, "Active hold"):
+            retention.guard(self.vault, saved[direct["id"]], saved[direct["id"]]["copies"][1], "2026-04-15T00:00:00Z")
+        self.assertEqual(len(self.archive_receipts()), 1)
+
+    def test_lint_uses_completed_archive_receipts_until_an_inbox_path_reappears(self):
+        first, second = "inbox/a/first.txt", "inbox/b/second.txt"
+        atomic(self.root / first, b"")
+        inbox.inventory(self.vault)
+        sha = digest(b"")
+        captured = "2026-04-01T00:00:00Z"
+        deferred = inbox.decide(self.vault, sha, "defer", owner="human", classification="common", entered_at=captured,
+                                entry_origin="Original fixture evidence", defer_until=utc() + timedelta(hours=1))
+        receipt = self.vault.control / "receipts" / (deferred["decision_receipt"] + ".json")
+        original = receipt.read_bytes()
+        now = utc() + timedelta(days=8)
+
+        def findings():
+            results, errors = linting.collect(self.vault, now)
+            self.assertEqual(errors, [])
+            return {item["message"] for item in results.values() if item["category"] == "inbox"}
+
+        expected = {"original_triage_overdue", "deferral_due"}
+        self.assertEqual(findings(), expected)
+        inbox.archive_empty(self.vault, sha)
+        self.assertEqual(findings(), set())
+        atomic(self.root / second, b"")
+        inbox.inventory(self.vault)
+        self.assertEqual(findings(), expected)
+        inbox.archive_empty(self.vault, sha)
+        self.assertEqual(findings(), set())
+        atomic(self.root / first, b"")
+        self.assertEqual(findings(), expected)
+        stored = read_json(self.vault.control / "inbox.json")[sha]
+        for field in ("classification", "decision", "decision_receipt", "decided_at", "defer_until", "entered_at"):
+            self.assertEqual(stored[field], deferred[field])
+        self.assertEqual(receipt.read_bytes(), original)
+
     def test_stale_deleted_copy_plan_preserves_reused_archive_destination(self):
         first = "inbox/a/nota.txt"
         sha = self.triage_empty(first)
@@ -292,6 +364,7 @@ class OriginalAdmission(VaultTest):
         self.assertFalse(destination.exists())
         second = "inbox/b/nota.txt"
         atomic(self.root / second, b"")
+        self.track_empty_copy(material["id"], second)
         inbox.inventory(self.vault)
         inbox.archive_empty(self.vault, sha)
         new = retention.plan(self.vault, now)
@@ -326,10 +399,12 @@ class OriginalAdmission(VaultTest):
 
         for source in (second, independent):
             atomic(self.root / source, b"")
+        self.track_empty_copy(tracked["id"], second)
         inbox.inventory(self.vault)
         code, error = self.cli("inbox", "archive-empty", sha)
         self.assertEqual(code, 5, error)
         self.assertIn("Resume retention first", error["error"])
+        self.assertIn("maintenance execute " + plan["id"], error["error"])
         self.assertIn(second, error["error"])
         self.assertIn(archive_name, error["error"])
         self.assertNotIn(independent, error["error"])
@@ -340,7 +415,16 @@ class OriginalAdmission(VaultTest):
         self.assertEqual(read_json(self.vault.control / inbox.ARCHIVE_JOURNAL), {})
         self.assertIn(original_receipts[0], self.archive_receipts())
 
-        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        save_material = custody.save_material
+
+        def interrupt_after_reconciliation(vault, material):
+            save_material(vault, material)
+            raise OSError("Interrupted after custody update")
+
+        with patch("healdan.retention.save_material", side_effect=interrupt_after_reconciliation):
+            reconciled = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(reconciled["entries"][0]["status"], "deleting")
+        self.assertEqual(custody.materials(self.vault)[tracked["id"]]["copies"][slot]["status"], "deleted")
         self.assertEqual(self.cli("inbox", "archive-empty", sha)[0], 0)
         self.assertEqual(destination.read_bytes(), b"")
         self.assertCountEqual([receipt["source"] for receipt in self.archive_receipts()], [first, second, independent])
@@ -464,6 +548,42 @@ class OriginalAdmission(VaultTest):
         self.assertEqual(originals.git_blob(restored, recovery["commit"], row["path"]), body)
         start, end = (claim["sources"][0][field] for field in ("start", "end"))
         self.assertEqual(digest((restored / row["path"]).read_bytes()[start:end]), claim["sources"][0]["sha256"])
+
+    def test_query_and_preview_only_read_git_blobs_for_used_sources(self):
+        claim = self.claim()
+        self.knowledge([claim])
+        used, = self.vault.rows(originals.REGISTRY)
+        rows = [used]
+        cutoff = "2026-06-01T00:00:00Z"
+        for count in (0, 8, 32, 64):
+            with self.subTest(unused_sources=count):
+                for offset in range(len(rows), count + 1):
+                    identifier = f"F-{offset + 1:04d}"
+                    path = f"resources/sources/{identifier}/original.txt"
+                    body = f"Unreferenced material {offset}\n".encode()
+                    atomic(self.root / path, body)
+                    rows.append(dict(used, id=identifier, path=path, size=len(body), sha256=digest(body)))
+                self.rows(originals.REGISTRY, rows)
+                git(self.root, "add", "--", "wiki", "resources/sources", "control/approvals")
+                git(self.root, "commit", "-m", f"Preserve the cited source and {count} unused sources")
+                with patch.object(originals, "git_blob", wraps=originals.git_blob) as read:
+                    self.assertEqual(query(self.vault, {"entity": "instrument"}, cutoff)["code"], 0)
+                self.assertCountEqual([call.args[2] for call in read.call_args_list], [originals.REGISTRY, used["path"]])
+                with patch.object(originals, "git_blob", wraps=originals.git_blob) as read:
+                    preview = pages.preview(self.vault, cutoff)
+                self.assertEqual(preview["pending_evidence"], [])
+                self.assertCountEqual([call.args[2] for call in read.call_args_list], [originals.REGISTRY, used["path"]])
+
+        unused = self.root / rows[-1]["path"]
+        raw = unused.read_bytes()
+        atomic(unused, b"Divergent bytes committed in a source the query does not use")
+        git(self.root, "add", "--", rows[-1]["path"])
+        git(self.root, "commit", "-m", "Fixture divergent unused blob")
+        atomic(unused, raw)
+        self.assertEqual(query(self.vault, {}, cutoff)["code"], 0)
+        self.assertEqual(pages.preview(self.vault, cutoff)["pending_evidence"], [])
+        with self.assertRaisesRegex(Blocked, rows[-1]["id"]):
+            Knowledge(self.vault)
 
     def test_effective_git_attributes_block_ingest_and_approved_proposal(self):
         path = "inbox/converted.txt"

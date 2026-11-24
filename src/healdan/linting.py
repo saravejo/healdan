@@ -42,7 +42,7 @@ def collect(vault, now=None):
         errors.append({"category": "query", "error": str(exc)})
     items = read_json(vault.control / "inbox.json", {})
     for item in items.values():
-        for message in inbox_findings(item, now):
+        for message in inbox_findings(item, now, vault=vault):
             add("inbox", item["sha256"] + ":" + message, message)
     known = {p for i in items.values() for p in i["paths"]}
     for path in (vault.root / "inbox").rglob("*"):

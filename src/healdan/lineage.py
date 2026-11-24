@@ -54,6 +54,34 @@ def page_revision(path, body, claims, sources, source_aliases=None):
     return {"path": path, "revision": digest(body), "claims": uses}
 
 
+def package_pages(payload):
+    pages = payload.get("page_revisions", [])
+    require(isinstance(pages, list), "Invalid signed page revisions", 5)
+    files = payload.get("files", {})
+    seen = set()
+    for page in pages:
+        require(isinstance(page, dict) and set(page) == {"path", "revision", "claims"} and
+                sha256(page["revision"]) and isinstance(page["claims"], list), "Invalid signed page revision", 5)
+        path = page["path"]
+        require(wiki_path(path) and path not in seen and isinstance(files, dict) and path in files,
+                "Signed page revision lacks a unique published file", 5)
+        seen.add(path)
+        try:
+            body = base64.b64decode(files[path], validate=True)
+        except (TypeError, ValueError) as exc:
+            raise Blocked("Invalid signed page bytes: " + path, 5) from exc
+        require(digest(body) == page["revision"], "Signed page revision differs from its bytes", 5)
+        for claim in page["claims"]:
+            require(isinstance(claim, dict) and set(claim) == {"id", "revision", "sources"} and
+                    sha256(claim["revision"]) and isinstance(claim["sources"], list), "Invalid signed page claim", 5)
+            if claim["sources"]:
+                references(claim["sources"])
+                for ref in claim["sources"]:
+                    registry_records(REGISTRY, [ref])
+        registry_records(CLAIMS, page["claims"])
+    return pages
+
+
 class PageHistory:
     def __init__(self, vault, approvals=None):
         self.vault = vault
@@ -61,6 +89,7 @@ class PageHistory:
         self.signed = None
         self.current = None
         self.historical = {}
+        self.history_trees = None
 
     def _signed_pages(self):
         if self.signed is not None:
@@ -69,14 +98,7 @@ class PageHistory:
         if self.approvals is None:
             self.approvals = [verify(row, "package", trusted_signers(self.vault)) for row in self.vault.rows(LEDGER)]
         for payload in self.approvals:
-            revisions = payload.get("page_revisions", [])
-            require(isinstance(revisions, list), "Invalid signed page revisions", 5)
-            for page in revisions:
-                path = page.get("path")
-                require(wiki_path(path) and path in payload.get("files", {}),
-                        "Signed page revision lacks its published file", 5)
-                body = base64.b64decode(payload["files"][path], validate=True)
-                require(digest(body) == page.get("revision"), "Signed page revision differs from its bytes", 5)
+            for page in package_pages(payload):
                 entries = self.signed.setdefault(page["revision"], [])
                 if page not in entries:
                     entries.append(page)
@@ -101,11 +123,14 @@ class PageHistory:
         if not head:
             return pages
         oid = git_bytes(root, "hash-object", "--no-filters", "--stdin", data=body).strip()
-        commits = git(root, "log", "--reverse", "--full-history", "--format=%H", "--all", head, "--", "wiki").splitlines()
+        if self.history_trees is None:
+            commits = git(root, "log", "--reverse", "--full-history", "--format=%H", "--all", head, "--", "wiki").splitlines()
+            self.history_trees = [(commit, git_bytes(root, "ls-tree", "-rz", commit, "--", "wiki").split(b"\0")[:-1])
+                                  for commit in commits]
         seen = set()
-        for commit in commits:
+        for commit, entries in self.history_trees:
             matches = []
-            for entry in git_bytes(root, "ls-tree", "-rz", commit, "--", "wiki").split(b"\0")[:-1]:
+            for entry in entries:
                 meta, name = entry.split(b"\t", 1)
                 if meta.split()[-1] == oid:
                     path = name.decode("utf-8")
@@ -146,11 +171,12 @@ class PageHistory:
 
 
 class Lineage:
-    def __init__(self, vault, sources, page_history, bodies=None):
+    def __init__(self, vault, sources, page_history, bodies=None, *, verify_original=None):
         self.vault = vault
         self.sources = sources
         self.page_history = page_history
         self.bodies = bodies or {}
+        self.verify_original = verify_original
         self.aliases = None
         self.by_digest = defaultdict(list)
         self.conversions = {}
@@ -166,6 +192,8 @@ class Lineage:
 
     def body(self, identifier):
         row = self.sources[identifier]
+        if self.verify_original:
+            self.verify_original(identifier)
         if identifier not in self.bodies:
             body = safe_path(self.vault.root, row["path"], exists=True).read_bytes()
             self.bodies[identifier] = verify_body(row, body)

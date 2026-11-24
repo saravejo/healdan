@@ -3,12 +3,31 @@ from base64 import b64decode
 from pathlib import Path
 
 from .binding import Repository
-from .core import read_json, require, safe_path
+from .core import TRANSACTION_V2, Blocked, digest, read_json, require, safe_path
+from .lineage import package_pages, sha256
 from .migration import PACKAGE_FORMATS
 from .regression import CASE_REGISTRY, _compatible_case
 from .review import csp_state_streak, read_csp_state
 
 JOURNAL_FIELDS = {"package_id", "status", "base", "files", "before", "written"}
+TERMINAL_FIELDS = {"commit", "completed_at"}
+PUBLICATION_FIELDS = {"before_files", "publication_at", "admissions", "aborted_at", "reason", "admission_conflict"}
+LEGACY_JOURNAL = "healdan-transaction-legacy-v1"
+
+
+def _journal_format(journal):
+    require(isinstance(journal, dict) and JOURNAL_FIELDS <= journal.keys() and isinstance(journal["status"], str),
+            "Unsupported integration journal format", 5)
+    fields = journal.keys() - {"format"}
+    inferred = TRANSACTION_V2 if fields & PUBLICATION_FIELDS or journal["status"] == "aborted" else LEGACY_JOURNAL
+    version = journal.get("format", inferred)
+    if version == TRANSACTION_V2:
+        require(fields <= JOURNAL_FIELDS | TERMINAL_FIELDS | PUBLICATION_FIELDS and
+                journal["status"] in {"writing", "complete", "aborted"}, "Unsupported integration journal format", 5)
+    else:
+        require(version == LEGACY_JOURNAL and fields <= JOURNAL_FIELDS | TERMINAL_FIELDS and
+                journal["status"] in {"writing", "complete"}, "Unsupported integration journal format", 5)
+    return version
 
 
 def _journal(vault):
@@ -16,9 +35,7 @@ def _journal(vault):
     if not path.exists():
         return None
     journal = read_json(path)
-    require(isinstance(journal, dict) and JOURNAL_FIELDS <= journal.keys() <=
-            JOURNAL_FIELDS | {"commit", "completed_at"} and journal["status"] in {"writing", "complete"},
-            "Unsupported integration journal format", 5)
+    version = _journal_format(journal)
     require(isinstance(journal["package_id"], str) and isinstance(journal["base"], str) and
             isinstance(journal["files"], dict) and isinstance(journal["before"], dict) and
             set(journal["files"]) == set(journal["before"]) and isinstance(journal["written"], list) and
@@ -26,14 +43,37 @@ def _journal(vault):
             "Unsupported integration journal entries", 5)
     for name, body in journal["files"].items():
         safe_path(vault.repository.primary, name)
-        b64decode(body, validate=True)
-    return "healdan-transaction-legacy-v1"
+        _journal_bytes(body)
+    if version == TRANSACTION_V2:
+        before_files = journal.get("before_files", {})
+        require(isinstance(before_files, dict) and before_files.keys() <= journal["files"].keys(),
+                "Invalid integration journal originals", 5)
+        for name, body in before_files.items():
+            require(digest(_journal_bytes(body)) == journal["before"][name], "Integration journal original differs: " + name, 5)
+        admissions = journal.get("admissions", [])
+        require(isinstance(admissions, list) and all(isinstance(entry, dict) and isinstance(entry.get("path"), str) and
+                entry.get("path") in journal["files"] and sha256(entry.get("sha256")) and
+                sha256(entry.get("revision")) and isinstance(entry.get("source"), str) for entry in admissions),
+                "Invalid integration journal admissions", 5)
+        require(all(isinstance(journal[key], str) for key in (TERMINAL_FIELDS | PUBLICATION_FIELDS) & journal.keys()
+                    if key not in {"before_files", "admissions"}), "Invalid integration journal state", 5)
+        require(journal["status"] != "aborted" or {"aborted_at", "reason"} <= journal.keys(),
+                "Incomplete withdrawn integration journal", 5)
+    return version
+
+
+def _journal_bytes(body):
+    try:
+        return b64decode(body, validate=True)
+    except (TypeError, ValueError) as exc:
+        raise Blocked("Invalid integration journal bytes", 5) from exc
 
 
 def _package_format(payload):
     require(isinstance(payload, dict), "Invalid persisted approval payload", 5)
     if set(payload) == {"claim_digests"}:
         return "healdan-claim-digests-v1"
+    package_pages(payload)
     return PACKAGE_FORMATS.get(frozenset(payload))
 
 

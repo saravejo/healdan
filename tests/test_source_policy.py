@@ -1,5 +1,6 @@
 import base64
 import copy
+from datetime import timedelta
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from uuid import uuid4
 from support import VaultTest
 import test_transactions
 from healdan import admission, custody, inbox, incidents, originals, pages, tasks, transactions
-from healdan.core import INGEST_JOURNAL, Blocked, atomic, digest, git, jsonl, read_json
+from healdan.core import INGEST_JOURNAL, Blocked, atomic, digest, git, jsonl, read_json, utc
 from healdan.ids import reserve
 from healdan.knowledge import query
 from healdan.lineage import ORIGIN
@@ -205,6 +206,48 @@ class SourcePolicy(VaultTest):
         triaged, _ = self.triage("common.txt", b"Previously approved common", "common")
         self.capture("common-copy.txt", b"Previously approved common")
         self.assertEqual(read_json(path)[triaged["sha256"]]["decision_receipt"], triaged["decision_receipt"])
+
+    def test_unknown_deferral_allows_first_triage_without_resetting_custody(self):
+        body = b"Deferral pending the first explicit decision"
+        source = "inbox/deferred.txt"
+        sha = digest(body)
+        material_id = "inbox-" + sha
+        atomic(self.root / source, body)
+        inbox.inventory(self.vault)
+        deferred = inbox.decide(self.vault, sha, "defer", owner="human", classification="unknown",
+            entered_at=CAPTURE, entry_origin="Original fixture receipt", defer_until=utc() + timedelta(days=1),
+            purpose={"purpose": "Pending decision", "necessity": "Review required", "owner": "human", "link": material_id})
+        hold = custody.hold(self.vault, material_id, "Preserve pending material", "human")
+        initial = custody.materials(self.vault)[material_id]
+        receipt_path = self.vault.control / "receipts" / (deferred["decision_receipt"] + ".json")
+        old = receipt_path.read_bytes()
+        with self.assertRaisesRegex(Blocked, "recorded classification is unknown"):
+            self.capture("deferred.txt", body)
+        with self.assertRaisesRegex(Blocked, "cannot reset"):
+            inbox.decide(self.vault, sha, "ingest", owner="human", classification="common",
+                         entered_at="2026-04-02T00:00:00Z", entry_origin="Later", destination="Reviewed")
+
+        def stop_before_inbox(path, body):
+            if Path(path) == self.vault.control / "inbox.json":
+                raise OSError("Interrupted after saving first classification in custody")
+            return atomic(path, body)
+
+        with patch("healdan.inbox.atomic", side_effect=stop_before_inbox), self.assertRaisesRegex(OSError, "Interrupted"):
+            inbox.decide(self.vault, sha, "ingest", owner="human", classification="common", destination="Reviewed")
+        with self.assertRaisesRegex(Blocked, "Conflicting source classifications"):
+            self.capture("deferred.txt", body)
+        classified = inbox.decide(self.vault, sha, "ingest", owner="human", classification="common", destination="Reviewed")
+        self.assertEqual(classified["classification"], "common")
+        self.assertEqual(classified["entered_at"], deferred["entered_at"])
+        self.assertIsNone(classified["defer_until"])
+        self.assertIn(deferred["decision_receipt"], classified["receipts"])
+        self.assertEqual(receipt_path.read_bytes(), old)
+        self.assertEqual(self.capture("deferred.txt", body)["classification"], "common")
+        current = custody.materials(self.vault)[material_id]
+        self.assertEqual(current["holds"], [hold])
+        self.assertEqual(custody.retention_deadline(current), custody.retention_deadline(initial))
+        with self.assertRaisesRegex(Blocked, "authorized reclassification"):
+            inbox.decide(self.vault, sha, "archive", owner="human", classification="mixed", destination="Reviewed")
 
     def test_restricted_copies_and_derivatives_cannot_be_declared_common(self):
         for classification in ("personal", "sensitive", "mixed"):

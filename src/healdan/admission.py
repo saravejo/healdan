@@ -257,9 +257,23 @@ def reclassify(vault, envelope):
 
 
 def require_triage(vault, sha, classification):
-    current, _ = Classification(vault, published_rows(vault)).current(sha)
+    policy = Classification(vault, published_rows(vault))
+    item = policy.items[sha]
+    material_id = "inbox-" + sha
+    if (item.get("classification") == "unknown" and item.get("decision") == "defer" and
+            classification in PUBLISHABLE | {"mixed"} and not policy.history.get(sha) and
+            policy.facts(sha).keys() <= {"inbox", "custody:" + material_id}):
+        material = policy.materials.get(material_id)
+        if not material or material["classification"] == "unknown":
+            return True
+        if material["classification"] == classification and material.get("decision_receipt"):
+            decision = receipt(vault, material["decision_receipt"], "inbox-decision")
+            if decision.get("sha256") == sha and decision.get("classification") == classification:
+                return True  # The first classification reached custody before the Inbox write.
+    current, _ = policy.current(sha)
     require(current is None or current == classification,
             f"Source {sha} is {current}; an authorized reclassification to {classification} is required", 5)
+    return False
 
 
 def require_origin_classification(policy, sha, classification):

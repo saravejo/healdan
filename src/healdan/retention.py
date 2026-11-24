@@ -36,7 +36,7 @@ def copy_identity(copy):
 def pending_deletion_paths(vault):
     root = safe_path(vault.control, "deletions")
     inventory = materials(vault)
-    paths = set()
+    paths = {}
     for path in root.glob("*.json"):
         plan = read_json(safe_path(root, path.name, exists=True))
         for entry in plan["entries"]:
@@ -47,7 +47,7 @@ def pending_deletion_paths(vault):
             if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
                     copy_identity(copies[index]) == copy_identity(entry["copy"])):
                 continue
-            paths.add(copy_path(vault, entry["copy"]))
+            paths.setdefault(copy_path(vault, entry["copy"]), set()).add(plan["id"])
     return paths
 
 

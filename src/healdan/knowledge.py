@@ -14,6 +14,10 @@ STATES = LIVE | {"superseded", "rejected"}
 QUERY_FILTERS = {"entity", "property", "environment", "modality", "topic", "term"}
 
 
+class CommittedSourceError(Blocked):
+    pass
+
+
 def typed(value):
     require(isinstance(value, dict) and set(value) == {"type", "value", "unit"}, "Invalid typed value")
     types = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "null": type(None)}
@@ -31,15 +35,19 @@ def claim_key(claim):
 
 
 class Knowledge:
-    def __init__(self, vault, *, proposed=(), diagnostic=False):
+    def __init__(self, vault, *, proposed=(), diagnostic=False, check_all_committed=True):
         self.vault = vault
         claims = "wiki/claims.jsonl"
         self.claims = registry_records(claims, vault.rows(claims))
         self.by_identity = {identity(k): k for k in self.claims}
         self.sources = {}
         sources = originals.REGISTRY
-        root, revision = vault.repository.root, vault.head()
-        originals.verify_committed(root, revision, originals.committed_sources(root, revision).values())
+        self.git_root, self.git_revision = vault.repository.root, vault.head()
+        self.committed_sources = originals.committed_sources(self.git_root, self.git_revision)
+        self.verified_sources = set()
+        if check_all_committed:
+            originals.verify_committed(self.git_root, self.git_revision, self.committed_sources.values())
+            self.verified_sources.update(self.committed_sources)
         for row in registry_records(sources, vault.rows(sources)).values():
             require(row.get("provenance") and row.get("classification"), "Missing source provenance/class")
             require(row["classification"] != "secret", "Secrets cannot be promoted as canonical sources")
@@ -76,7 +84,8 @@ class Knowledge:
             approved.update(payload.get("claim_digests", {}).values())
         self.lineage = Lineage(vault, {identifier: row for identifier, (row, _) in self.sources.items()},
                                PageHistory(vault, approvals),
-                               {identifier: body for identifier, (_, body) in self.sources.items()})
+                               {identifier: body for identifier, (_, body) in self.sources.items()},
+                               verify_original=None if check_all_committed else self.verify_committed_source)
         self.locators = {}
         for row in self.claims.values():
             require(row.get("state") in STATES, "Unknown claim state")
@@ -109,6 +118,14 @@ class Knowledge:
                 require(row.get("successor"), "Superseded claim lacks successor")
             self.successor(row["id"])
         self.classification = admission.Classification(vault, self.lineage.sources)
+
+    def verify_committed_source(self, identifier):
+        if identifier not in self.verified_sources and identifier in self.committed_sources:
+            try:
+                originals.verify_committed(self.git_root, self.git_revision, [self.committed_sources[identifier]])
+            except Blocked as exc:
+                raise CommittedSourceError(str(exc), exc.code) from exc
+            self.verified_sources.add(identifier)
 
     def resolve_id(self, value):
         key = identity(value)
@@ -181,6 +198,8 @@ class Knowledge:
                 observed, uncertain = self.source_support(identifier, cutoff, chain, revision)
                 roots.update(observed)
                 legacy |= uncertain
+            except CommittedSourceError:
+                raise
             except Blocked as exc:
                 message = str(exc)
                 problems.append(message if message.startswith(" -> ".join(chain)) else
@@ -245,7 +264,7 @@ def query(vault, filters, cutoff=None, *, proposed=(), max_records=None):
         cutoff = stamp(cutoff)
         before = vault.fingerprint()
         classification = admission.classification_token(vault)
-        result = Knowledge(vault, proposed=proposed).resolve(filters, cutoff, max_records=max_records)
+        result = Knowledge(vault, proposed=proposed, check_all_committed=False).resolve(filters, cutoff, max_records=max_records)
         require(vault.fingerprint() == before and admission.classification_token(vault) == classification,
                 "Query inputs changed during research", 5)
         return dict(result, cutoff=cutoff, commit=vault.head(), fingerprint=before)

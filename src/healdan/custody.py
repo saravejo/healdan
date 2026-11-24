@@ -4,7 +4,7 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from .core import atomic, canonical, decode, digest, executable, read_json, require, run, safe_path, stamp, utc
+from .core import atomic, canonical, canonical_storage_path, decode, digest, executable, read_json, require, run, safe_path, stamp, utc
 from .signing import trusted_signers, verify
 
 INACTIVE_COPIES = {"deleted", "moved"}
@@ -71,26 +71,31 @@ def save_material(vault, record):
         atomic(vault.control / "materials.json", rows)
 
 
-def record_archive_move(vault, records, move, receipt):
+def archive_move_origins(vault, records, source, sha, receipt):
+    origin_path = canonical_storage_path(safe_path(vault.root, source))
+    origins = []
+    for record in records:
+        tracked = [copy for copy in record["copies"] if copy["kind"] == "export" and copy["sha256"] == sha and
+                   (copy["status"] not in INACTIVE_COPIES or copy.get("move_receipt") == receipt) and
+                   canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == origin_path]
+        if tracked:
+            origins.append((record, tracked))
+    return origins
+
+
+def record_archive_move(vault, origins, move, receipt):
     payload = move["payload"]
-    source, destination, sha = payload["source"], payload["destination"], payload["sha256"]
-    origin_path = safe_path(vault.root, source)
+    destination, sha = payload["destination"], payload["sha256"]
     archived = safe_path(vault.root, destination, exists=True)
     require(digest(archived.read_bytes()) == sha, "Archived custody copy changed: " + destination, 5)
-    for record in records:
+    location = canonical_storage_path(archived)
+    for record, tracked in origins:
         copies = record["copies"]
-        origins = [copy for copy in copies if copy["kind"] == "export" and copy["sha256"] == sha and
-                   vault.relocated_path(copy["root"]) / copy["path"] == origin_path]
-        if not any(copy.get("move_receipt") == receipt for copy in origins):
-            active = [copy for copy in origins if copy["status"] not in INACTIVE_COPIES]
-            if not active:
-                active = [{"root": str(vault.root / "inbox"), "path": source.removeprefix("inbox/"),
-                           "sha256": sha, "kind": "export"}]
-                copies.extend(active)
-            for copy in active:
+        for copy in tracked:
+            if copy.get("move_receipt") != receipt:
                 copy.update(status="moved", moved_at=move["at"], move_receipt=receipt)
         if not any(copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] == "present" and
-                   vault.relocated_path(copy["root"]) / copy["path"] == archived for copy in copies):
+                   canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location for copy in copies):
             copies.append({"root": str(vault.root / "archive"), "path": destination.removeprefix("archive/"),
                            "sha256": sha, "kind": "archive", "status": "present"})
         save_material(vault, record)

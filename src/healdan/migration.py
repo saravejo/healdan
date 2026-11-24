@@ -3,6 +3,7 @@ import re
 
 from .core import Blocked, REGISTRIES, digest, git, git_bytes, read_json, require
 from .ids import identity, inventory as id_inventory, registry_records
+from .lineage import package_pages
 from .regression import case_projections
 from .review import csp_state_bytes, csp_state_streak, csp_status, decode_csp_state
 from .signing import trusted_signers, verify_origin
@@ -13,6 +14,7 @@ PACKAGE_FIELDS_V1 = frozenset({"task", "base", "fingerprint", "files", "claim_di
 PACKAGE_FORMATS = {
     PACKAGE_FIELDS_V1: "healdan-approval-package-v1",
     PACKAGE_FIELDS_V1 | {"input_hashes"}: "healdan-approval-package-v2",
+    PACKAGE_FIELDS_V1 | {"input_hashes", "page_revisions"}: "healdan-approval-package-v3",
 }
 CSP_FIELDS_V1 = {"rule", "units", "units_digest", "seed", "initial_streak", "state_digest", "inspections"}
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -23,6 +25,7 @@ def _project_package(vault, approval, original):
     require(isinstance(signed, dict), "Approval package payload requires an object")
     version = PACKAGE_FORMATS.get(frozenset(signed))
     require(version is not None, "Approval package fields or format are unknown")
+    package_pages(signed)
     content = {key: value for key, value in signed.items() if key not in {"package_id", "csp"}}
     require(digest(content) == signed["package_id"], "Signed package identity differs from its content")
     claims = signed["claim_digests"]
@@ -137,7 +140,7 @@ def purge_check(vault):
     if any(t.get("capacity_held") or t.get("processes") for t in all_tasks(vault)):
         blockers.append("Task capacity, processes or reconciliation is pending")
     transaction = read_json(vault.control / "transaction.json")
-    if transaction and transaction["status"] != "complete":
+    if transaction and transaction["status"] not in {"complete", "aborted"}:
         blockers.append("Integration is pending")
     for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
         if (vault.common / name).exists():

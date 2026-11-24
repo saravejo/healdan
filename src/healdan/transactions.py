@@ -4,7 +4,7 @@ import copy
 from pathlib import Path
 import tempfile
 
-from .core import REGISTRIES, atomic, digest, extend_jsonl, git, git_bytes, read_json, require, safe_path, stamp, utc
+from .core import REGISTRIES, TRANSACTION_V2, atomic, digest, extend_jsonl, git, git_bytes, read_json, require, safe_path, stamp, utc
 from . import admission, originals
 from .ids import aliases, committed_registries, identity, registry_records
 from .knowledge import Knowledge
@@ -324,7 +324,7 @@ def apply(vault, identifier=None, *, recover=False):
             files[LEDGER] = base64.b64encode(extend_jsonl(ledger, [record["approval"]])).decode("ascii")
             before_files = {name: safe_path(vault.root, name).read_bytes() for name in files
                             if safe_path(vault.root, name).exists()}
-            journal = {"package_id": identifier, "status": "writing", "base": vault.head(), "files": files,
+            journal = {"format": TRANSACTION_V2, "package_id": identifier, "status": "writing", "base": vault.head(), "files": files,
                        "before": {p: digest(before_files[p]) if p in before_files else None for p in files},
                        "before_files": {p: base64.b64encode(body).decode("ascii") for p, body in before_files.items()},
                        "publication_at": stamp(), "written": []}

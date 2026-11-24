@@ -12,9 +12,11 @@ import venv
 import zipfile
 
 from support import VaultTest
+import test_source_policy
+import test_transactions
 import healdan
-from healdan import binding, build, installation, launchd, maintenance, tasks
-from healdan.core import Blocked, Vault, atomic, decode, git, read_json, run
+from healdan import binding, build, compatibility, installation, launchd, maintenance, tasks, transactions
+from healdan.core import TRANSACTION_V2, Blocked, Vault, atomic, decode, git, read_json, run
 from healdan.setup import initialize
 
 
@@ -248,6 +250,75 @@ class ImmutableInstallation(VaultTest):
             self.activate(b, Vault(self.root))
         self.assertEqual(selected.read_bytes(), selector)
         self.assertEqual(self.identity(a.entry_point), a.identity)
+
+    def test_activation_and_migration_accept_generated_page_package_without_rewriting(self):
+        prepared = self.stage("page package reader")
+        _, package = test_transactions.Transactions.prepare_fixture(self)
+        identifier = package["id"]
+        transactions.inspect_package(self.vault, identifier, {"C-0001": "conform"})
+        signed = transactions.approve(self.vault, identifier)
+        self.assertTrue(signed["payload"]["page_revisions"])
+        transactions.apply(self.vault, identifier)
+        journal = self.vault.control / "transaction.json"
+        ledger = self.root / transactions.LEDGER
+        self.assertEqual(read_json(journal)["format"], TRANSACTION_V2)
+        before = {path: path.read_bytes() for path in (journal, ledger)}
+        self.assertEqual(self.activate(prepared)["build"], prepared.identity)
+        code, result = self.cli("migration", "preview")
+        self.assertEqual(code, 0, result)
+        approved, = result["packages"]
+        origin = approved["projection"]["origin"]
+        self.assertEqual(origin["format"], "healdan-approval-package-v3")
+        self.assertEqual(origin["approval"], signed)
+        self.assertEqual(base64.b64decode(origin["row_base64"]), before[ledger])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+        previous = read_json(journal)
+        del previous["format"]
+        atomic(journal, previous)
+        unversioned = journal.read_bytes()
+        self.assertEqual(self.activate(prepared)["build"], prepared.identity)
+        self.assertEqual(journal.read_bytes(), unversioned)
+        capabilities = prepared.manifest["capabilities"]
+        older = {**capabilities, "journal": [compatibility.LEGACY_JOURNAL]}
+        with self.assertRaisesRegex(Blocked, "cannot read current journal format"):
+            compatibility.check(self.vault, older)
+        older = {**capabilities, "package": capabilities["package"][:-1]}
+        with self.assertRaisesRegex(Blocked, "cannot read current package format"):
+            compatibility.check(self.vault, older)
+
+    def test_activation_reads_interrupted_and_withdrawn_publication_journals(self):
+        prepared = self.stage("withdrawn source reader")
+        body = b"Disposable source approval fixture"
+        source = test_source_policy.SourcePolicy.proposal(self, body)
+        identifier = test_source_policy.SourcePolicy.approved(self)
+        destination = self.root / source["path"]
+
+        def interrupt(path, data):
+            atomic(path, data)
+            if Path(path) == destination:
+                raise OSError("Interrupted after source publication")
+
+        with patch("healdan.transactions.atomic", side_effect=interrupt), self.assertRaisesRegex(OSError, "Interrupted"):
+            transactions.apply(self.vault, identifier)
+        journal = self.vault.control / "transaction.json"
+        self.assertEqual(read_json(journal)["status"], "writing")
+        before = journal.read_bytes()
+        self.assertEqual(self.activate(prepared)["build"], prepared.identity)
+        self.assertEqual(journal.read_bytes(), before)
+        test_source_policy.SourcePolicy.triage(self, "restricted.txt", body, "sensitive")
+        with self.assertRaisesRegex(Blocked, "recorded classification is sensitive"):
+            transactions.apply(self.vault, recover=True)
+        self.assertEqual(read_json(journal)["status"], "aborted")
+        self.assertFalse(destination.exists())
+        after = journal.read_bytes()
+        self.assertEqual(self.activate(prepared)["build"], prepared.identity)
+        self.assertEqual(journal.read_bytes(), after)
+        changed = read_json(journal)
+        changed["before_files"][transactions.LEDGER] = "%%%"
+        atomic(journal, changed)
+        with self.assertRaisesRegex(Blocked, "Invalid integration journal bytes"):
+            self.activate(prepared)
 
     def test_migrating_one_vault_preserves_shared_legacy_environment(self):
         legacy_home = self.base / "legacy controller home"

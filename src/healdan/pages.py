@@ -116,7 +116,7 @@ def split_preview(rows, renderer, caps=CAPS):
 def preview(vault, cutoff=None, *, proposed=()):
     before = vault.fingerprint()
     classification = admission.classification_token(vault)
-    knowledge = Knowledge(vault, proposed=proposed, diagnostic=True)
+    knowledge = Knowledge(vault, proposed=proposed, diagnostic=True, check_all_committed=False)
     cutoff = stamp(cutoff)
     result = split_preview(list(knowledge.claims.values()),
                            lambda title, ids: render_current(knowledge, ids, title, cutoff))

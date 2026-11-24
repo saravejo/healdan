@@ -276,6 +276,7 @@ REGISTRIES = tuple(REGISTRY_PREFIXES)
 REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
                        "wiki/control/aliases.jsonl", "control/approvals/packages.jsonl")
 INGEST_JOURNAL = "source-ingest.json"
+TRANSACTION_V2 = "healdan-transaction-v2"
 
 
 class Vault:

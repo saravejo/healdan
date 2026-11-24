@@ -68,12 +68,12 @@ def decide(vault, sha256, decision, *, owner, classification, entered_at=None, e
                 if origin.is_file() and digest(origin.read_bytes()) == sha256:
                     quarantines.append(quarantine(vault, name, owner))
             return {"classification": "secret", "quarantines": quarantines}
-        admission.require_triage(vault, sha256, classification)
+        first_class = admission.require_triage(vault, sha256, classification)
+        identifier = "inbox-" + sha256
+        existing = custody.materials(vault).get(identifier, {})
         if classification != "common":
-            from .custody import materials, validate_purpose
-            validate_purpose({"classification": classification, "purpose": purpose})
-            existing = materials(vault).get("inbox-" + sha256, {})
-            require(not existing or existing.get("purpose") == purpose,
+            custody.validate_purpose({"classification": classification, "purpose": purpose})
+            require(not existing or existing.get("purpose") == purpose or (first_class and existing.get("classification") == "unknown"),
                     "Triage purpose differs from existing custody", 5)
         if entered_at:
             require(entry_origin, "Capture provenance is required", 2)
@@ -90,14 +90,14 @@ def decide(vault, sha256, decision, *, owner, classification, entered_at=None, e
         receipt = vault.receipt("inbox-decision", item)
         item["decision_receipt"] = receipt
         item["receipts"].append(receipt)
-        if classification != "common":
-            from .custody import save_material
-            identifier = "inbox-" + sha256
+        if classification != "common" or (first_class and existing):
             record = {**existing, "id": identifier, "kind": "export", "classification": classification,
                       "captured_at": min(filter(None, (existing.get("captured_at"), item["entered_at"])), key=utc, default=None),
-                      "purpose": purpose,
+                      "purpose": purpose if classification != "common" else existing.get("purpose"),
                       "source_sha256": sha256, "holds": existing.get("holds", []),
                       "dependencies": existing.get("dependencies", []), "copies": existing.get("copies", [])}
+            if first_class:
+                record["decision_receipt"] = receipt
             for name in item["paths"]:
                 origin = safe_path(vault.root, name)
                 if origin.is_file() and digest(origin.read_bytes()) == sha256:
@@ -105,12 +105,46 @@ def decide(vault, sha256, decision, *, owner, classification, entered_at=None, e
                             "sha256": sha256, "kind": "export", "status": "present"}
                     if copy not in record["copies"]:
                         record["copies"].append(copy)
-            save_material(vault, record)
+            custody.save_material(vault, record)
         atomic(path, items)
         return item
 
 
-def findings(item, now=None):
+def archive_complete(vault, item):
+    sha = item["sha256"]
+    paths = set(item["paths"])
+    if not paths or sha != digest(b""):
+        return False
+    pending = read_json(safe_path(vault.control, ARCHIVE_JOURNAL), {})
+    for path in paths:
+        move = pending.get(path)
+        if move and ("worktree" not in move or vault.relocated_path(move["worktree"]) == vault.root):
+            return False
+        try:
+            safe_path(vault.root, path).lstat()
+            return False
+        except FileNotFoundError:
+            pass
+        except (Blocked, OSError):
+            return False
+    archived = set()
+    for identifier in item.get("receipts", []):
+        if not admission.sha256(identifier):
+            continue
+        value = read_json(safe_path(vault.control / "receipts", identifier + ".json"))
+        if not isinstance(value, dict) or value.get("kind") != "zero-byte-archive" or digest(value) != identifier:
+            continue
+        payload = value.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        source = payload.get("source")
+        if (isinstance(source, str) and source in paths and payload.get("sha256") == sha and payload.get("size") == 0 and
+                payload.get("destination") == f"archive/{sha}/{Path(source).name}"):
+            archived.add(source)
+    return archived == paths
+
+
+def findings(item, now=None, *, vault=None):
     now = utc(now)
     result = []
     if not item.get("entered_at"):
@@ -120,6 +154,9 @@ def findings(item, now=None):
             result.append("original_triage_overdue")
     if item.get("defer_until") and now >= utc(item["defer_until"]):
         result.append("deferral_due")
+    overdue = {"original_triage_overdue", "deferral_due"}
+    if vault is not None and overdue.intersection(result) and archive_complete(vault, item):
+        result = [finding for finding in result if finding not in overdue]
     if item.get("classification") == "unknown":
         result.append("classification_pending")
     return result
@@ -161,8 +198,11 @@ def archive_empty(vault, sha256):
             if not source.exists() and not move:
                 continue
             target_name = f"archive/{sha256}/{Path(relative).name}"
-            if canonical_storage_path(source) in deletions or canonical_storage_path(vault.root / target_name) in deletions:
-                blocked.append(f"{relative} -> {target_name}")
+            plans = deletions.get(canonical_storage_path(source), set()) | deletions.get(
+                canonical_storage_path(vault.root / target_name), set())
+            if plans:
+                commands = ", ".join(f"maintenance execute {identifier}" for identifier in sorted(plans))
+                blocked.append(f"{relative} -> {target_name} ({commands})")
                 continue
             target = empty_archive_target(vault, relative, target_name)
             if source.exists():
@@ -181,6 +221,7 @@ def archive_empty(vault, sha256):
             receipt_fields = {"at": move["at"], "payload": payload}
             receipt_id = digest({"kind": "zero-byte-archive", **receipt_fields})
             if receipt_id not in item["receipts"]:
+                origins = custody.archive_move_origins(vault, classification.links.get(sha256, []), relative, sha256, receipt_id)
                 # An existing destination may have appeared after the preflight.
                 create_empty_archive(vault, relative, target_name)
                 target = empty_archive_target(vault, relative, target_name)
@@ -190,7 +231,7 @@ def archive_empty(vault, sha256):
                             "Inbox item changed: " + relative, 5)
                     source.unlink()
                     sync_directory(source.parent)
-                custody.record_archive_move(vault, classification.links.get(sha256, []), move, receipt_id)
+                custody.record_archive_move(vault, origins, move, receipt_id)
                 receipt = vault.receipt("zero-byte-archive", payload, at=move["at"])
                 item["receipts"].append(receipt)
                 item.setdefault("archive_moves", []).append({**receipt_fields, "receipt": receipt})
