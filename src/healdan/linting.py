@@ -4,9 +4,9 @@ from uuid import uuid4
 import re
 
 from .core import Blocked, atomic, digest, read_json, require, stamp, utc
-from .custody import materials, retention_deadline, validate_purpose
+from .custody import INACTIVE_COPIES, materials, retention_deadline, validate_purpose
 from .ids import inventory as id_inventory
-from .inbox import findings as inbox_findings, ordinary
+from .inbox import findings as inbox_findings, worktree_inbox_digests
 from .knowledge import Knowledge
 from .pages import validate_pages
 from .regression import suite
@@ -41,14 +41,14 @@ def collect(vault, now=None):
     except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
         errors.append({"category": "query", "error": str(exc)})
     items = read_json(vault.control / "inbox.json", {})
+    observed, inbox_errors = worktree_inbox_digests(vault)
+    errors.extend(inbox_errors)
     for item in items.values():
-        for message in inbox_findings(item, now):
+        for message in inbox_findings(item, now, vault=None if inbox_errors else vault, observed=observed):
             add("inbox", item["sha256"] + ":" + message, message)
-    known = {p for i in items.values() for p in i["paths"]}
-    for path in (vault.root / "inbox").rglob("*"):
-        relative = path.relative_to(vault.root).as_posix()
-        if path.is_file() and ordinary(relative) and relative not in known:
-            add("inbox", relative, "File has no triage inventory")
+    known = {(path, item["sha256"]) for item in items.values() for path in item["paths"]}
+    for relative, _ in sorted(observed - known):
+        add("inbox", relative, "File has no triage inventory")
     for task in all_tasks(vault):
         if task.get("capacity_held") and age_status(task, now) != "active":
             add("worktrees", task["id"], age_status(task, now))
@@ -65,7 +65,7 @@ def collect(vault, now=None):
                 add("retention", material["id"] + ":purpose", str(exc))
         deadline = retention_deadline(material)
         if not deadline or utc(now) >= deadline:
-            if any(c.get("status") != "deleted" for c in material.get("copies", [])):
+            if any(c.get("status") not in INACTIVE_COPIES for c in material.get("copies", [])):
                 add("retention", material["id"], "No proven deadline" if not deadline else "Deletion overdue or held")
         for h in material.get("holds", []):
             if not h.get("ended_at"):

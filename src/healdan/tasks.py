@@ -8,6 +8,7 @@ from uuid import uuid4
 from .binding import project_record
 from .core import atomic, digest, git, jsonl, read_json, require, safe_path, stamp, utc
 from .ids import reserve
+from . import originals
 
 
 def task_path(vault, identifier):
@@ -41,6 +42,13 @@ def create(vault, title, now=None):
                 "Writing capacity is occupied", 5)
         require(vault.head(), "Create an initial local Git commit before opening a task", 5)
         vault.clean_inputs()
+        revision = vault.head()
+        sources = vault.rows(originals.REGISTRY)
+        source_bodies = []
+        for source in sources:
+            originals.verify_attributes(vault.root, source["path"])
+            body = originals.git_blob(vault.root, revision, source["path"])
+            source_bodies.append(originals.verify_body(source, body, revision=revision))
         identifier = str(uuid4())
         base = vault.state / "tasks" / identifier
         worktree = base / "worktree"
@@ -56,13 +64,12 @@ def create(vault, title, now=None):
             (base / "temporary" / role).mkdir(parents=True)
         evidence = base / "evidence"
         evidence.mkdir()
-        sources = vault.rows("resources/sources/index.jsonl")
-        for source in sources:
-            original = safe_path(vault.root, source["path"], exists=True)
-            require(digest(original.read_bytes()) == source["sha256"], "Source changed before task snapshot")
+        for source, body in zip(sources, source_bodies, strict=True):
+            original = safe_path(worktree, source["path"], exists=True)
+            originals.verify_body(source, original.read_bytes(), revision=revision)
             target = safe_path(evidence, source["path"])
-            atomic(target, original.read_bytes())
-        atomic(evidence / "resources/sources/index.jsonl", jsonl(sources))
+            atomic(target, body)
+        atomic(evidence / originals.REGISTRY, originals.git_blob(vault.root, revision, originals.REGISTRY))
         record["source_manifest"] = sources
         record["state"] = "active"
         atomic(task_path(vault, identifier), record)
@@ -71,9 +78,10 @@ def create(vault, title, now=None):
 
 
 def validate_evidence(vault, task):
-    require(vault.rows("resources/sources/index.jsonl") == task["source_manifest"], "Task source inventory changed", 5)
+    require(vault.rows(originals.REGISTRY) == task["source_manifest"], "Task source inventory changed", 5)
     evidence = vault.state / "tasks" / task["id"] / "evidence"
-    require((evidence / "resources/sources/index.jsonl").read_bytes() == jsonl(task["source_manifest"]),
+    manifest = originals.git_blob(vault.root, task["base"], originals.REGISTRY)
+    require((evidence / originals.REGISTRY).read_bytes() in {manifest, jsonl(task["source_manifest"])},
             "Task source snapshot manifest changed")
     for source in task["source_manifest"]:
         require(digest(safe_path(evidence, source["path"], exists=True).read_bytes()) == source["sha256"] and

@@ -2,3 +2,5 @@
 *.jsonl -merge
 *.sig -text
 wiki-1.4.md export-ignore
+resources/sources/** -text !eol
+resources/sources/index.jsonl text eol=lf

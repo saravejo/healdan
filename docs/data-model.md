@@ -21,6 +21,29 @@ all published/reserved identifiers, and never reclaim an abandoned number.
 provenance, and classification. Paths stay below `resources/sources/`.
 Locators use byte offsets and a SHA-256 of the exact byte range; no inferred
 page offset is accepted. Original bytes are never rewritten by promotion.
+The controller checks the effective Git attributes and the blob stored for each
+new original, including originals submitted in a source proposal. Original
+files use `-text`; the JSONL registry retains its text format. BOMs, mixed line
+endings, binary bytes and empty files retain their exact digests. Empty files
+have no valid nonempty evidence interval. A mismatch in a historical blob
+identifies the source and revision and requires verified raw bytes for an
+explicit reconciliation; reading or diagnosing it does not rewrite history.
+
+New lineage uses `origin.format = healdan-source-origin-v1`, records the capture origin and identifies parent source
+revisions. A wiki-derived source records page revisions and their supporting
+claims and sources. References are checked against current records rather than
+accepted from an index. Rejected supporting claims, missing revisions and
+cycles cannot supply independent evidence. Known copies share their observation
+roots. A claim can require `minimum_observations`; the query reports the unique
+roots in `observations`. Legacy lineage remains undetermined where independence
+cannot be established, without rewriting the old row or signature.
+
+Admission reconciles the source bytes and revision with existing Inbox,
+canonical-source and custody records. An explicit first classification may
+classify previously unknown material. Changing an existing classification
+requires a signed `healdan-source-classification-v1` decision by an authorized identity. Restricted derivatives
+retain their parents' restrictions. Custody records keep their existing holds,
+deadlines and copy history when a canonical copy is added.
 
 `wiki/claims.jsonl` contains C- ID, statement, entity, property, environment,
 primary_topic, state, typed value `{type,value,unit}`, polarity, sources,

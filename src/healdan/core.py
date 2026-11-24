@@ -109,6 +109,40 @@ def jsonl(rows):
     return b"".join(canonical(row) + b"\n" for row in rows)
 
 
+def extend_jsonl(data, rows):
+    addition = jsonl(rows)
+    separator = b"\n" if data and addition and not data.endswith(b"\n") else b""
+    return data + separator + addition
+
+
+def sync_directory(path):
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def canonical_storage_path(path):
+    original = current = Path(path)
+    message = "Cannot verify storage location: " + str(original)
+    require(original.is_absolute(), message, 5)
+    missing = []
+    try:
+        while True:
+            try:
+                resolved = current.resolve(strict=True)
+                require(not missing or resolved.is_dir(), message, 5)
+                return resolved.joinpath(*reversed(missing))
+            except FileNotFoundError:
+                require(current.parent != current and not current.is_symlink() and not current.is_junction(), message, 5)
+                missing.append(current.name)
+                current = current.parent
+    except (OSError, RuntimeError) as exc:
+        raise Blocked(message, 5) from exc
+
+
 def atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -122,12 +156,7 @@ def atomic(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
-        if os.name != "nt":
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -182,14 +211,15 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
     return result
 
 
-def git_bytes(root, *args, check=True):
+def git_bytes(root, *args, check=True, data=None):
     # The explicit vault path selects the real worktree, refs, objects and index.
     overrides = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_GRAFT_FILE",
                  "GIT_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
                  "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
     env = {key: value for key, value in os.environ.items() if key.upper() not in overrides}
-    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], env=env, check=check).stdout
+    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args],
+               env=env, check=check, data=data).stdout
 
 
 def git(root, *args, check=True):
@@ -245,6 +275,8 @@ REGISTRY_PREFIXES = {
 REGISTRIES = tuple(REGISTRY_PREFIXES)
 REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/control/selectors.jsonl",
                        "wiki/control/aliases.jsonl", "control/approvals/packages.jsonl")
+INGEST_JOURNAL = "source-ingest.json"
+TRANSACTION_V2 = "healdan-transaction-v2"
 
 
 class Vault:
@@ -356,17 +388,20 @@ class Vault:
         return digest({"head": self.head(), "files": self.inputs(), "policy": self.policy,
                        "config": self.config, "policy_files": policy_files, "controller": controller})
 
-    def receipt(self, kind, payload):
-        value = {"kind": kind, "at": stamp(), "payload": payload}
+    def receipt(self, kind, payload, *, at=None):
+        value = {"kind": kind, "at": stamp(at), "payload": payload}
         identifier = digest(value)
         with self.locked():
             atomic(self.control / "receipts" / (identifier + ".json"), value)
         return identifier
 
-    def no_transaction(self):
+    def no_transaction(self, *, allow_ingest=False):
         pending = read_json(safe_path(self.control, "transaction.json"))
-        require(not pending or pending["status"] == "complete",
+        require(not pending or pending["status"] in {"complete", "aborted"},
                 "An integration needs recovery", 5)
+        if not allow_ingest:
+            ingestion = read_json(safe_path(self.control, INGEST_JOURNAL), {})
+            require(ingestion.get("status") != "writing", "An Inbox ingestion needs recovery", 5)
         return pending
 
     def clean_inputs(self):

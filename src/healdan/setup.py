@@ -6,6 +6,7 @@ import sys
 
 from .core import REQUIRED_REGISTRIES, Blocked, Vault, atomic, executable, git, read_json, require, run
 from .binding import setup_binding
+from . import admission, originals
 
 DIRECTORIES = ("inbox", "projects", "wiki/topics", "archive", "control/tasks", "templates")
 
@@ -27,6 +28,7 @@ def initialize(root, state=None, *, interactive=False):
 
 def _initialize(vault, interactive):
     root = vault.root
+    originals.protect(root)
     for name in REQUIRED_REGISTRIES:
         path = root / name
         if not path.exists():
@@ -99,6 +101,31 @@ def doctor(vault):
         checks.append({"name": name, "passed": bool(passed), "detail": detail})
     check("python", sys.version_info >= (3, 12), platform.python_version())
     check("production_platform", platform.system() == "Darwin", platform.system())
+    try:
+        sources = vault.rows(originals.REGISTRY)
+        paths = {row["path"] for row in sources}
+        paths.add("resources/sources/F-0000/original.txt")
+        for path in sorted(paths):
+            try:
+                originals.verify_attributes(vault.root, path)
+                check("source_attributes", True, path)
+            except Blocked as exc:
+                check("source_attributes", False, str(exc))
+        revision = vault.head()
+        for row in originals.committed_sources(vault.root, revision).values():
+            try:
+                originals.verify_committed(vault.root, revision, [row])
+                check("source_blob", True, f"{row['id']} {revision} {row['path']}")
+            except Blocked as exc:
+                check("source_blob", False, str(exc))
+    except Blocked as exc:
+        check("source_blob", False, str(exc))
+    try:
+        for row in admission.existing_sources(vault):
+            check("source_admission", row["status"] == "valid",
+                  f"{row['source']} {row['path']}: {row.get('reason', row['status'])}")
+    except Blocked as exc:
+        check("source_admission", False, str(exc))
     for name in ("git", "ssh-keygen", "claude", "age", "node", "srt"):
         try:
             check(name, True, executable(name))

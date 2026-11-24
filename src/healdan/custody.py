@@ -4,8 +4,10 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from .core import atomic, canonical, decode, digest, executable, read_json, require, run, safe_path, stamp, utc
+from .core import atomic, canonical, canonical_storage_path, decode, digest, executable, read_json, require, run, safe_path, stamp, utc
 from .signing import trusted_signers, verify
+
+INACTIVE_COPIES = {"deleted", "moved"}
 
 
 def archive_tree(root):
@@ -67,6 +69,66 @@ def save_material(vault, record):
         rows = materials(vault)
         rows[record["id"]] = record
         atomic(vault.control / "materials.json", rows)
+
+
+def archive_move_origins(vault, records, source, sha, receipt):
+    origin_path = canonical_storage_path(safe_path(vault.root, source))
+    origins = []
+    for record in records:
+        tracked = [copy for copy in record["copies"] if copy["kind"] == "export" and copy["sha256"] == sha and
+                   (copy["status"] not in INACTIVE_COPIES or copy.get("move_receipt") == receipt) and
+                   canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == origin_path]
+        if tracked:
+            origins.append((record, tracked))
+    return origins
+
+
+def record_archive_move(vault, origins, move, receipt):
+    payload = move["payload"]
+    destination, sha = payload["destination"], payload["sha256"]
+    archived = safe_path(vault.root, destination, exists=True)
+    require(digest(archived.read_bytes()) == sha, "Archived custody copy changed: " + destination, 5)
+    location = canonical_storage_path(archived)
+    for record, tracked in origins:
+        copies = record["copies"]
+        index = next((index for index, copy in enumerate(copies) if copy["kind"] == "archive" and
+                      copy["sha256"] == sha and copy["status"] == "present" and
+                      canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location), len(copies))
+        if index == len(copies):
+            copies.append({"root": str(vault.root / "archive"), "path": destination.removeprefix("archive/"),
+                           "sha256": sha, "kind": "archive", "status": "present"})
+        for copy in tracked:
+            copy.update(status="moved", moved_at=move["at"], move_receipt=receipt, archive_copy_index=index)
+        save_material(vault, record)
+
+
+def archived_origin_records(vault, records, source, sha, receipt):
+    location = canonical_storage_path(source)
+    origins = []
+    for record in records:
+        copies = [copy for copy in record["copies"] if copy["kind"] == "export" and copy["sha256"] == sha and
+                  copy["status"] == "moved" and copy.get("move_receipt") == receipt and
+                  canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location]
+        if copies:
+            origins.append((record, copies))
+    return origins
+
+
+def verified_archive_deletion(vault, origins, target, sha):
+    location = canonical_storage_path(target)
+    for record, sources in origins:
+        generations = {index: copy for index, copy in enumerate(record["copies"]) if copy["kind"] == "archive" and
+                       copy["sha256"] == sha and
+                       canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location}
+        for source in sources:
+            if "archive_copy_index" in source:
+                copy = generations.get(source["archive_copy_index"])
+            else:
+                # A legacy receipt carries no generation link. Accept only unambiguous history.
+                copy = next(iter(generations.values())) if len(generations) == 1 else None
+            if not copy or copy["status"] != "deleted" or copy.get("verified_archive_sha256") != sha:
+                return False
+    return bool(origins)
 
 
 def capture_tree(vault, root, *, task, classification, session=None, purpose=None):

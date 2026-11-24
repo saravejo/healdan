@@ -7,7 +7,7 @@ import unittest
 from uuid import uuid4
 
 from support import VaultTest
-from healdan import backups, custody, inbox, linting, maintenance, retention, tasks
+from healdan import admission, backups, custody, inbox, linting, maintenance, retention, tasks
 from healdan.core import Blocked, atomic, digest, git, read_json, stamp, utc
 from healdan.review import csp_status, freeze_csp, inspect
 from healdan.setup import initialize
@@ -110,13 +110,37 @@ class Tasks(VaultTest):
 
 class InboxLint(VaultTest):
     def test_operational_exclusions_and_unknown_entry(self):
-        for path in ("inbox/a.txt", "inbox/tasks/a.txt", "inbox/agent-dashboard.html", "inbox/agent-activities-today.md", "control/tasks/a.txt"):
+        ordinary = ["inbox/a.txt", "inbox/manual-activities-today.md/ordinary.txt", "inbox/holding/.gitkeep/ordinary.txt",
+                    "inbox/holding/agent-dashboard.html", "inbox/holding/tasks/ordinary.txt"]
+        excluded = ["inbox/tasks/a.txt", "inbox/agent-dashboard.html", "inbox/agent-activities-today.md",
+                    "inbox/holding/ignored/.gitkeep", "control/tasks/a.txt"]
+        for path in ordinary + excluded:
             atomic(self.root / path, b"fixture")
+        found, errors = linting.collect(self.vault)
+        self.assertEqual(errors, [])
+        self.assertCountEqual([row["key"] for row in found.values() if row["category"] == "inbox"], ordinary)
         items = inbox.inventory(self.vault)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["paths"], ["inbox/a.txt"])
+        self.assertCountEqual(items[0]["paths"], ordinary)
         self.assertIsNone(items[0]["entered_at"])
         self.assertIn("unknown_entry_time", inbox.findings(items[0]))
+
+    def test_tasks_regular_file_is_reported_and_inventoried(self):
+        path = "inbox/tasks"
+        body = b"Regular capture at the task folder name"
+        atomic(self.root / path, body)
+        report = linting.lint(self.vault)
+        self.assertEqual(report["status"], "complete", report["errors"])
+        finding = "inbox:" + path
+        self.assertEqual(report["findings"][finding]["message"], "File has no triage inventory")
+
+        items = inbox.inventory(self.vault)
+        self.assertEqual([(item["paths"], item["sha256"], item["size"]) for item in items],
+                         [([path], digest(body), len(body))])
+        report = linting.lint(self.vault)
+        self.assertEqual(report["status"], "complete", report["errors"])
+        self.assertNotIn(finding, report["findings"])
+        self.assertIn(f"inbox:{digest(body)}:unknown_entry_time", report["findings"])
 
     def test_zero_bytes_not_spaces_and_sensitive_not_archived(self):
         atomic(self.root / "inbox/zero", b"")
@@ -130,6 +154,11 @@ class InboxLint(VaultTest):
             inbox.archive_empty(self.vault, rows[3]["sha256"])
         atomic(self.root / "inbox/secret-zero", b"")
         inbox.inventory(self.vault)
+        self.vault.config["source_classification_authorities"] = ["human"]
+        atomic(self.vault.config_path, self.vault.config)
+        approval = admission.sign_reclassification(self.vault, rows[0]["sha256"],
+            {"classification": "sensitive", "reason": "Fixture correction after further review"})
+        admission.reclassify(self.vault, approval)
         inbox.decide(self.vault, rows[0]["sha256"], "archive", owner="human", classification="sensitive", destination="restricted",
                      purpose={"purpose": "Verify incident", "necessity": "Required synthetic evidence", "owner": "human", "link": "fixture"})
         with self.assertRaises(Blocked):

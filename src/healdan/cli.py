@@ -2,10 +2,9 @@
 import argparse
 from pathlib import Path
 import sys
-from uuid import uuid4
 
 from . import __version__
-from .core import Blocked, Vault, atomic, canonical, digest, jsonl, read_json, require, safe_path, stamp
+from .core import Blocked, Vault, atomic, canonical, read_json, require
 
 
 def parser():
@@ -59,6 +58,17 @@ def parser():
     source.add_argument("--captured-at", required=True)
     source.add_argument("--classification", required=True, choices=["common", "personal", "sensitive"])
     source.add_argument("--purpose", type=Path)
+    source.add_argument("--derived-from", type=Path)
+    reconcile_original = inbox.add_parser("reconcile-original")
+    reconcile_original.add_argument("id")
+    reconcile_original.add_argument("raw", type=Path)
+    inbox.add_parser("reconcile-sources")
+    sign_classification = inbox.add_parser("sign-reclassification")
+    sign_classification.add_argument("sha256")
+    sign_classification.add_argument("request", type=Path)
+    sign_classification.add_argument("--output", required=True, type=Path)
+    reclassification = inbox.add_parser("reclassify")
+    reclassification.add_argument("approval", type=Path)
     quarantine = inbox.add_parser("quarantine")
     quarantine.add_argument("path")
     quarantine.add_argument("--owner", required=True)
@@ -180,8 +190,8 @@ def parser():
 
 
 def dispatch(args):
-    from . import backups, binding, build, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
-    from . import pages, regression, review, setup, tasks, transactions
+    from . import admission, backups, binding, build, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
+    from . import originals, pages, regression, review, setup, tasks, transactions
     from .knowledge import query
     from .signing import human_sign
     if args.command == "setup":
@@ -242,24 +252,24 @@ def dispatch(args):
                 ("owner", "classification", "entered_at", "entry_origin", "defer_until", "destination")})
         if args.action == "archive-empty":
             return inbox.archive_empty(vault, args.sha256)
+        if args.action == "reconcile-original":
+            return originals.reconcile(vault, args.id, args.raw)
+        if args.action == "reconcile-sources":
+            result = admission.reconcile_sources(vault)
+            return result, 5 if result["status"] == "pending" else 0
+        if args.action == "sign-reclassification":
+            signed = admission.sign_reclassification(vault, args.sha256, read_json(args.request))
+            atomic(args.output, signed)
+            return {"output": str(args.output), "digest": signed["digest"]}
+        if args.action == "reclassify":
+            return admission.reclassify(vault, read_json(args.approval))
         if args.action == "quarantine":
             return incidents.quarantine(vault, args.path, args.owner)
         if args.action == "ingest":
-            require(args.path.startswith("inbox/"), "Ingest expects an Inbox path", 2)
-            require(args.classification == "common", "Personal/sensitive originals require a reviewed minimal-source proposal and retention linkage", 5)
-            data = safe_path(vault.root, args.path, exists=True).read_bytes()
-            with vault.locked():
-                vault.no_transaction()
-                identifier = ids.reserve(vault, "F", 1, str(uuid4()), locked=True)[0]
-                target = "resources/sources/" + identifier + "/original" + Path(args.path).suffix
-                record = {"id": identifier, "path": target, "sha256": digest(data), "size": len(data),
-                          "captured_at": stamp(args.captured_at), "provenance": args.provenance,
-                          "classification": args.classification}
-                atomic(safe_path(vault.root, target), data)
-                registry = vault.rows("resources/sources/index.jsonl") + [record]
-                atomic(vault.root / "resources/sources/index.jsonl", jsonl(registry))
-                vault.receipt("source-ingest", record)
-                return record
+            derived = read_json(args.derived_from) if args.derived_from else None
+            require(not args.derived_from or isinstance(derived, dict), "Derived capture requires a conversion JSON object", 2)
+            return admission.ingest(vault, args.path, provenance=args.provenance, captured_at=args.captured_at,
+                                    classification=args.classification, derived=derived)
     if args.command == "task":
         if args.action == "create":
             return tasks.create(vault, args.title)
