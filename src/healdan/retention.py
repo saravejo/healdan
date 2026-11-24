@@ -10,6 +10,7 @@ from .tasks import all_tasks
 
 RESOLVED = INACTIVE_COPIES | {"preserved"}
 NATIVE_REPLICAS_PENDING = "Verified ciphertext is needed by native copies awaiting deletion"
+CHECKPOINT_REPLICAS_PENDING = "Verified ciphertext is needed by checkpoints awaiting deletion"
 PRESERVATION_AUTHORIZATION_PENDING = "Expired signed backup awaits individual preservation authorization"
 
 
@@ -66,12 +67,39 @@ def copy_identity(copy):
     return {key: value for key, value in copy.items() if key not in state}
 
 
-def active_archive_generations(vault, inventory, target, sha):
-    location = canonical_storage_path(target)
-    return [{"material": record["id"], "copy_index": index, "identity": digest(copy_identity(copy))}
-            for record in inventory.values() for index, copy in enumerate(record.get("copies", []))
-            if copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] not in INACTIVE_COPIES and
-            shares_path(vault, copy, location)]
+def active_slots(vault, inventory, location):
+    return [(record, index, copy) for record in inventory.values() for index, copy in enumerate(record.get("copies", []))
+            if copy["status"] not in INACTIVE_COPIES and shares_path(vault, copy, location)]
+
+
+def generation_locator(material, index, copy):
+    return {"material": material["id"], "copy_index": index, "identity": digest(copy_identity(copy))}
+
+
+def shared_generation(material, index, copy):
+    locator = generation_locator(material, index, copy)
+    if material["kind"] == "backup":
+        locator["generation_digest"] = material["approval"]["digest"]
+    return locator
+
+
+def verified_shared_slots(inventory, entry):
+    intent = entry["intent"]
+    generations = intent["generations"]
+    slots = []
+    identities = set()
+    for generation in generations:
+        material = inventory[generation["material"]]
+        index = generation["copy_index"]
+        require(type(index) is int and 0 <= index < len(material["copies"]), "Shared custody slot is missing", 5)
+        copy = material["copies"][index]
+        require(copy["sha256"] == entry["copy"]["sha256"] and copy["status"] != "moved" and
+                shared_generation(material, index, copy) == generation, "Shared custody slot changed", 5)
+        identities.add((material["id"], index, generation["identity"]))
+        slots.append((material, index, copy))
+    require(slot(entry) in identities and len(identities) == len(slots) and len(slots) > 1,
+            "Shared deletion intent does not identify its custody slots", 5)
+    return slots
 
 
 def verified_archive_slots(inventory, entry):
@@ -97,9 +125,45 @@ def archive_verification_complete(inventory, entry):
         return False
 
 
+def deletion_payload(entry, material, index):
+    return {"material": material, "copy_index": index, "sha256": entry["copy"]["sha256"], "intent": entry.get("intent")}
+
+
 def deletion_receipt(vault, entry, material, index, at):
-    return vault.receipt("deletion-copy", {"material": material, "copy_index": index,
-                         "sha256": entry["copy"]["sha256"], "intent": entry.get("intent")}, at=at)
+    return vault.receipt("deletion-copy", deletion_payload(entry, material, index), at=at)
+
+
+def shared_copy_reconciled(vault, entry, material, index, copy):
+    at = entry["intent"]["at"]
+    proof = {"kind": "deletion-copy", "at": at, "payload": deletion_payload(entry, material["id"], index)}
+    receipt = digest(proof)
+    return (copy["status"] == "deleted" and copy.get("deleted_at") == at and copy.get("deletion_receipt") == receipt and
+            (copy["kind"] != "archive" or copy.get("verified_archive_sha256") == copy["sha256"]) and
+            read_json(safe_path(vault.control, f"receipts/{receipt}.json")) == proof)
+
+
+def record_shared_deletion(vault, inventory, entry):
+    at = entry["intent"]["at"]
+    changed = {}
+    for material, index, copy in verified_shared_slots(inventory, entry):
+        if shared_copy_reconciled(vault, entry, material, index, copy):
+            continue
+        require(copy["status"] not in INACTIVE_COPIES, "Shared custody slot was disposed by another effect", 5)
+        copy.update(status="deleted", deleted_at=at, deletion_receipt=deletion_receipt(vault, entry, material["id"], index, at))
+        if copy["kind"] == "archive":
+            copy["verified_archive_sha256"] = copy["sha256"]
+        changed[material["id"]] = material
+    for material in changed.values():
+        save_material(vault, material)
+
+
+def deletion_reconciled(vault, inventory, entry):
+    try:
+        if (entry.get("intent") or {}).get("generations"):
+            return all(shared_copy_reconciled(vault, entry, *row) for row in verified_shared_slots(inventory, entry))
+        return archive_verification_complete(inventory, entry)
+    except (Blocked, OSError, KeyError, TypeError):
+        return False
 
 
 def record_archive_deletion(vault, inventory, entry, at):
@@ -115,7 +179,7 @@ def record_archive_deletion(vault, inventory, entry, at):
         save_material(vault, record)
 
 
-def pending_deletion_paths(vault, *, target=None):
+def pending_deletion_paths(vault, *, target=None, exclude=None):
     root = safe_path(vault.control, "deletions")
     inventory = materials(vault)
     paths = {}
@@ -124,11 +188,13 @@ def pending_deletion_paths(vault, *, target=None):
         for entry in plan["entries"]:
             if entry["status"] != "deleting" and not entry.get("awaiting_archive_reconciliation"):
                 continue
+            if exclude is not None and exclude == (plan["id"], slot(entry)):
+                continue
             copies = inventory.get(entry["material"], {}).get("copies", [])
             index = entry["copy_index"]
             if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
                     copy_identity(copies[index]) == copy_identity(entry["copy"]) and
-                    archive_verification_complete(inventory, entry)):
+                    deletion_reconciled(vault, inventory, entry)):
                 continue
             if target is None:
                 location = copy_path(vault, entry["copy"])
@@ -205,7 +271,7 @@ def authorized_target(vault, record, copy):
     return root, target
 
 
-def guard(vault, record, copy, now, policy=None):
+def guard(vault, record, copy, now, policy=None, *, slots=None):
     from .custody import pending_restoration
 
     policy = policy if policy is not None else storage_policy.effective(vault)
@@ -215,17 +281,17 @@ def guard(vault, record, copy, now, policy=None):
     require(destination not in pending_archive_paths(vault), "Inbox archive move is pending for " + str(target), 5)
     require(not pending_restoration(vault, target=destination),
             "Copy path is reserved by a pending restoration", 5)
-    for other in materials(vault).values():
-        if other["id"] == record["id"]:
-            continue
-        shared = [c for c in other.get("copies", []) if c.get("status") not in INACTIVE_COPIES and shares_path(vault, c, destination)]
-        if shared:
-            require(all(c["sha256"] == copy["sha256"] for c in shared), "Shared copy has conflicting custody hashes", 5)
+    slots = active_slots(vault, materials(vault), destination) if slots is None else slots
+    checked = {record["id"]}
+    for other, _, shared in slots:
+        require(shared["sha256"] == copy["sha256"], "Shared copy has conflicting custody hashes", 5)
+        if other["id"] not in checked:
             material_guard(vault, other, now, policy)
-            if any(c["kind"] == "ciphertext" for c in shared):
-                guard_ciphertext(vault, other)
-    if copy["kind"] == "ciphertext":
-        guard_ciphertext(vault, record)
+            checked.add(other["id"])
+        if shared["kind"] == "ciphertext":
+            guard_ciphertext(vault, other)
+        _, shared_target = authorized_target(vault, other, shared)
+        require(shared_target == target, "Shared custody paths do not identify the same target", 5)
     return target
 
 
@@ -235,6 +301,8 @@ def guard_ciphertext(vault, record):
     require(not pending_restoration(vault, record["id"]), "Ciphertext is needed by a pending restoration", 5)
     require(not any(c["kind"] == "native" and c["status"] not in INACTIVE_COPIES for c in record["copies"]),
             NATIVE_REPLICAS_PENDING, 5)
+    require(record.get("kind") != "conversation" or not any(c["kind"] == "checkpoint" and c["status"] not in INACTIVE_COPIES
+                    for c in record["copies"]), CHECKPOINT_REPLICAS_PENDING, 5)
 
 
 def pending_plans(vault):
@@ -360,14 +428,29 @@ def file_identity(path):
     return [info.st_dev, info.st_ino]
 
 
+def file_revision(path):
+    info = path.stat()
+    return [info.st_ctime_ns, info.st_size]
+
+
 def apply_entry(vault, path, plan, entry, now):
     inventory = materials(vault)
     material = inventory[entry["material"]]
     copy = material["copies"][entry["copy_index"]]
     require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
     at = stamp(now)
+    intent = entry.get("intent")
+    if intent:
+        require(intent["slot"] == list(slot(entry)) and intent["plan_digest"] == plan["digest"] and
+                intent.get("plan_id", plan["id"]) == plan["id"], "Deletion intent does not match the plan or copy", 5)
+    shared = bool(intent and intent.get("generations"))
     if copy["status"] in INACTIVE_COPIES:
-        if entry["status"] == "deleting" and entry.get("verified_archive_generations"):
+        if entry["status"] == "deleting" and shared:
+            root, target = authorized_target(vault, material, copy)
+            require(intent["path"] == str(target) and intent["root_identity"] == file_identity(root),
+                    "Deletion intent no longer matches the storage", 5)
+            record_shared_deletion(vault, inventory, entry)
+        elif entry["status"] == "deleting" and entry.get("verified_archive_generations"):
             record_archive_deletion(vault, inventory, entry, at)
         status = copy["status"]
         entry.update(status=status, at=copy.get(f"{status}_at") or at)
@@ -376,7 +459,6 @@ def apply_entry(vault, path, plan, entry, now):
         return
 
     policy = storage_policy.effective(vault)
-    intent = entry.get("intent")
     if not intent and not entry.get("verified_archive_generations") and preserved(vault, material, policy):
         require(not storage_policy.preservation_authorization_pending(vault, material, policy, now),
                 PRESERVATION_AUTHORIZATION_PENDING, 5)
@@ -385,39 +467,55 @@ def apply_entry(vault, path, plan, entry, now):
     root, target = authorized_target(vault, material, copy)
     present = target.exists()
     if intent:
-        require(intent["path"] == str(target) and intent["root_identity"] == file_identity(root) and
-                intent["slot"] == list(slot(entry)), "Deletion intent no longer matches the storage or copy", 5)
+        require(intent["path"] == str(target) and intent["root_identity"] == file_identity(root),
+                "Deletion intent no longer matches the storage", 5)
     if present:
         if preserved(vault, material, policy):
             require(not storage_policy.preservation_authorization_pending(vault, material, policy, now),
                     PRESERVATION_AUTHORIZATION_PENDING, 5)
             entry.update(status="preserved", at=at, policy_version=policy["version"])
             return
-        guard(vault, material, copy, now, policy)
-        reservation = pending_deletion_paths(vault, target=copy_path(vault, copy)).get(copy_path(vault, copy), set()) - {plan["id"]}
+        location = copy_path(vault, copy)
+        slots = active_slots(vault, inventory, location)
+        guard(vault, material, copy, now, policy, slots=slots)
+        reservation = pending_deletion_paths(vault, target=location, exclude=(plan["id"], slot(entry)))
         require(not reservation, "Another deletion plan is reconciling this copy", 5)
         file_id = file_identity(target)
-        require(not intent or intent["file_identity"] == file_id, "Copy identity changed after deletion intent", 5)
+        revision = file_revision(target)
+        require(not intent or intent["file_identity"] == file_id and intent.get("file_revision", revision) == revision,
+                "Copy identity changed after deletion intent", 5)
         require(digest(safe_path(root, copy["path"], exists=True).read_bytes()) == copy["sha256"],
                 "Copy hash changed; deletion stopped", 5)
-        if copy["kind"] == "archive":
-            generations = active_archive_generations(vault, inventory, target, copy["sha256"])
+        archives = [generation_locator(*row) for row in slots if row[2]["kind"] == "archive"]
+        if archives:
             if "verified_archive_generations" in entry:
-                require(all(generation in entry["verified_archive_generations"] for generation in generations),
-                        "Archive custody changed after verifying deletion", 5)
-            else:
-                entry["verified_archive_generations"] = generations
+                require(archives == entry["verified_archive_generations"], "Archive custody changed after verifying deletion", 5)
+            elif not intent:
+                entry["verified_archive_generations"] = archives
             verified_archive_slots(inventory, entry)
+        generations = [shared_generation(*row) for row in slots]
+        if intent:
+            if shared:
+                require(generations == intent["generations"], "Shared custody changed after verifying deletion", 5)
+                verified_shared_slots(inventory, entry)
+            else:
+                require(len(generations) == 1, "Another custody generation appeared after verifying deletion", 5)
+        elif entry["status"] == "deleting" and entry.get("verified_archive_generations"):
+            require(len(generations) == len(archives), "Another custody generation appeared after verifying deletion", 5)
         if intent is None:
             intent = {"path": str(target), "slot": list(slot(entry)), "root_identity": file_identity(root),
-                      "file_identity": file_id, "plan_digest": plan["digest"], "plan_id": plan["id"], "at": at}
+                      "file_identity": file_id, "file_revision": revision, "plan_digest": plan["digest"], "plan_id": plan["id"], "at": at}
             if material["kind"] == "backup":
                 intent["generation_digest"] = material["approval"]["digest"]
+            if len(generations) > 1:
+                intent["generations"] = generations
+                shared = True
         entry["intent"] = intent
-        require(entry["intent"]["plan_digest"] == plan["digest"], "Deletion intent does not match the plan", 5)
+        if shared:
+            verified_shared_slots(inventory, entry)
         entry["status"] = "deleting"
         atomic(path, plan)
-        require(file_identity(target) == file_id and file_identity(root) == entry["intent"]["root_identity"] and
+        require(file_identity(target) == file_id and file_revision(target) == revision and file_identity(root) == intent["root_identity"] and
                 digest(safe_path(root, copy["path"], exists=True).read_bytes()) == copy["sha256"],
                 "Copy changed after deletion intent", 5)
         target.unlink()
@@ -430,7 +528,9 @@ def apply_entry(vault, path, plan, entry, now):
                 "Copy is absent without verified deletion intent", 5)
     require(not target.exists(), "Copy still exists after deletion", 5)
     at = (entry.get("intent") or {}).get("at", at)
-    if entry.get("verified_archive_generations"):
+    if shared:
+        record_shared_deletion(vault, inventory, entry)
+    elif entry.get("verified_archive_generations"):
         record_archive_deletion(vault, inventory, entry, at)
     else:
         copy.update(status="deleted", deleted_at=at,

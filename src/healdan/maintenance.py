@@ -52,7 +52,8 @@ def daily(vault, now=None):
             except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
                 results.append({"id": plan["id"], "status": "pending", "pending": [{"reason": str(exc)}]})
         for index, result in enumerate(results):
-            if any(item.get("reason") == retention.NATIVE_REPLICAS_PENDING for item in result.get("pending", [])):
+            if any(item.get("reason") in {retention.NATIVE_REPLICAS_PENDING, retention.CHECKPOINT_REPLICAS_PENDING}
+                   for item in result.get("pending", [])):
                 results[index] = retention.execute(vault, result["id"], now)
         pending.extend({"plan": result["id"], **item} for result in results for item in result.get("pending", []))
         backup = backup_round(vault, now)

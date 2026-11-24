@@ -129,8 +129,11 @@ def check(vault, capabilities):
     if any(safe_path(vault.control, "restorations").glob("*.json")):
         needs("journal", "healdan-restore-v1")
     deletions = safe_path(vault.control, "deletions")
-    if any(any("intent" in entry or entry.get("status") == "preserved" for entry in
-               read_json(safe_path(deletions, path.name, exists=True))["entries"]) for path in deletions.glob("*.json")):
-        needs("journal", "healdan-deletion-intent-v1")
+    for path in deletions.glob("*.json"):
+        entries = read_json(safe_path(deletions, path.name, exists=True))["entries"]
+        if any("intent" in entry or entry.get("status") == "preserved" for entry in entries):
+            needs("journal", "healdan-deletion-intent-v1")
+        if any((entry.get("intent") or {}).get("generations") for entry in entries):
+            needs("journal", "healdan-shared-deletion-v1")
     if (vault.control / "materials.json").exists() or (vault.root / "control/repository.bundle").exists():
         needs("archive", "healdan-tree-v1")

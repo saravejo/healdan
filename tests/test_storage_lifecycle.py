@@ -239,6 +239,59 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(retention.execute(self.vault, plan["id"], expiry)["status"], "complete")
         self.assertNotIn(f"custody:{identifier}", linting.lint(self.vault)["findings"])
 
+    def test_legacy_replica_deletion_verifies_plan_and_round_before_restore(self):
+        first = self.configure_age()
+        second = self.base / "legacy secondary"
+        second.mkdir()
+        self.vault.config["backup_destinations"].append(str(second))
+        atomic(self.vault.config_path, self.vault.config)
+        cutoff = utc()
+        expiry = cutoff - timedelta(days=2)
+        original = backups.create(self.vault, "long", expiry, now=expiry - timedelta(days=2))
+        identifier = original["id"]
+        lost = second / (identifier + ".age")
+        cipher = lost.read_bytes()
+        plan = retention.plan(self.vault, cutoff)
+        path = self.vault.control / "deletions" / (plan["id"] + ".json")
+        material = custody.materials(self.vault)[identifier]
+        lost.unlink()
+        material["copies"][1].update(status="deleted", deleted_at=stamp(cutoff))
+        custody.save_material(self.vault, material)
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.verify_backup(self.vault, identifier)
+        plan.update(status="pending")
+        plan["entries"][0].update(status="pending", error="Copy destination is offline", at=stamp(cutoff))
+        plan["entries"][1].update(status="deleted", at=stamp(cutoff))
+        atomic(path, plan)
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.verify_backup(self.vault, identifier)
+        receipt = self.vault.receipt("deletion-round", {"plan": plan["id"], "digest": plan["digest"], "status": "pending"})
+        self.assertEqual(retention.plan_digest(plan), plan["digest"])
+        history = {p: p.read_bytes() for p in (path, self.vault.control / "materials.json",
+                                                self.vault.control / "receipts" / (receipt + ".json"))}
+        outcome = backups.verify_backup(self.vault, identifier)
+        self.assertEqual(outcome["copies"], [{"root": str(first), "verified": True}])
+        self.assertEqual(outcome["deleted_copies"], [{"root": str(second), "copy_index": 1, "receipt": receipt, "proof": "legacy-round"}])
+        destination = self.base / "legacy recovery"
+        self.assertEqual(self.cli("restore", identifier, destination)[0], 0)
+        self.assertEqual((destination / "wiki/claims.jsonl").read_bytes(), b"")
+        self.assertEqual({p: p.read_bytes() for p in history}, history)
+        plan["entries"][1]["at"] = stamp(cutoff + timedelta(seconds=1))
+        atomic(path, plan)
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.verify_backup(self.vault, identifier)
+        atomic(path, history[path])
+        atomic(lost, cipher)
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.verify_backup(self.vault, identifier)
+        self.assertEqual(lost.read_bytes(), cipher)
+        self.assertEqual(custody.materials(self.vault)[identifier]["approval"], original["approval"])
+        lost.unlink()
+        resumed = retention.execute(self.vault, plan["id"], cutoff)
+        self.assertEqual((resumed["status"], resumed["digest"]), ("complete", plan["digest"]))
+        retired = backups.verify_backup(self.vault, identifier, allow_retired=True)["deleted_copies"]
+        self.assertEqual((retired[0]["copy_index"], retired[1]["proof"]), (0, "legacy-round"))
+
     def test_task_capacity_waits_for_custody_with_backup_off(self):
         keys = self.age()
         self.change_policy(retention_mode="keep_forever")
@@ -394,6 +447,96 @@ class StorageLifecycle(VaultTest):
         self.assertIn("verified deletion intent", reasons["unexplained"])
         self.assertIn("offline", reasons["offline"])
         self.assertTrue(offline.exists())
+
+    def test_shared_checkpoints_protect_both_captures_and_reconcile_every_slot(self):
+        self.age()
+        self.change_policy()
+        original, origin = self.capture()
+        duplicate = custody.capture_tree(self.vault, origin, task=original["task"], classification="common")
+        other = custody.materials(self.vault)[duplicate]
+        other["closed_at"] = original["closed_at"]
+        custody.save_material(self.vault, other)
+        hold = custody.hold(self.vault, duplicate, "Hold this captured checkpoint", "human")
+        now = "2026-02-10T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "pending")
+        ciphers = [self.state / "custody" / (identifier + ".age") for identifier in (original["id"], duplicate)]
+        self.assertTrue(all(path.is_file() for path in (*ciphers, origin / "a.jsonl", origin / "nested/b.jsonl")))
+        custody.release_hold(self.vault, duplicate, hold["id"], [])
+
+        save = retention.save_material
+
+        def interrupted(vault, material):
+            save(vault, material)
+            if material["copies"][1]["status"] == "deleted":
+                raise SystemExit("interrupted after the first grouped custody update")
+
+        with patch("healdan.retention.save_material", side_effect=interrupted), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], now)
+        target = origin / "a.jsonl"
+        self.assertFalse(target.exists())
+        self.assertEqual(retention.pending_deletion_paths(self.vault)[target], {plan["id"]})
+        capabilities = read_json(Path(compatibility.__file__).with_name("controller_formats.json"))
+        old = {**capabilities, "journal": [name for name in capabilities["journal"] if name != "healdan-shared-deletion-v1"]}
+        with self.assertRaisesRegex(Blocked, "healdan-shared-deletion-v1"):
+            compatibility.check(self.vault, old)
+
+        # Reuse the pathname without adding a slot to the already completed physical effect.
+        atomic(target, b"first synthetic conversation file")
+        newest = custody.capture_tree(self.vault, origin, task=original["task"], classification="common")
+        newest_before = custody.materials(self.vault)[newest]
+        result = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(result["status"], "pending", result)
+        saved = custody.materials(self.vault)
+        self.assertEqual(saved[newest], newest_before)
+        self.assertEqual(target.read_bytes(), b"first synthetic conversation file")
+        receipts = {saved[identifier]["copies"][1]["deletion_receipt"] for identifier in (original["id"], duplicate)}
+        self.assertEqual(len(receipts), 2)
+        self.assertTrue(all(read_json(self.vault.control / "receipts" / (r + ".json"))["payload"]["intent"]["generations"]
+                            for r in receipts))
+        self.assertNotIn(target, retention.pending_deletion_paths(self.vault))
+        for identifier in (original["id"], duplicate):
+            self.assertEqual(saved[identifier]["copies"][1]["status"], "deleted")
+        self.assertTrue(all(path.is_file() for path in ciphers))
+
+        # The isolated new capture has its own later expiration, and blocks deletion until then.
+        newest_before["closed_at"] = "2026-03-01T00:00:00Z"
+        custody.save_material(self.vault, newest_before)
+        final = maintenance.daily(self.vault, "2026-04-15T00:00:00Z")
+        self.assertEqual(final["status"], "complete", final)
+        self.assertFalse(any(path.exists() for path in (*ciphers, target, origin / "nested/b.jsonl")))
+
+    def test_pending_shared_unlink_preserves_new_generation_at_same_path(self):
+        self.age()
+        self.change_policy()
+        original, origin = self.capture()
+        duplicate = custody.capture_tree(self.vault, origin, task=original["task"], classification="common")
+        material = custody.materials(self.vault)[duplicate]
+        material["closed_at"] = original["closed_at"]
+        custody.save_material(self.vault, material)
+        now = "2026-02-10T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        target = origin / "a.jsonl"
+        unlink = Path.unlink
+
+        def before_effect(path, *args, **kwargs):
+            if path == target:
+                raise SystemExit("interrupted before grouped unlink")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", before_effect), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], now)
+        newest = custody.capture_tree(self.vault, origin, task=original["task"], classification="common")
+        material = custody.materials(self.vault)[newest]
+        material["closed_at"] = original["closed_at"]
+        custody.save_material(self.vault, material)
+        result = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(result["status"], "pending", result)
+        self.assertTrue(any("Shared custody changed" in item["reason"] for item in result["pending"]))
+        self.assertEqual(target.read_bytes(), b"first synthetic conversation file")
+        saved = custody.materials(self.vault)[newest]
+        self.assertEqual(saved["copies"][:2], material["copies"][:2])
+        self.assertEqual(saved["copies"][2]["status"], "deleted")
 
     def test_eligible_long_backup_runs_while_short_body_is_ineligible(self):
         destination = self.configure_age(backup_interval_hours=24)

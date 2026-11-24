@@ -42,9 +42,12 @@ def prepare(wheel, store=None):
     data = wheel.read_bytes()
     details = wheel_details(wheel.name, data)
     store = Path(store if store is not None else store_path()).resolve()
+    store.mkdir(parents=True, exist_ok=True)
+    store = store.resolve()
+    (store / ".locks").mkdir(exist_ok=True)
     key = details["sha256"]
-    prefix = safe_path(store, key)
     with lock(safe_path(store, ".locks/" + key + ".lock"), timeout=120):
+        prefix = safe_path(store, key)
         manifest_path = safe_path(prefix, BUILD_RECEIPT)
         if manifest_path.exists():
             build = verify_build(prefix)
