@@ -67,7 +67,7 @@ def daily(vault, now=None, *, report_custody=False):
             pending.append({"retention": "inventory", "reason": str(exc)})
         else:
             try:
-                discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans))
+                discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans), inventory_findings=pending)
                 if discovered is not None:
                     plans.append(discovered)
             except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:

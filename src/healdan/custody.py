@@ -161,15 +161,14 @@ def integrity_findings(vault, *, records=None):
         try:
             require(isinstance(record, dict) and record.get("id") == identifier and record.get("kind"),
                     "Invalid custody material identity", 5)
-            live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
-            if not live and record["kind"] != "backup":
-                continue
             if record["kind"] == "backup":
                 if writing_generation(record):
                     inspect_writing_generation(vault, record)
                 else:
                     inspect_backup(vault, record, allow_retired=True)
-            elif record.get("decryption_verified"):
+                continue
+            live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
+            if live and record.get("decryption_verified"):
                 if any(copy.get("kind") == "ciphertext" for copy in live):
                     capture_ciphertexts(vault, record, read_bytes=False)
                 else:

@@ -373,7 +373,8 @@ def dispatch(args):
         if args.action == "plan":
             from .retention import plan
             with vault.locked():
-                return plan(vault)
+                result = plan(vault)
+            return result, 5 if result.get("pending") else 0
         if args.action == "execute":
             result = maintenance.execute_plan(vault, args.plan)
             return result, 0 if result["status"] == "complete" else 5

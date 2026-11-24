@@ -66,6 +66,9 @@ JSON. `--help` lists exact arguments.
 | `migration preview` | Verify signed cases and inspection records, then report compatible projections and pending fields |
 | `migration sign-alias INPUT.json --output SIGNED.json` | Same-identity alias with a human signed decision |
 
+`maintenance plan` returns code `5` when it reports per-material inventory
+findings in `pending`. It saves the plan for entries whose discovery completed.
+
 To set an independent backup and retention policy, supply a reason and both
 modes in the policy request. For example, an installation without scheduled or
 manual backups can use:

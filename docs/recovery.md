@@ -5,6 +5,9 @@ can be moved to another location. Use an external SSH allowed-signers file for
 the backup signer, an external age identity for either recipient, and the
 external human signing policy for any approvals in the snapshot.
 
+The signed manifest records the expected number of replica slots. Local paths
+and replica availability are recorded in the controller's inventory.
+
 ```text
 healdan backup verify ID --manifest COPY.manifest.json --replica COPY.age --age-identity /path/to/offline.agekey --backup-allowed-signers /path/to/backup-signers --allowed-signers /path/to/human-signers
 healdan --state /path/to/new-state restore ID /path/to/new-vault --manifest COPY.manifest.json --replica COPY.age --age-identity /path/to/offline.agekey --backup-allowed-signers /path/to/backup-signers --allowed-signers /path/to/human-signers

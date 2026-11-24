@@ -7,7 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest, controller_environment
-from healdan import admission, backup_recovery, backup_snapshot, backups, binding, compatibility, custody, inbox, retention, storage_policy, tasks
+from healdan import admission, backup_recovery, backup_snapshot, backups, binding, compatibility, custody, inbox, maintenance, retention, storage_policy, tasks
 from healdan.core import Blocked, Vault, atomic, canonical, decode, digest, git, read_json, run, stamp, utc
 from healdan.signing import envelope
 
@@ -286,6 +286,48 @@ class BackupPortable(VaultTest):
         with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
             backups.restore(self.vault, identifier, destination)
         self.assertFalse(destination.exists())
+
+    def test_1_signed_replica_count_guards_complete_inventory(self):
+        self.configure(2)
+        self.vault.config.update(backup_interval_hours=24, backup_generation_days=2)
+        atomic(self.vault.config_path, self.vault.config)
+        self.policy("scheduled")
+        now = utc()
+        expiry = now + timedelta(days=2)
+        record = backups.create(self.vault, "long", expiry, now=now)
+        identifier = record["id"]
+        plan = retention.plan(self.vault, expiry)
+        self.assertEqual([entry["copy_index"] for entry in plan["entries"]], [0, 1])
+        self.assertEqual(record["approval"]["payload"].get("replica_count"), 2)
+
+        for index, copy in enumerate(record["copies"]):
+            with self.subTest(retained_slot=index):
+                damaged = {**record, "copies": [copy]}
+                custody.save_material(self.vault, damaged)
+                with self.assertRaisesRegex(Blocked, "replica count"):
+                    backups.inspect_backup(self.vault, damaged, decrypt_replicas=True)
+                with self.assertRaisesRegex(Blocked, "replica count"):
+                    backups.reconcile(self.vault, identifier)
+                discovered = retention.plan(self.vault, expiry)
+                self.assertEqual(discovered["entries"], [])
+                self.assertEqual(discovered["pending"][0]["material"], identifier)
+                self.assertIn("replica count", discovered["pending"][0]["reason"])
+                outcome = retention.execute(self.vault, plan["id"], expiry)
+                self.assertEqual(outcome["status"], "pending", outcome)
+                self.assertEqual(len(outcome["pending"]), 2)
+                self.assertTrue(all("replica count" in row["reason"] for row in outcome["pending"]))
+
+                report = backups.verify_backup(self.vault, identifier)
+                result = backups.restore(self.vault, identifier, self.base / f"restored-slot-{index}")
+                for checked in (report, result):
+                    self.assertEqual(checked["replica"], str(self.paths(record, index)[1]))
+                    self.assertEqual([(row["copy_index"], row["status"]) for row in checked["replicas"]], [(index, "verified")])
+                    self.assertIn("replica count", checked["pending_replicas"][0]["reason"])
+                self.assertTrue(all(path.is_file() for slot in (0, 1) for path in self.paths(record, slot)))
+
+        scheduled = maintenance.backup_round(self.vault, now + timedelta(minutes=1))
+        self.assertEqual(scheduled["status"], "complete", scheduled)
+        self.assertNotEqual(scheduled["id"], identifier)
 
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
@@ -773,6 +815,14 @@ class BackupPortable(VaultTest):
         self.assertFalse(manifest.exists())
         self.assertEqual([copy["status"] for copy in pending["copies"]], ["present", "planned"])
         written = cipher.read_bytes()
+        truncated = {**pending, "copies": pending["copies"][:1]}
+        custody.save_material(self.vault, truncated)
+        with self.assertRaisesRegex(Blocked, "replica count"):
+            backups.reconcile(self.vault, pending["id"])
+        self.assertEqual(custody.materials(self.vault)[pending["id"]], truncated)
+        self.assertEqual(cipher.read_bytes(), written)
+        self.assertFalse(manifest.exists())
+        custody.save_material(self.vault, pending)
         self.policy("off")
         with self.assertRaisesRegex(Blocked, "disabled by policy"):
             backups.reconcile(self.vault, pending["id"])

@@ -272,6 +272,42 @@ class StorageLifecycle(VaultTest):
         for root in (first, second):
             self.assertTrue((root / (identifier + ".age")).is_file())
 
+    def test_malformed_backup_slot_blocks_overlapping_retention_only(self):
+        first = self.configure_age()
+        second = self.base / "backup-secondary"
+        second.mkdir()
+        self.vault.config["backup_destinations"].append(str(second))
+        atomic(self.vault.config_path, self.vault.config)
+        self.change_policy(backup="manual")
+        now = utc()
+        record = backups.create(self.vault, "long", now + timedelta(days=2), now=now)
+        first_cipher = first / record["copies"][0]["path"]
+        second_cipher = second / first_cipher.name
+        _, independent = self.export("independent", stamp(now - timedelta(days=40)))
+        overlap, _ = self.export("overlap", stamp(now - timedelta(days=40)))
+        overlap["copies"][0].update(root=str(first), path=first_cipher.name, sha256=digest(first_cipher.read_bytes()))
+        custody.save_material(self.vault, overlap)
+        custody.save_material(self.vault, {**record, "copies": [None, record["copies"][1]]})
+
+        code, preview = self.cli("maintenance", "plan")
+        self.assertEqual(code, 5, preview)
+        self.assertEqual({entry["material"] for entry in preview["entries"]}, {"independent", "overlap"})
+        self.assertEqual(preview["pending"][0]["material"], record["id"])
+        journal = read_json(self.vault.control / "deletions" / (preview["id"] + ".json"))
+        self.assertNotIn("pending", journal)
+        self.assertEqual(retention.plan_digest(journal), preview["digest"])
+
+        report = maintenance.daily(self.vault, now)
+        self.assertEqual(report["status"], "pending", report)
+        self.assertFalse(independent.exists(), report)
+        self.assertTrue(first_cipher.is_file() and second_cipher.is_file())
+        findings = {row["material"]: row["reason"] for row in report["pending"]}
+        self.assertIn("Portable replica inventory changed", findings[record["id"]])
+        self.assertIn("Portable replica inventory changed", findings[overlap["id"]])
+        self.assertFalse(any(entry["material"] == record["id"] for plan in report["plans"] for entry in plan["entries"]))
+        restored = backups.verify_backup(self.vault, record["id"])
+        self.assertEqual([row["status"] for row in restored["replicas"]], ["invalid", "verified"])
+
     def test_legacy_replica_deletion_verifies_plan_and_round_before_restore(self):
         first = self.configure_age()
         second = self.base / "legacy secondary"
@@ -362,6 +398,22 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(retention.plan(self.vault, now)["entries"], [])
         self.assertEqual(target.read_bytes(), cipher)
 
+        truncated_plan = retention.plan(self.vault, expiry)
+        truncated = {**original, "copies": original["copies"][:1]}
+        custody.save_material(self.vault, truncated)
+        with self.assertRaisesRegex(Blocked, "replica count"):
+            backups.reconcile(self.vault, identifier)
+        with self.assertRaisesRegex(Blocked, "replica count"):
+            backups.inspect_writing_generation(self.vault, truncated)
+        discovered = retention.plan(self.vault, expiry)
+        self.assertEqual(discovered["entries"], [])
+        self.assertIn("replica count", discovered["pending"][0]["reason"])
+        refused = retention.execute(self.vault, truncated_plan["id"], expiry)
+        self.assertEqual(refused["status"], "pending", refused)
+        self.assertTrue(all("replica count" in row["reason"] for row in refused["pending"]))
+        self.assertEqual(target.read_bytes(), cipher)
+        custody.save_material(self.vault, original)
+
         offline = third.with_name("offline-away")
         third.rename(offline)
         plan = retention.plan(self.vault, expiry)
@@ -401,7 +453,7 @@ class StorageLifecycle(VaultTest):
 
         complete = backups.create(self.vault, "long", expiry, now=now)
         unsigned = {key: value for key, value in complete.items() if key not in {"approval", "verified_at"}}
-        unsigned["status"] = "writing"
+        unsigned.update(status="writing", publication=complete["approval"])
         custody.save_material(self.vault, unsigned)
         plan = retention.plan(self.vault, expiry)
         result = retention.execute(self.vault, plan["id"], expiry)

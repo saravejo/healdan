@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from . import storage_policy
+from . import backup_snapshot, storage_policy
 from .core import Blocked, atomic, canonical_storage_path, digest, json_paths, read_json, require, safe_path, stamp, sync_directory, utc
 from .custody import INACTIVE_COPIES, materials, native_guard, save_material, verified_capture
 from .inbox import pending_archive_paths
@@ -90,8 +90,20 @@ def copy_identity(copy):
 
 
 def active_slots(vault, inventory, location):
-    return [(record, index, copy) for record in inventory.values() for index, copy in enumerate(record.get("copies", []))
-            if copy["status"] not in INACTIVE_COPIES and shares_path(vault, copy, location)]
+    from .backups import check_portable_replica_inventory
+
+    slots = []
+    for identifier, record in inventory.items():
+        if record.get("format") == backup_snapshot.MANIFEST:
+            # A portable generation can own only its reserved ciphertext name, even when its slot path is lost.
+            names = {(name + ".age").casefold() for name in (identifier, record.get("id")) if isinstance(name, str)}
+            if location.name.casefold() not in names:
+                continue
+            require(record.get("id") == identifier, "Backup identity changed", 5)
+            check_portable_replica_inventory(vault, record)
+        slots.extend((record, index, copy) for index, copy in enumerate(record.get("copies", []))
+                     if copy["status"] not in INACTIVE_COPIES and shares_path(vault, copy, location))
+    return slots
 
 
 def generation_locator(material, index, copy):
@@ -165,9 +177,15 @@ def shared_copy_reconciled(vault, entry, material, index, copy):
 
 
 def record_shared_deletion(vault, inventory, entry):
+    from .backups import check_portable_replica_inventory
+
     at = entry["intent"]["at"]
     changed = {}
-    for material, index, copy in verified_shared_slots(inventory, entry):
+    slots = verified_shared_slots(inventory, entry)
+    for material, _, _ in slots:
+        if material.get("format") == backup_snapshot.MANIFEST:
+            check_portable_replica_inventory(vault, material)
+    for material, index, copy in slots:
         if shared_copy_reconciled(vault, entry, material, index, copy):
             continue
         require(copy["status"] not in INACTIVE_COPIES, "Shared custody slot was disposed by another effect", 5)
@@ -214,10 +232,12 @@ def pending_deletion_paths(vault, *, target=None, exclude=None):
                 continue
             copies = inventory.get(entry["material"], {}).get("copies", [])
             index = entry["copy_index"]
-            if 0 <= index < len(copies) and copies[index]["status"] == "unavailable":
+            copy = copies[index] if isinstance(copies, list) and 0 <= index < len(copies) else None
+            status = copy.get("status") if isinstance(copy, dict) else None
+            if status == "unavailable":
                 continue
-            if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
-                    copy_identity(copies[index]) == copy_identity(entry["copy"]) and
+            if isinstance(status, str) and status in INACTIVE_COPIES and (
+                    copy_identity(copy) == copy_identity(entry["copy"]) and
                     deletion_reconciled(vault, inventory, entry)):
                 continue
             if target is None:
@@ -387,6 +407,8 @@ def reconcile_inbox(vault, now):
     records = materials(vault)
     owners = {}
     for record in records.values():
+        if record.get("format") == backup_snapshot.MANIFEST:
+            continue
         for copy in record.get("copies", []):
             if copy["kind"] == "export" and vault.relocated_path(copy["root"]) == root and copy["status"] not in INACTIVE_COPIES:
                 owners.setdefault(copy["sha256"], set()).add(record["id"])
@@ -438,7 +460,9 @@ def reconcile_inbox(vault, now):
             save_material(vault, record)
 
 
-def plan(vault, now=None, *, exclude=(), skip_empty=False):
+def plan(vault, now=None, *, exclude=(), skip_empty=False, inventory_findings=None):
+    from .backups import check_portable_replica_inventory
+
     with vault.locked():
         open_tasks = reconcile_closures(vault, materials(vault).values())
         reconcile_inbox(vault, now)
@@ -446,8 +470,15 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False):
         pending = pending_archive_paths(vault)
         policy = storage_policy.effective(vault)
         excluded = set(exclude)
-        entries = []
-        for record in materials(vault).values():
+        entries, findings = [], []
+        for identifier, record in materials(vault).items():
+            if record.get("format") == backup_snapshot.MANIFEST:
+                try:
+                    require(record.get("id") == identifier, "Backup identity changed", 5)
+                    check_portable_replica_inventory(vault, record)
+                except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+                    findings.append({"material": identifier, "retention": "discovery", "reason": str(exc)})
+                    continue
             try:
                 status, deadline = storage_policy.deadline(record, policy)
                 if (deadline and utc(now) < deadline) or (status == "unknown" and record.get("task") in open_tasks):
@@ -469,11 +500,15 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False):
                 entry = {"material": record["id"], "copy_index": index, "copy": copy, "status": "planned"}
                 if slot(entry) not in excluded:
                     entries.append(entry)
+        if inventory_findings is not None:
+            inventory_findings.extend(findings)
         if skip_empty and not entries:
             return None
         result = {"id": str(uuid4()), "created_at": now, "entries": entries, "status": "planned"}
         result["digest"] = digest(result)
         atomic(vault.control / "deletions" / (result["id"] + ".json"), result)
+        if findings:
+            return {**result, "pending": findings}
         return result
 
 
@@ -488,11 +523,13 @@ def file_revision(path):
 
 
 def apply_entry(vault, path, plan, entry, now, policy_snapshot):
-    from .backups import interrupted_absence, writing_generation
+    from .backups import check_portable_replica_inventory, interrupted_absence, writing_generation
 
     inventory = materials(vault)
     material = inventory[entry["material"]]
     require(material["id"] == entry["material"], "Material identity changed", 5)
+    if material.get("format") == backup_snapshot.MANIFEST:
+        check_portable_replica_inventory(vault, material)
     copy = material["copies"][entry["copy_index"]]
     require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
     at = stamp(now)
