@@ -48,12 +48,12 @@ def ordinary_paths(root, on_error):
             on_error(relative, exc)
         for entry in sorted(entries, key=lambda entry: entry.name, reverse=True):
             name = f"{relative}/{entry.name}"
-            if name == "inbox/tasks":
-                continue
             try:
                 is_directory = entry.is_dir(follow_symlinks=False)
             except OSError as exc:
                 on_error(name, exc)
+                continue
+            if is_directory and name == "inbox/tasks":
                 continue
             if is_directory or ordinary(name):
                 pending.append((name, is_directory))

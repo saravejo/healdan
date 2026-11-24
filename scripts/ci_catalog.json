@@ -111,6 +111,7 @@
     "test_operations.InboxLint.test_lint_strict_eight_days_partial_and_task_dedup",
     "test_operations.InboxLint.test_operational_exclusions_and_unknown_entry",
     "test_operations.InboxLint.test_rename_copy_version_and_deferral_keep_deadline",
+    "test_operations.InboxLint.test_tasks_regular_file_is_reported_and_inventoried",
     "test_operations.InboxLint.test_zero_bytes_not_spaces_and_sensitive_not_archived",
     "test_operations.Installation.test_any_extra_worktree_blocks_purge",
     "test_operations.Installation.test_native_trials_missing_never_look_successful",
