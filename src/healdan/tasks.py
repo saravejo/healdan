@@ -216,14 +216,17 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
                         "Session preservation belongs to a different session or task", 5)
                 verified_capture(vault, saved)
         capture = task.get("preservation")
+        verified = None
+        expiry_capture = None
         if worktree.exists():
             # Includes dirty proposals, original sources, contexts and the current worktree.
             capture = capture_tree(vault, base, task=task_id, classification="unknown", purpose=purpose)
             task["preservation"] = capture
             atomic(task_path(vault, task_id), task)
-            git(vault.root, "worktree", "remove", "--force", str(worktree))
+            verified = remove_preserved_worktree(vault, task, worktree, capture)
         elif task.get("worktree_removed"):
-            verify_worktree_preservation(vault, task, worktree, task.get("expiry_preservation"))
+            expiry_capture = task.get("expiry_preservation")
+            verify_worktree_preservation(vault, task, worktree, expiry_capture)
             if capture:
                 saved = materials(vault)[capture]
                 require(saved.get("task") == task_id and not saved.get("session"), "Task preservation belongs to a different task", 5)
@@ -234,7 +237,7 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
                 atomic(task_path(vault, task_id), task)
         else:
             verify_worktree_preservation(vault, task, worktree, capture)
-        record_worktree_removal(vault, task, worktree, capture)
+        record_worktree_removal(vault, task, worktree, expiry_capture or capture, verified=verified)
         task.update(state="cancelled" if reason == "human_timeout" else "closed",
                     closure_reason=reason, closed_at=stamp(), capacity_held=False)
         atomic(task_path(vault, task_id), task)
@@ -266,32 +269,84 @@ def reconcile_processes(vault, task):
 
 
 def verify_worktree_preservation(vault, task, worktree, capture):
-    from .custody import materials, verified_capture
+    from .custody import materials
 
     record = materials(vault).get(capture)
     require(record and record.get("task") == task["id"] and not record.get("session"),
             "Missing worktree has no linked verified preservation", 5)
+    copies = worktree_checkpoints(vault, record, worktree)
+    require(copies, "Preservation does not contain the recorded worktree", 5)
+    verify_preserved_checkpoints(vault, record, copies)
+
+
+def worktree_checkpoints(vault, record, worktree):
+    base = vault.state / "tasks" / record["task"]
+    copies = []
+    for index, copy in enumerate(record["copies"]):
+        if copy["kind"] != "checkpoint" or copy.get("restoration"):
+            continue
+        root = vault.relocated_path(copy["root"])
+        if root.is_relative_to(base) and safe_path(root, copy["path"]).is_relative_to(worktree):
+            copies.append((index, copy))
+    return copies
+
+
+def verify_preserved_checkpoints(vault, record, copies):
+    from .custody import archive_members, verified_capture
+
     _, plain = verified_capture(vault, record)
-    files = decode(plain)["files"]
-    require(any(copy["kind"] == "checkpoint" and (vault.relocated_path(copy["root"]) / copy["path"]).is_relative_to(worktree) and
-                files.get(copy["path"], {}).get("sha256") == copy["sha256"] for copy in record["copies"]),
-            "Preservation does not contain the recorded worktree", 5)
+    archive = decode(plain)
+    files = archive_members(archive, vault.state / "custody")
+    hashes = {path: digest(data) for path, data in files.items()}
+    require(all(hashes.get(Path(copy["path"])) == copy["sha256"] for _, copy in copies),
+            "Capture does not preserve its recorded worktree checkpoints: " + record["id"], 5)
+    return hashes
 
 
-def record_worktree_removal(vault, task, worktree, capture):
-    from .custody import materials, save_material
+def verified_worktree_checkpoints(vault, task, worktree):
+    from .custody import materials
 
-    record = materials(vault)[capture]
-    at = record["captured_at"]
-    receipt = vault.receipt("worktree-preservation", {"material": capture, "task": task["id"],
-                            "worktree": str(worktree), "cipher_sha256": record["cipher_sha256"]}, at=at)
-    changed = False
-    for copy in record["copies"]:
-        target = vault.relocated_path(copy["root"]) / copy["path"]
-        if copy["kind"] == "checkpoint" and target.is_relative_to(worktree) and copy["status"] == "present":
+    result = []
+    for record in materials(vault).values():
+        if record.get("task") != task["id"] or record.get("session") or record.get("kind") != "conversation":
+            continue
+        copies = [(index, copy) for index, copy in worktree_checkpoints(vault, record, worktree) if copy["status"] == "present"]
+        if copies:
+            result.append((record, copies, verify_preserved_checkpoints(vault, record, copies)))
+    return result
+
+
+def remove_preserved_worktree(vault, task, worktree, capture):
+    from .custody import archive_tree
+
+    verified = verified_worktree_checkpoints(vault, task, worktree)
+    hashes = next((hashes for record, _, hashes in verified if record["id"] == capture), None)
+    require(hashes is not None, "Current worktree capture is missing", 5)
+    prefix = worktree.relative_to(vault.state / "tasks" / task["id"])
+    expected = {path.relative_to(prefix).as_posix(): sha for path, sha in hashes.items() if path.is_relative_to(prefix)}
+    observed = {name: entry["sha256"] for name, entry in archive_tree(worktree)["files"].items()}
+    require(expected == observed, "Worktree changed after its verified capture", 5)
+    git(vault.root, "worktree", "remove", "--force", str(worktree))
+    return verified
+
+
+def record_worktree_removal(vault, task, worktree, capture, *, verified=None):
+    from .custody import save_material
+
+    base = vault.state / "tasks" / task["id"]
+    require(worktree == Path(task["worktree"]) and worktree != base and worktree.is_relative_to(base),
+            "Removal does not match the task worktree", 5)
+    require(not worktree.exists() and worktree not in vault.repository.worktree_roots(),
+            "Worktree removal has not been confirmed by Git", 5)
+    if verified is None:
+        verified = verified_worktree_checkpoints(vault, task, worktree)
+    for record, copies, _ in verified:
+        at = record["captured_at"]
+        receipt = vault.receipt("worktree-preservation", {"material": record["id"], "task": task["id"],
+                                "worktree": str(worktree), "cipher_sha256": record["cipher_sha256"],
+                                "removal_capture": capture, "copy_indices": [index for index, _ in copies]}, at=at)
+        for _, copy in copies:
             copy.update(status="moved", moved_at=at, move_receipt=receipt)
-            changed = True
-    if changed:
         save_material(vault, record)
 
 
@@ -309,6 +364,7 @@ def reconcile_expired(vault, task_id, now=None):
             "purpose": "Expired worktree reconciliation", "necessity": "Preserve proposals, sources and checkpoints before removal",
             "owner": vault.config.get("signing_identity") or "controller", "link": task_id}
         capture = task.get("expiry_preservation")
+        verified = None
         if worktree.exists():
             capture = capture_tree(vault, base, task=task_id, classification="unknown", purpose=purpose)
             if task.get("processes"):
@@ -316,10 +372,10 @@ def reconcile_expired(vault, task_id, now=None):
                 capture = capture_tree(vault, base, task=task_id, classification="unknown", purpose=purpose)
             task["expiry_preservation"] = capture
             atomic(task_path(vault, task_id), task)
-            git(vault.root, "worktree", "remove", "--force", str(worktree))
+            verified = remove_preserved_worktree(vault, task, worktree, capture)
         else:
             verify_worktree_preservation(vault, task, worktree, capture)
-        record_worktree_removal(vault, task, worktree, capture)
+        record_worktree_removal(vault, task, worktree, capture, verified=verified)
         # Worktree expiry does not cancel the task, restart waiting, or release its capacity.
         task.update(worktree_removed=True, worktree_expired=True)
         atomic(task_path(vault, task_id), task)

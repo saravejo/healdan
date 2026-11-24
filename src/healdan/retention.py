@@ -1,4 +1,5 @@
 """Durable per-copy deletion plans with rechecks before every effect."""
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -447,8 +448,11 @@ def apply_entry(vault, path, plan, entry, now):
     at = stamp(now)
     intent = entry.get("intent")
     if intent:
+        history = entry.get("intent_history", [])
         require(intent["slot"] == list(slot(entry)) and intent["plan_digest"] == plan["digest"] and
-                intent.get("plan_id", plan["id"]) == plan["id"], "Deletion intent does not match the plan or copy", 5)
+                intent.get("plan_id", plan["id"]) == plan["id"] and
+                intent.get("supersedes") == (digest(history[-1]) if history else None),
+                "Deletion intent does not match the plan, copy or its history", 5)
     shared = bool(intent and intent.get("generations"))
     if copy["status"] in INACTIVE_COPIES:
         if entry["status"] == "deleting" and shared:
@@ -488,29 +492,41 @@ def apply_entry(vault, path, plan, entry, now):
         require(not reservation, "Another deletion plan is reconciling this copy", 5)
         file_id = file_identity(target)
         revision = file_revision(target)
-        require(not intent or intent["file_identity"] == file_id and intent.get("file_revision", revision) == revision,
+        mtime_ns = target.stat().st_mtime_ns
+        require(not intent or intent["file_identity"] == file_id and intent.get("file_revision", revision) == revision and
+                intent.get("file_mtime_ns", mtime_ns) == mtime_ns,
                 "Copy identity changed after deletion intent", 5)
         require(digest(safe_path(root, copy["path"], exists=True).read_bytes()) == copy["sha256"],
                 "Copy hash changed; deletion stopped", 5)
         archives = [generation_locator(*row) for row in slots if row[2]["kind"] == "archive"]
-        if archives:
-            if "verified_archive_generations" in entry:
-                require(archives == entry["verified_archive_generations"], "Archive custody changed after verifying deletion", 5)
-            elif not intent:
-                entry["verified_archive_generations"] = archives
+        previous_archives = entry.get("verified_archive_generations", [])
+        if previous_archives:
             verified_archive_slots(inventory, entry)
         generations = [shared_generation(*row) for row in slots]
         if intent:
             if shared:
-                require(generations == intent["generations"], "Shared custody changed after verifying deletion", 5)
                 verified_shared_slots(inventory, entry)
-            else:
-                require(len(generations) == 1, "Another custody generation appeared after verifying deletion", 5)
-        elif entry["status"] == "deleting" and entry.get("verified_archive_generations"):
-            require(len(generations) == len(archives), "Another custody generation appeared after verifying deletion", 5)
+            previous = intent.get("generations", [shared_generation(material, entry["copy_index"], copy)])
+            require(all(generation in generations for generation in previous) and
+                    all(generation in archives for generation in previous_archives),
+                    "Shared custody changed after verifying deletion", 5)
+            if generations != previous or archives != previous_archives:
+                # On Windows st_ctime is a creation timestamp, so the old revision alone cannot prove a file was untouched.
+                require(len(generations) > 1 and intent.get("file_revision") == revision and
+                        (os.name != "nt" or intent.get("file_mtime_ns") == mtime_ns),
+                        "Original file revision is unproven for the expanded deletion intent", 5)
+                entry.setdefault("intent_history", []).append(intent)
+                intent = {**intent, "at": at, "generations": generations, "file_mtime_ns": mtime_ns, "supersedes": digest(intent)}
+                shared = True
+        elif entry["status"] == "deleting" and previous_archives:
+            require(archives == previous_archives and len(generations) == len(archives),
+                    "Another custody generation appeared after verifying deletion", 5)
+        if archives:
+            entry["verified_archive_generations"] = archives
         if intent is None:
             intent = {"path": str(target), "slot": list(slot(entry)), "root_identity": file_identity(root),
-                      "file_identity": file_id, "file_revision": revision, "plan_digest": plan["digest"], "plan_id": plan["id"], "at": at}
+                      "file_identity": file_id, "file_revision": revision, "file_mtime_ns": mtime_ns,
+                      "plan_digest": plan["digest"], "plan_id": plan["id"], "at": at}
             if material["kind"] == "backup":
                 intent["generation_digest"] = material["approval"]["digest"]
             if len(generations) > 1:
@@ -521,7 +537,8 @@ def apply_entry(vault, path, plan, entry, now):
             verified_shared_slots(inventory, entry)
         entry["status"] = "deleting"
         atomic(path, plan)
-        require(file_identity(target) == file_id and file_revision(target) == revision and file_identity(root) == intent["root_identity"] and
+        require(file_identity(target) == file_id and file_revision(target) == revision and target.stat().st_mtime_ns == mtime_ns and
+                file_identity(root) == intent["root_identity"] and
                 digest(safe_path(root, copy["path"], exists=True).read_bytes()) == copy["sha256"],
                 "Copy changed after deletion intent", 5)
         target.unlink()

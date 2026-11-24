@@ -1,3 +1,4 @@
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -316,6 +317,102 @@ class StorageLifecycle(VaultTest):
         self.assertFalse(closed["capacity_held"])
         self.assertFalse(draft.exists())
 
+    def test_task_close_reconciles_prior_verified_snapshot_after_draft_changes(self):
+        keys = self.age()
+        self.change_policy()
+        task = tasks.create(self.vault, "Resumed worktree closure")
+        draft = Path(task["worktree"]) / "draft.txt"
+        atomic(draft, b"earlier verified draft")
+        preserved = self.state / "tasks" / task["id"] / "outside-worktree.txt"
+        atomic(preserved, b"keep this checkpoint outside the removed worktree")
+        git = tasks.git
+
+        def interrupt(root, *args, **kwargs):
+            if args[:2] == ("worktree", "remove"):
+                raise SystemExit("interrupted before Git removes the worktree")
+            return git(root, *args, **kwargs)
+
+        with patch("healdan.tasks.git", side_effect=interrupt), self.assertRaises(SystemExit):
+            tasks.preserve_and_close(self.vault, task["id"])
+        interrupted = tasks.get_task(self.vault, task["id"])
+        previous = interrupted["preservation"]
+        self.assertTrue(interrupted["capacity_held"] and draft.is_file())
+        with self.assertRaisesRegex(Blocked, "removal has not been confirmed by Git"):
+            tasks.record_worktree_removal(self.vault, interrupted, draft.parent, previous)
+        atomic(draft, b"new draft saved before retry")
+        closed = tasks.preserve_and_close(Vault(self.root, self.state), task["id"])
+        self.assertNotEqual(previous, closed["preservation"])
+        self.assertFalse(draft.exists() or closed["capacity_held"])
+        receipts = set()
+        for identifier, expected in ((previous, b"earlier verified draft"), (closed["preservation"], b"new draft saved before retry")):
+            row = custody.materials(self.vault)[identifier]
+            files = decode(custody.decrypt(self.vault, custody.capture_copy(self.vault, row), keys[1]))["files"]
+            slot = next(copy for copy in row["copies"] if copy["path"].endswith("/draft.txt"))
+            self.assertEqual(base64.b64decode(files[slot["path"]]["body"]), expected)
+            self.assertEqual(slot["status"], "moved")
+            self.assertEqual(next(copy for copy in row["copies"] if copy["path"] == preserved.name)["status"], "present")
+            receipt = read_json(self.vault.control / "receipts" / (slot["move_receipt"] + ".json"))
+            self.assertEqual(receipt["payload"]["material"], identifier)
+            self.assertEqual(receipt["payload"]["cipher_sha256"], row["cipher_sha256"])
+            receipts.add(slot["move_receipt"])
+        self.assertEqual(len(receipts), 2)
+        result = maintenance.daily(self.vault, utc(closed["closed_at"]) + timedelta(days=15))
+        self.assertEqual(result["status"], "complete", result)
+
+    def test_task_close_rechecks_worktree_after_verifying_captures(self):
+        self.age()
+        self.change_policy()
+        task = tasks.create(self.vault, "Worktree changes during verification")
+        draft = Path(task["worktree"]) / "draft.txt"
+        atomic(draft, b"initial draft")
+        verify = tasks.verify_preserved_checkpoints
+
+        def edit_after_verification(vault, record, copies):
+            checked = verify(vault, record, copies)
+            atomic(draft, b"draft changed during verification")
+            return checked
+
+        with patch("healdan.tasks.verify_preserved_checkpoints", side_effect=edit_after_verification):
+            with self.assertRaisesRegex(Blocked, "Worktree changed after its verified capture"):
+                tasks.preserve_and_close(self.vault, task["id"])
+        self.assertEqual(draft.read_bytes(), b"draft changed during verification")
+        self.assertTrue(tasks.get_task(self.vault, task["id"])["capacity_held"])
+        self.assertFalse(tasks.preserve_and_close(self.vault, task["id"])["capacity_held"])
+
+    def test_expired_worktree_reconciles_captures_before_and_after_process_supervision(self):
+        keys = self.age()
+        self.change_policy()
+        task = tasks.create(self.vault, "Expired worktree with supervised process")
+        task["processes"] = [{"session": "synthetic supervised process"}]
+        atomic(tasks.task_path(self.vault, task["id"]), task)
+        draft = Path(task["worktree"]) / "draft.txt"
+        atomic(draft, b"draft before supervisor")
+        prior = []
+
+        def supervisor(vault, current):
+            captures = [row for row in custody.materials(vault).values() if row.get("task") == current["id"]]
+            self.assertEqual(len(captures), 1)
+            prior.append(captures[0]["id"])
+            self.assertTrue(custody.capture_copy(vault, captures[0]))
+            atomic(draft, b"last draft flushed by supervisor")
+            current["processes"] = []
+            atomic(tasks.task_path(vault, current["id"]), current)
+
+        with patch("healdan.tasks.reconcile_processes", side_effect=supervisor) as checked:
+            expired = tasks.reconcile_expired(self.vault, task["id"], now=utc(task["created_at"]) + timedelta(days=2))
+        checked.assert_called_once()
+        self.assertTrue(expired["worktree_removed"] and expired["capacity_held"])
+        self.assertFalse(draft.exists())
+        self.assertNotEqual(prior[0], expired["expiry_preservation"])
+        for identifier, expected in ((prior[0], b"draft before supervisor"),
+                                     (expired["expiry_preservation"], b"last draft flushed by supervisor")):
+            row = custody.materials(self.vault)[identifier]
+            files = decode(custody.decrypt(self.vault, custody.capture_copy(self.vault, row), keys[1]))["files"]
+            slot = next(copy for copy in row["copies"] if copy["path"].endswith("/draft.txt"))
+            self.assertEqual(base64.b64decode(files[slot["path"]]["body"]), expected)
+            self.assertEqual(slot["status"], "moved")
+            self.assertIsNotNone(slot.get("move_receipt"))
+
     def test_material_proof_applies_before_any_native_or_cipher_deletion(self):
         self.age()
         self.change_policy()
@@ -549,7 +646,7 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(final["status"], "complete", final)
         self.assertFalse(any(path.exists() for path in (*ciphers, target, origin / "nested/b.jsonl")))
 
-    def test_pending_shared_unlink_preserves_new_generation_at_same_path(self):
+    def test_pending_shared_unlink_expands_intent_after_expiry_and_hold_release(self):
         self.age()
         self.change_policy()
         original, origin = self.capture()
@@ -569,17 +666,129 @@ class StorageLifecycle(VaultTest):
 
         with patch.object(Path, "unlink", before_effect), self.assertRaises(SystemExit):
             retention.execute(self.vault, plan["id"], now)
+        plan_path = self.vault.control / "deletions" / (plan["id"] + ".json")
+        prior = next(entry["intent"] for entry in read_json(plan_path)["entries"] if entry["status"] == "deleting")
         newest = custody.capture_tree(self.vault, origin, task=original["task"], classification="common")
         material = custody.materials(self.vault)[newest]
-        material["closed_at"] = original["closed_at"]
+        material["closed_at"] = "2026-02-20T00:00:00Z"
         custody.save_material(self.vault, material)
         result = retention.execute(self.vault, plan["id"], now)
         self.assertEqual(result["status"], "pending", result)
-        self.assertTrue(any("Shared custody changed" in item["reason"] for item in result["pending"]))
+        self.assertTrue(any("Retention has not expired" in item["reason"] for item in result["pending"]))
+        hold = custody.hold(self.vault, newest, "Review newer capture", "human")
+        _, unrelated = self.export("independent-while-held")
+        restart = Vault(self.root, self.state)
+        later = "2026-04-11T00:00:00Z"
+        pending = maintenance.daily(restart, later)
+        self.assertTrue(any("Active hold" in item["reason"] for item in pending["pending"]))
+        self.assertFalse(unrelated.exists())
         self.assertEqual(target.read_bytes(), b"first synthetic conversation file")
-        saved = custody.materials(self.vault)[newest]
-        self.assertEqual(saved["copies"][:2], material["copies"][:2])
-        self.assertEqual(saved["copies"][2]["status"], "deleted")
+        self.assertEqual(next(entry["intent"] for entry in read_json(plan_path)["entries"] if entry["status"] == "deleting"), prior)
+        custody.release_hold(restart, newest, hold["id"], [])
+
+        def after_effect(path, *args, **kwargs):
+            outcome = unlink(path, *args, **kwargs)
+            if path == target:
+                raise SystemExit("interrupted after unlink with extended intent")
+            return outcome
+
+        with patch.object(Path, "unlink", after_effect), self.assertRaises(SystemExit):
+            maintenance.daily(restart, later)
+        self.assertFalse(target.exists())
+        entry = next(entry for entry in read_json(plan_path)["entries"] if entry["status"] == "deleting")
+        current = entry["intent"]
+        self.assertEqual(entry["intent_history"], [prior])
+        self.assertEqual(current["supersedes"], digest(prior))
+        ids = {original["id"], duplicate, newest}
+        self.assertEqual({slot["material"] for slot in current["generations"]}, ids)
+        completed = maintenance.daily(Vault(self.root, self.state), later)
+        self.assertEqual(completed["status"], "complete", completed)
+        receipts = set()
+        for identifier in ids:
+            row = custody.materials(self.vault)[identifier]
+            self.assertTrue(all(copy["status"] == "deleted" and copy["deletion_receipt"] for copy in row["copies"]))
+            for copy in row["copies"]:
+                receipt = read_json(self.vault.control / "receipts" / (copy["deletion_receipt"] + ".json"))
+                self.assertEqual(receipt["payload"]["material"], identifier)
+                receipts.add(copy["deletion_receipt"])
+                if copy["path"] == target.name:
+                    self.assertEqual(receipt["payload"]["intent"], current)
+        self.assertEqual(len(receipts), 9)
+
+    def test_single_slot_intent_requires_original_revision_before_expansion(self):
+        self.age()
+        self.change_policy()
+        record, origin = self.capture()
+        target = origin / "a.jsonl"
+        data = target.read_bytes()
+        now = "2026-02-10T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        unlink = Path.unlink
+
+        def interrupt(path, *args, **kwargs):
+            if path == target:
+                raise SystemExit("interrupted before single-slot unlink")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", interrupt), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], now)
+        path = self.vault.control / "deletions" / (plan["id"] + ".json")
+        original = path.read_bytes()
+        journal = read_json(path)
+        intent = next(entry["intent"] for entry in journal["entries"] if entry["status"] == "deleting")
+        self.assertNotIn("generations", intent)
+        del intent["file_mtime_ns"]
+        atomic(path, journal)
+        with patch.object(Path, "unlink", interrupt), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], now)
+        atomic(path, original)
+        duplicate = custody.capture_tree(self.vault, origin, task=record["task"], classification="common")
+        newest = custody.materials(self.vault)[duplicate]
+        newest["closed_at"] = record["closed_at"]
+        custody.save_material(self.vault, newest)
+        del intent["file_revision"]
+        atomic(path, journal)
+        result = retention.execute(self.vault, plan["id"], now)
+        self.assertTrue(any("Original file revision is unproven" in item["reason"] for item in result["pending"]))
+        self.assertEqual(target.read_bytes(), data)
+        atomic(path, original)
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertFalse(target.exists())
+        self.assertEqual(custody.materials(self.vault)[duplicate]["copies"][1]["status"], "deleted")
+
+    def test_pending_shared_unlink_preserves_a_rewritten_revision_even_with_same_hash(self):
+        self.age()
+        self.change_policy()
+        record, origin = self.capture()
+        before = custody.capture_tree(self.vault, origin, task=record["task"], classification="common")
+        other = custody.materials(self.vault)[before]
+        other["closed_at"] = record["closed_at"]
+        custody.save_material(self.vault, other)
+        target = origin / "a.jsonl"
+        data = target.read_bytes()
+        now = "2026-02-10T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        unlink = Path.unlink
+
+        def interrupt(path, *args, **kwargs):
+            if path == target:
+                raise SystemExit("interrupted before grouped unlink")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", interrupt), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], now)
+        inode, mtime_ns = retention.file_identity(target), target.stat().st_mtime_ns
+        target.write_bytes(data)
+        self.assertEqual(retention.file_identity(target), inode)
+        self.assertNotEqual(target.stat().st_mtime_ns, mtime_ns)
+        retry = maintenance.daily(self.vault, now)
+        self.assertEqual(retry["status"], "pending", retry)
+        self.assertTrue(any("Copy identity changed" in item["reason"] for item in retry["pending"]))
+        self.assertEqual(target.read_bytes(), data)
+        for identifier in (record["id"], before):
+            saved = custody.materials(self.vault)[identifier]
+            self.assertEqual(saved["copies"][0]["status"], "present")
+            self.assertEqual(saved["copies"][1]["status"], "present")
 
     def test_eligible_long_backup_runs_while_short_body_is_ineligible(self):
         destination = self.configure_age(backup_interval_hours=24)
