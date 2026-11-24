@@ -3,6 +3,7 @@ from datetime import timedelta
 import os
 from pathlib import Path
 
+from . import admission
 from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, utc
 
 EXCLUDED = {"inbox/agent-activities-today.md", "inbox/manual-activities-today.md", "inbox/agent-dashboard.html"}
@@ -36,7 +37,16 @@ def inventory(vault):
             if relative not in items[key]["paths"]:
                 items[key]["paths"].append(relative)
         atomic(journal_path, items)
-        return list(items.values())
+        view = admission.Classification(vault, admission.published_rows(vault))
+        result = []
+        for item in items.values():
+            try:
+                classification, _ = view.current(item["sha256"])
+                classification = classification or item["classification"]
+                result.append(dict(item, classification=classification))
+            except Blocked as exc:
+                result.append(dict(item, classification="unknown", classification_conflict=str(exc)))
+        return result
 
 
 def decide(vault, sha256, decision, *, owner, classification, entered_at=None, entry_origin=None,
@@ -44,21 +54,26 @@ def decide(vault, sha256, decision, *, owner, classification, entered_at=None, e
     require(decision in {"ingest", "project", "resource", "discard", "archive", "defer"}, "Invalid triage decision", 2)
     require(classification in {"common", "personal", "sensitive", "mixed", "unknown", "secret"}, "Invalid class", 2)
     require(owner, "Triage requires a responsible owner", 2)
-    if classification == "secret":
-        from .incidents import quarantine
-        items = read_json(vault.control / "inbox.json", {})
-        require(sha256 in items, "Inventory the Inbox item first", 2)
-        quarantines = [quarantine(vault, path, owner) for path in items[sha256]["paths"]
-                       if safe_path(vault.root, path).is_file()]
-        return {"classification": "secret", "quarantines": quarantines}
-    if classification != "common":
-        from .custody import validate_purpose
-        validate_purpose({"classification": classification, "purpose": purpose})
     with vault.locked():
         path = vault.control / "inbox.json"
         items = read_json(path, {})
         require(sha256 in items, "Inventory the Inbox item first", 2)
         item = items[sha256]
+        if classification == "secret":
+            from .incidents import quarantine
+            quarantines = []
+            for name in item["paths"]:
+                origin = safe_path(vault.root, name)
+                if origin.is_file() and digest(origin.read_bytes()) == sha256:
+                    quarantines.append(quarantine(vault, name, owner))
+            return {"classification": "secret", "quarantines": quarantines}
+        admission.require_triage(vault, sha256, classification)
+        if classification != "common":
+            from .custody import materials, validate_purpose
+            validate_purpose({"classification": classification, "purpose": purpose})
+            existing = materials(vault).get("inbox-" + sha256, {})
+            require(not existing or existing.get("purpose") == purpose,
+                    "Triage purpose differs from existing custody", 5)
         if entered_at:
             require(entry_origin, "Capture provenance is required", 2)
             if item.get("entered_at"):
@@ -69,21 +84,28 @@ def decide(vault, sha256, decision, *, owner, classification, entered_at=None, e
         require(decision == "defer" or destination, "A decision needs a destination or disposition reference", 2)
         item.update(classification=classification, decision=decision, owner=owner,
                     decided_at=stamp(), defer_until=stamp(defer_until) if defer_until else None, destination=destination)
+        if purpose is not None:
+            item["purpose"] = purpose
         receipt = vault.receipt("inbox-decision", item)
+        item["decision_receipt"] = receipt
         item["receipts"].append(receipt)
-        atomic(path, items)
         if classification != "common":
-            from .custody import materials, save_material
+            from .custody import save_material
             identifier = "inbox-" + sha256
-            existing = materials(vault).get(identifier, {})
-            record = {"id": identifier, "kind": "export", "classification": classification,
-                      "captured_at": item["entered_at"], "purpose": purpose, "holds": existing.get("holds", []),
-                      "dependencies": existing.get("dependencies", []), "copies": []}
+            record = {**existing, "id": identifier, "kind": "export", "classification": classification,
+                      "captured_at": min(filter(None, (existing.get("captured_at"), item["entered_at"])), key=utc, default=None),
+                      "purpose": purpose,
+                      "source_sha256": sha256, "holds": existing.get("holds", []),
+                      "dependencies": existing.get("dependencies", []), "copies": existing.get("copies", [])}
             for name in item["paths"]:
-                if safe_path(vault.root, name).is_file():
-                    record["copies"].append({"root": str(vault.root / "inbox"), "path": name.removeprefix("inbox/"),
-                                             "sha256": sha256, "kind": "export", "status": "present"})
+                origin = safe_path(vault.root, name)
+                if origin.is_file() and digest(origin.read_bytes()) == sha256:
+                    copy = {"root": str(vault.root / "inbox"), "path": name.removeprefix("inbox/"),
+                            "sha256": sha256, "kind": "export", "status": "present"}
+                    if copy not in record["copies"]:
+                        record["copies"].append(copy)
             save_material(vault, record)
+        atomic(path, items)
         return item
 
 
@@ -108,7 +130,8 @@ def archive_empty(vault, sha256):
         items = read_json(path, {})
         require(sha256 in items, "Inventory the Inbox item first", 2)
         item = items[sha256]
-        require(sha256 == digest(b"") and item["size"] == 0 and item["classification"] == "common",
+        current, _ = admission.Classification(vault, admission.published_rows(vault)).current(sha256)
+        require(sha256 == digest(b"") and item["size"] == 0 and current == "common",
                 "Only zero-byte ordinary material may auto-archive", 5)
         journal_path = vault.control / "zero-byte-archive.json"
         pending = read_json(journal_path, {})

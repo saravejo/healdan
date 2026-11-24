@@ -18,10 +18,12 @@ def protect(root):
 
 def source_path(path):
     return (isinstance(path, str) and path.startswith("resources/sources/") and
-            Path(path).as_posix() == path and path not in {REGISTRY, "resources/sources/.gitkeep"})
+            Path(path).as_posix() == path and path not in {REGISTRY, "resources/sources/.gitkeep"} and
+            not {".git", ".gitattributes"}.intersection(part.casefold() for part in Path(path).parts))
 
 
 def verify_attributes(root, path):
+    require(source_path(path), "Invalid preserved source path: " + str(path), 5)
     fields = ("text", "eol", "filter", "working-tree-encoding", "ident")
     output = git_bytes(root, "check-attr", "-z", *fields, "--", path).decode("utf-8").split("\0")
     attributes = dict(zip(output[1::3], output[2::3], strict=True))
@@ -30,10 +32,13 @@ def verify_attributes(root, path):
     for field in fields[1:]:
         value = attributes[field]
         require(value in UNSET, f"{path}: effective Git {field}={value} can alter original bytes", 5)
+    # Git prints the same value for -filter and a literal filter named "unset".
+    ambiguous = attributes["filter"]
+    configured = git(root, "config", "--get-regexp", rf"^filter\.{ambiguous}\.(clean|smudge|process|required)$", check=False)
+    require(not configured, f"{path}: effective Git filter={ambiguous} matches a configured filter", 5)
 
 
 def verify_storage(root, path, body):
-    require(source_path(path), "Invalid preserved source path: " + str(path), 5)
     verify_attributes(root, path)
     raw = git_bytes(root, "hash-object", "--no-filters", "--stdin", data=body)
     try:
@@ -53,8 +58,12 @@ def verify_body(row, body, *, revision=None):
 
 def git_blob(root, revision, path):
     reference = f"{revision}:{path}"
-    require(git(root, "cat-file", "-t", reference, check=False) == "blob",
-            "Missing source blob " + reference + "; reconciliation requires verified raw bytes")
+    args = ("ls-tree", "-z", revision) if revision else ("ls-files", "--stage", "-z")
+    entries = git_bytes(root, "--literal-pathspecs", *args, "--", path, check=False).split(b"\0")[:-1]
+    metadata = [entry.split(b"\t", 1)[0].split() for entry in entries]
+    require(len(metadata) == 1 and metadata[0][0] in {b"100644", b"100755"} and
+            (not revision or metadata[0][1] == b"blob") and (revision or metadata[0][-1] == b"0"),
+            "Missing regular source blob " + reference + "; reconciliation requires verified raw bytes")
     return git_bytes(root, "cat-file", "blob", reference)
 
 

@@ -3,7 +3,8 @@ from collections import defaultdict
 import re
 from urllib.parse import quote, unquote
 
-from .core import digest, read_json, require, safe_path, stamp
+from . import admission
+from .core import digest, read_json, require, safe_path, stamp, utc
 from .ids import identity
 from .knowledge import Knowledge, LIVE, claim_key
 
@@ -34,6 +35,9 @@ def render_current(knowledge, ids, title, cutoff):
                 f"  Qualifiers: {escape(row.get('qualifiers', {}))}.\n")
         if not factual:
             line += f"  Pending: {answer['outcome']}; conflicts: {', '.join(answer['conflicts'])}.\n"
+            supported, _, reasons = knowledge.support(row, utc(cutoff))
+            if not supported and reasons:
+                line += "  Evidence: " + escape("; ".join(reasons)) + ".\n"
         (current if factual else pending).append(line)
     return ("<!-- healdan:current:start -->\n# " + escape(title) + "\n\nCutoff: " + stamp(cutoff) +
             "\n\n## Knowledge\n\n" + "\n".join(current) + "\n## Pending\n\n" + "\n".join(pending) +
@@ -111,12 +115,20 @@ def split_preview(rows, renderer, caps=CAPS):
 
 def preview(vault, cutoff=None, *, proposed=()):
     before = vault.fingerprint()
+    classification = admission.classification_token(vault)
     knowledge = Knowledge(vault, proposed=proposed, diagnostic=True)
     cutoff = stamp(cutoff)
     result = split_preview(list(knowledge.claims.values()),
                            lambda title, ids: render_current(knowledge, ids, title, cutoff))
-    require(before == vault.fingerprint(), "Concurrent change invalidated preview", 5)
-    return {"fingerprint": before, "cutoff": cutoff, "comparisons": result}
+    pending = []
+    for row in knowledge.claims.values():
+        if row["state"] in LIVE:
+            supported, _, reasons = knowledge.support(row, utc(cutoff))
+            if not supported:
+                pending.append({"id": row["id"], "reasons": reasons})
+    require(before == vault.fingerprint() and admission.classification_token(vault) == classification,
+            "Concurrent change invalidated preview", 5)
+    return {"fingerprint": before, "cutoff": cutoff, "comparisons": result, "pending_evidence": pending}
 
 
 def generated_pages(vault, *, proposed=()):

@@ -16,8 +16,12 @@ JSON. `--help` lists exact arguments.
 | `doctor`, `status` | Dependency/configuration/trial health and operational clocks |
 | `inbox inventory` | Record content identity, paths, versions; never infer capture time |
 | `inbox decide HASH DECISION` | Owner, class, known entry provenance, destination or explicit deferral |
-| `inbox ingest inbox/FILE --provenance TEXT --captured-at UTC --classification common` | Reserve F-, preserve original, record hash/locator basis |
+| `inbox ingest inbox/FILE --provenance TEXT --captured-at UTC --classification common [--derived-from FILE]` | Reconcile classification and lineage, reserve F-, preserve original and record hash/locator basis |
 | `inbox archive-empty HASH` | Archive only classified ordinary zero-byte copies with receipts |
+| `inbox reconcile-original F-ID RAW_FILE` | Verify supplied raw bytes against the committed source manifest and restore the working copy for a reviewed reconciliation |
+| `inbox reconcile-sources` | Register verified custody links for legacy sources and report unresolved admission conflicts |
+| `inbox sign-reclassification HASH REQUEST.json --output APPROVAL.json` | Sign an explicit classification change using an authorized external human identity |
+| `inbox reclassify APPROVAL.json` | Verify and apply the signed change against the current material revision and policy |
 | `inbox quarantine inbox/FILE --owner OWNER` | Encrypt and restrict an incident copy before removing exposure |
 | `task create TITLE`, `task list` | Create a recorded detached worktree; report capacity |
 | `task reserve-id C --operation UUID [--count N]` | Idempotent common-Git reservation |
@@ -66,6 +70,39 @@ every proposed claim ID to an object with status `conform` and the exact claim's
 SHA-256, and binds both frozen extraction hashes.
 The editor proposal mirrors authorized `wiki/` and `resources/sources/` paths.
 The controller writes generated pages into the frozen candidate before signing.
+
+`inbox archive-empty` creates its destination exclusively. An existing empty
+destination can be reused; a different destination is a conflict that preserves
+both paths. Repeating an interrupted movement reconciles its recorded intent
+and receipt. Whitespace-only files are not empty files.
+
+`setup` appends protection for preserved originals to `.gitattributes` without
+replacing unrelated rules. `doctor` reports effective attributes, filters and
+committed source bytes. A higher-priority Git conversion rule must be corrected
+before admission or publication. `inbox reconcile-original` requires raw bytes
+matching the existing manifest; it does not change historical manifests,
+signatures or commits. Review and commit the reconciliation before using the
+source again. `inbox reconcile-sources` preserves legacy rows and registers
+custody copies only when their existing purpose, classification and bytes
+agree.
+
+For `--derived-from`, supply a JSON object with `method` and a `sources` list.
+Each parent has `id` and `revision`, the SHA-256 of its canonical source row.
+Known copies of generated wiki pages retain their page and claim dependencies
+when renamed or reingested. Query and preview check those dependencies against
+the current records. A derived source does not create an independent observation
+merely because its bytes differ from its parent's bytes.
+
+A reclassification request contains `classification` and `reason`. The signer
+must be trusted by the external allowed-signers file and listed in external
+configuration `source_classification_authorities`. The signed approval binds
+the prior class, requested class, material revision and policy; a stale or
+altered approval cannot change the material. Ordinary `inbox decide` does not
+authorize a conflicting classification change. Known personal, sensitive,
+mixed and secret material cannot enter as `common` through another path or a
+source-only proposal. Personal or sensitive minimal-source proposals require
+`purpose`, `necessity`, `owner` and `link` in their `purpose` object, with a
+verifiable custody link and the normal package review and human approval.
 
 Templates deliberately contain null placeholders and are never operational
 records. Allocate real IDs, inspect real evidence and fill them before use.

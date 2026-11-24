@@ -6,7 +6,7 @@ import sys
 
 from .core import REQUIRED_REGISTRIES, Blocked, Vault, atomic, executable, git, read_json, require, run
 from .binding import setup_binding
-from . import originals
+from . import admission, originals
 
 DIRECTORIES = ("inbox", "projects", "wiki/topics", "archive", "control/tasks", "templates")
 
@@ -120,6 +120,12 @@ def doctor(vault):
                 check("source_blob", False, str(exc))
     except Blocked as exc:
         check("source_blob", False, str(exc))
+    try:
+        for row in admission.existing_sources(vault):
+            check("source_admission", row["status"] == "valid",
+                  f"{row['source']} {row['path']}: {row.get('reason', row['status'])}")
+    except Blocked as exc:
+        check("source_admission", False, str(exc))
     for name in ("git", "ssh-keygen", "claude", "age", "node", "srt"):
         try:
             check(name, True, executable(name))

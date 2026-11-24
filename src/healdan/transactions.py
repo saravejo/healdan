@@ -4,10 +4,11 @@ import copy
 from pathlib import Path
 import tempfile
 
-from .core import REGISTRIES, atomic, digest, git, git_bytes, jsonl, read_json, require, safe_path, stamp
-from . import originals
+from .core import REGISTRIES, atomic, digest, extend_jsonl, git, git_bytes, read_json, require, safe_path, stamp, utc
+from . import admission, originals
 from .ids import aliases, committed_registries, identity, registry_records
 from .knowledge import Knowledge
+from .lineage import CLAIMS, PageHistory, page_revision
 from .pages import generated_pages, validate_pages
 from .regression import require_suite
 from .review import csp_status, freeze_csp, inspect, read_csp_state, require_csp_state, validate_review
@@ -22,8 +23,7 @@ LEDGER = "control/approvals/packages.jsonl"
 
 
 def allowed(path):
-    return (path in EXACT or (path.startswith("wiki/topics/") and path.endswith(".md")) or
-            (originals.source_path(path) and ".gitattributes" not in Path(path).parts))
+    return path in EXACT or (path.startswith("wiki/topics/") and path.endswith(".md")) or originals.source_path(path)
 
 
 class Candidate:
@@ -43,6 +43,7 @@ class Candidate:
             candidate = copy.copy(self.vault)
             candidate.root = root
             candidate.head = self.vault.head
+            candidate.proposed_paths = self.files.keys()
             candidate.check_registries()
             return candidate
         except BaseException:
@@ -92,11 +93,13 @@ def validate_candidate(vault, candidate, cutoff):
     aliases(candidate)
     changes = proposed_digests(vault, candidate)
     preserve_contracts(vault, candidate)
-    files = {name: data for name, data in vault.input_files() if originals.source_path(name)}
-    for name, body in candidate.input_files():
-        if originals.source_path(name) and name not in files:
-            originals.verify_storage(vault.root, name, body)
-    Knowledge(candidate, proposed=changes.values())
+    admission.plan(vault, candidate, admission.source_rows(vault), reviewed=True)
+    knowledge = Knowledge(candidate, proposed=changes.values())
+    for key in changes:
+        claim = knowledge.claims[key]
+        if claim["state"] == "accepted":
+            supported, _, reasons = knowledge.support(claim, utc(cutoff))
+            require(supported, "Ineligible evidence for " + key + ": " + "; ".join(reasons), 5)
     validate_pages(candidate, proposed=changes.values())
     factual = [c["id"] for c in candidate.rows("wiki/claims.jsonl")
                if c["id"] in changes and c["state"] == "accepted"]
@@ -113,6 +116,41 @@ def validate_recovery_identities(vault, signed_files, commit=None):
                 require(registry in committed, "Committed registry is missing: " + registry)
                 actual = registry_records(registry, committed[registry])
                 require(actual.keys() == expected.keys(), "Committed identities differ from the signed candidate: " + registry)
+
+
+def withdraw_publication(vault, journal_path, journal, failure):
+    restored = {}
+    for name, encoded in journal["files"].items():
+        target = safe_path(vault.root, name)
+        current = digest(target.read_bytes()) if target.exists() else None
+        before = journal["before"][name]
+        proposed = digest(base64.b64decode(encoded, validate=True))
+        require(current in {before, proposed}, "Concurrent edit prevents withdrawing integration: " + name, 5)
+        if current != before:
+            body = None
+            if before is not None:
+                frozen = journal.get("before_files", {}).get(name)
+                body = (base64.b64decode(frozen, validate=True) if frozen is not None else
+                        originals.git_blob(vault.root, journal["base"], name))
+                require(digest(body) == before, "Original bytes unavailable for withdrawal: " + name, 5)
+            restored[target] = body
+        stage = git(vault.root, "rev-parse", "--verify", f":{name}", check=False)
+        if stage:
+            staged = digest(originals.git_blob(vault.root, "", name))
+            original_stage = git(vault.root, "rev-parse", "--verify", f"{journal['base']}:{name}", check=False)
+            require(stage == original_stage or staged == proposed,
+                    "Concurrent staged edit prevents withdrawing integration: " + name, 5)
+    for target, body in restored.items():
+        if body is None:
+            target.unlink()
+        else:
+            atomic(target, body)
+    git(vault.root, "--literal-pathspecs", "reset", journal["base"], "--", *journal["files"])
+    at = journal.get("publication_at") or stamp()
+    admission.publication(vault, journal.get("admissions", []), "withdrawn", at=at)
+    journal.update(status="aborted", aborted_at=stamp(), reason=str(failure))
+    atomic(journal_path, journal)
+    vault.receipt("integration-withdrawn", {"package": journal["package_id"], "reason": str(failure)}, at=at)
 
 
 def package_path(vault, identifier):
@@ -141,10 +179,26 @@ def prepare(vault, task_id, *, cutoff=None):
                 files[name] = base64.b64encode(safe_path(root, name, exists=True).read_bytes()).decode("ascii")
         require(files, "No proposal files", 2)
         cutoff = stamp(cutoff)
+        revisions = []
         with Candidate(vault, files) as candidate:
             changes = proposed_digests(vault, candidate)
             require(not changes or candidate.rows("resources/sources/index.jsonl") == task["source_manifest"],
                     "Promoted claims must use the source snapshot seen by both independent sessions", 5)
+            baseline = admission.source_rows(vault)
+            proposed_sources = admission.source_rows(candidate)
+            if proposed_sources.keys() != baseline.keys() and all(proposed_sources.get(key) == row for key, row in baseline.items()):
+                additions = []
+                history = PageHistory(vault)
+                for key, original in proposed_sources.items():
+                    if key not in baseline:
+                        row = dict(original)
+                        body = safe_path(candidate.root, row["path"], exists=True).read_bytes()
+                        if "origin" not in row:
+                            row["origin"] = history.origin(body, row["path"])
+                        additions.append(row)
+                manifest = admission.append_sources(vault, additions)
+                files[originals.REGISTRY] = base64.b64encode(manifest).decode("ascii")
+                atomic(candidate.root / originals.REGISTRY, manifest)
             # Controller renders before signing; handwritten substitutes cannot pass validation.
             for name, body in generated_pages(candidate, proposed=changes.values()).items():
                 existing = safe_path(candidate.root, name)
@@ -154,6 +208,8 @@ def prepare(vault, task_id, *, cutoff=None):
                         b"<!-- healdan:history:start -->", 1)[1]
                 files[name] = base64.b64encode(body + tail).decode("ascii")
                 atomic(existing, body + tail)
+                claims = registry_records(CLAIMS, candidate.rows(CLAIMS))
+                revisions.append(page_revision(name, body + tail, claims, admission.source_rows(candidate), aliases(candidate)))
             if candidate.rows("wiki/control/selectors.jsonl"):
                 links = [f"- [{s['title']}]({s['path'].removeprefix('wiki/')})"
                          for s in candidate.rows("wiki/control/selectors.jsonl")]
@@ -169,6 +225,8 @@ def prepare(vault, task_id, *, cutoff=None):
         payload = {"task": task_id, "base": vault.head(), "fingerprint": before, "files": files,
                    "input_hashes": vault.inputs(),
                    "claim_digests": changes, "cutoff": cutoff, "review": review, "regression": regression}
+        if revisions:
+            payload["page_revisions"] = revisions
         identifier = digest(payload)
         path = package_path(vault, identifier)
         existing = read_json(path)
@@ -240,7 +298,7 @@ def apply(vault, identifier=None, *, recover=False):
         journal_path = vault.control / "transaction.json"
         journal = read_json(journal_path)
         if recover:
-            require(journal and journal["status"] != "complete", "No pending transaction", 2)
+            require(journal and journal["status"] not in {"complete", "aborted"}, "No pending transaction", 2)
             identifier = journal["package_id"]
         else:
             vault.no_transaction()
@@ -262,17 +320,22 @@ def apply(vault, identifier=None, *, recover=False):
             with Candidate(vault, signed["files"]) as candidate:
                 validate_candidate(vault, candidate, signed["cutoff"])
             files = dict(signed["files"])
-            entries = vault.rows(LEDGER) + [record["approval"]]
-            files[LEDGER] = base64.b64encode(jsonl(entries)).decode("ascii")
+            ledger = safe_path(vault.root, LEDGER, exists=True).read_bytes()
+            files[LEDGER] = base64.b64encode(extend_jsonl(ledger, [record["approval"]])).decode("ascii")
+            before_files = {name: safe_path(vault.root, name).read_bytes() for name in files
+                            if safe_path(vault.root, name).exists()}
             journal = {"package_id": identifier, "status": "writing", "base": vault.head(), "files": files,
-                       "before": {p: digest(safe_path(vault.root, p).read_bytes())
-                                  if safe_path(vault.root, p).exists() else None for p in files}, "written": []}
+                       "before": {p: digest(before_files[p]) if p in before_files else None for p in files},
+                       "before_files": {p: base64.b64encode(body).decode("ascii") for p, body in before_files.items()},
+                       "publication_at": stamp(), "written": []}
             atomic(journal_path, journal)
         else:
             require(journal["base"] == signed["base"], "Recovery journal base differs from the signed package")
             require(LEDGER in journal["files"] and
                     {name: data for name, data in journal["files"].items() if name != LEDGER} == signed["files"],
                     "Recovery journal files differ from the signed package")
+            require(journal["before"] == {name: signed["input_hashes"].get(name) for name in journal["files"]},
+                    "Recovery journal originals differ from the signed base")
         head = vault.head()
         require(head == journal["base"] or
                 f"Healdan-Package: {identifier}" in git(vault.root, "log", "-1", "--format=%B"),
@@ -288,6 +351,32 @@ def apply(vault, identifier=None, *, recover=False):
             if not committed or csp_state not in (next_csp_state, legacy_next_state):
                 require_csp_state(plan, csp_state)
             validate_recovery_identities(vault, signed["files"], committed)
+        baseline = originals.committed_sources(vault.root, journal["base"])
+        at = journal.get("publication_at") or stamp()
+        try:
+            with Candidate(vault, signed["files"]) as candidate:
+                admissions = admission.plan(vault, candidate, baseline, reviewed=True,
+                                            check_storage=head == journal["base"])
+            recorded = journal.get("admissions")
+            if recorded is not None and recorded != admissions:
+                # Completing a publication may have recorded its first decision before the journal was finalized.
+                same_sources = len(recorded) == len(admissions) and all(
+                    dict(before, state=after["state"]) == after for before, after in zip(recorded, admissions))
+                if head == journal["base"] or not same_sources:
+                    raise admission.AdmissionBlocked("Source admission changed during integration", 5)
+                admissions = recorded
+        except admission.AdmissionBlocked as exc:
+            if recover and head == journal["base"]:
+                withdraw_publication(vault, journal_path, journal, exc)
+            elif recover and head != journal["base"]:
+                admission.publication(vault, journal.get("admissions", []), "committed", at=at)
+                atomic(vault.control / "csp.json", next_csp_state)
+                journal.update(status="complete", commit=head, completed_at=stamp(), admission_conflict=str(exc))
+                atomic(journal_path, journal)
+            raise
+        journal.update(admissions=admissions, publication_at=at)
+        atomic(journal_path, journal)
+        admission.publication(vault, admissions, "planned", at=at)
         source_files = {name: base64.b64decode(encoded, validate=True)
                         for name, encoded in signed["files"].items() if originals.source_path(name)}
         for name, body in source_files.items():
@@ -310,7 +399,7 @@ def apply(vault, identifier=None, *, recover=False):
             # All accepted claims now have their authentic package receipt in the vault.
             validate_pages(vault)
             require_suite(vault, cutoff=signed["cutoff"])
-            git(vault.root, "add", "--", *journal["files"])
+            git(vault.root, "--literal-pathspecs", "add", "--", *journal["files"])
             staged = set(git_bytes(vault.root, "diff", "--cached", "--name-only", "-z").decode("utf-8").split("\0")) - {""}
             require(staged <= set(journal["files"]), "Index contains unrelated staged work", 5)
             for name, body in source_files.items():
@@ -321,6 +410,7 @@ def apply(vault, identifier=None, *, recover=False):
             for name, body in source_files.items():
                 require(originals.git_blob(vault.root, vault.head(), name) == body,
                         name + ": Git commit differs from the approved original", 5)
+        admission.publication(vault, admissions, "present", at=at)
         atomic(vault.control / "csp.json", next_csp_state)
         journal.update(status="complete", commit=vault.head(), completed_at=stamp())
         atomic(journal_path, journal)

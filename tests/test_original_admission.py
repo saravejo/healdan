@@ -1,11 +1,13 @@
 from datetime import timedelta
 from pathlib import Path
+import shlex
+import sys
 from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest
 from healdan import backups, inbox, originals, setup, tasks, transactions
-from healdan.core import Blocked, atomic, digest, git, jsonl, read_json, stamp, utc
+from healdan.core import Blocked, atomic, digest, git, git_bytes, jsonl, read_json, stamp, utc
 from healdan.ids import reserve
 from healdan.knowledge import query
 
@@ -183,11 +185,24 @@ class OriginalAdmission(VaultTest):
         atomic(self.root / path, body)
         row, package = self.source_proposal(body)
         info = Path(git(self.root, "rev-parse", "--path-format=absolute", "--git-path", "info/attributes"))
+        converter = self.base / "mutate one byte.py"
+        invoked = self.base / "converter invoked"
+        atomic(converter, b"import pathlib, sys\n"
+                          b"pathlib.Path(sys.argv[1]).touch()\n"
+                          b"data = sys.stdin.buffer.read()\n"
+                          b"sys.stdout.buffer.write(bytes([data[0] ^ 1]) + data[1:] if data else data)\n")
+        command = shlex.join([Path(sys.executable).as_posix(), converter.as_posix(), invoked.as_posix()])
+        git(self.root, "config", "filter.mutate.clean", command)
+        git(self.root, "config", "filter.mutate.required", "true")
         for rule, attribute in (("text eol=lf", "text"), ("-text filter=mutate", "filter"),
                                 ("-text working-tree-encoding=UTF-16LE", "working-tree-encoding")):
             with self.subTest(rule=rule):
                 atomic(info, f"resources/sources/** {rule}\nresources/sources/F-9191/** -text !eol !filter !working-tree-encoding\n".encode())
-                git(self.root, "config", "filter.mutate.clean", "git hash-object --stdin")
+                if attribute == "filter":
+                    raw = git_bytes(self.root, "hash-object", "--stdin", "--no-filters", data=body)
+                    self.assertNotEqual(git_bytes(self.root, "hash-object", "--stdin", "--path=" + row["path"], data=body), raw)
+                    self.assertTrue(invoked.is_file())
+                    invoked.unlink()
                 checks = setup.doctor(self.vault)["checks"]
                 self.assertTrue(any(c["name"] == "source_attributes" and not c["passed"] and
                                     attribute + "=" in c["detail"] for c in checks), checks)
@@ -198,6 +213,7 @@ class OriginalAdmission(VaultTest):
                     transactions.apply(self.vault, package["id"])
                 self.assertFalse((self.root / row["path"]).exists())
                 self.assertEqual(self.vault.rows(originals.REGISTRY), [])
+                self.assertFalse(invoked.exists())
         info.unlink()
         self.assertEqual(transactions.apply(self.vault, package["id"])["status"], "complete")
 

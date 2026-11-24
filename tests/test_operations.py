@@ -7,7 +7,7 @@ import unittest
 from uuid import uuid4
 
 from support import VaultTest
-from healdan import backups, custody, inbox, linting, maintenance, retention, tasks
+from healdan import admission, backups, custody, inbox, linting, maintenance, retention, tasks
 from healdan.core import Blocked, atomic, digest, git, read_json, stamp, utc
 from healdan.review import csp_status, freeze_csp, inspect
 from healdan.setup import initialize
@@ -130,6 +130,11 @@ class InboxLint(VaultTest):
             inbox.archive_empty(self.vault, rows[3]["sha256"])
         atomic(self.root / "inbox/secret-zero", b"")
         inbox.inventory(self.vault)
+        self.vault.config["source_classification_authorities"] = ["human"]
+        atomic(self.vault.config_path, self.vault.config)
+        approval = admission.sign_reclassification(self.vault, rows[0]["sha256"],
+            {"classification": "sensitive", "reason": "Fixture correction after further review"})
+        admission.reclassify(self.vault, approval)
         inbox.decide(self.vault, rows[0]["sha256"], "archive", owner="human", classification="sensitive", destination="restricted",
                      purpose={"purpose": "Verify incident", "necessity": "Required synthetic evidence", "owner": "human", "link": "fixture"})
         with self.assertRaises(Blocked):

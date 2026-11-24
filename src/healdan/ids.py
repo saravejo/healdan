@@ -100,6 +100,15 @@ def reserve(vault, prefix, count, operation, *, locked=False):
         require(old["prefix"] == prefix and len(old["ids"]) == count,
                 "Operation UUID reused with different arguments")
         return old["ids"]
+    values = next_ids(vault, prefix, count, journal)
+    journal[operation] = {"prefix": prefix, "ids": values}
+    atomic(path, journal)
+    return values
+
+
+def next_ids(vault, prefix, count, journal=None):
+    if journal is None:
+        journal = read_json(vault.control / "reservations.json", {})
     current, historic = published(vault)
     require(not any(identity(a)[0] == prefix for a, _ in current["collisions"]),
             "Ambiguous legacy ID collision blocks this prefix")
@@ -107,10 +116,7 @@ def reserve(vault, prefix, count, operation, *, locked=False):
     for record in journal.values():
         used.update(record["ids"])
     highest = max((identity(item)[1] for item in used if identity(item)[0] == prefix), default=0)
-    values = [format_id(prefix, n) for n in range(highest + 1, highest + count + 1)]
-    journal[operation] = {"prefix": prefix, "ids": values}
-    atomic(path, journal)
-    return values
+    return [format_id(prefix, n) for n in range(highest + 1, highest + count + 1)]
 
 
 def aliases(vault):

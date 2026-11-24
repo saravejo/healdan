@@ -109,6 +109,12 @@ def jsonl(rows):
     return b"".join(canonical(row) + b"\n" for row in rows)
 
 
+def extend_jsonl(data, rows):
+    addition = jsonl(rows)
+    separator = b"\n" if data and addition and not data.endswith(b"\n") else b""
+    return data + separator + addition
+
+
 def atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -366,7 +372,7 @@ class Vault:
 
     def no_transaction(self):
         pending = read_json(safe_path(self.control, "transaction.json"))
-        require(not pending or pending["status"] == "complete",
+        require(not pending or pending["status"] in {"complete", "aborted"},
                 "An integration needs recovery", 5)
         return pending
 
