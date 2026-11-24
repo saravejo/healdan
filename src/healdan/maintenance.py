@@ -94,6 +94,14 @@ def _check_trial_settings(vault, workspace):
         require(path != workspace and path.is_relative_to(workspace),
                 "Launchd trial keys, storage roots and backup destinations must stay in its workspace", 5)
         safe_path(workspace, path.relative_to(workspace))
+    for root, directories in ((vault.root, ("inbox", "wiki")),
+                              (vault.state, ("custody", "tasks", "launchd")),
+                              (vault.control, ("deletions", "lint", "receipts", "sessions", "tasks"))):
+        for name in directories:
+            relative = (root / name).relative_to(workspace)
+            path = safe_path(workspace, relative)
+            require(path.resolve() == path and (not path.exists() or path.is_dir()),
+                    "Launchd trial requires a canonical workspace directory at " + str(relative), 5)
     require(all(root.is_relative_to(workspace) for root in vault.repository.worktree_roots()),
             "Launchd trial worktrees must stay in its workspace", 5)
 

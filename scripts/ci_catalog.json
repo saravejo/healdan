@@ -99,6 +99,7 @@
     "test_migration.Migration.test_unknown_inspection_regime_requires_its_own_sequence",
     "test_native_trials.NativeTrialIdentity.test_changes_to_build_dependency_and_config_expire_only_the_applicable_trials",
     "test_native_trials.NativeTrialIdentity.test_knowledge_commit_does_not_expire_the_environment",
+    "test_native_trials.NativeTrialIdentity.test_launchd_trial_validator_rejects_aliased_implicit_directories",
     "test_native_trials.NativeTrialIdentity.test_legacy_receipt_bytes_preserved_and_personal_trials_gate_activation",
     "test_native_trials.NativeTrialIdentity.test_trial_envelope_is_isolated_by_vault_name_and_profile",
     "test_operations.InboxLint.test_lint_strict_eight_days_partial_and_task_dedup",

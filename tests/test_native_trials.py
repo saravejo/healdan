@@ -45,6 +45,36 @@ class NativeTrialIdentity(VaultTest):
         self.assertTrue(self.statuses()["claude-auth"]["passed"])
         self.assertEqual(path.read_bytes(), original)
 
+    def test_launchd_trial_validator_rejects_aliased_implicit_directories(self):
+        custody = self.state / "custody"
+        self.assertFalse(custody.exists())
+        maintenance._check_trial_settings(self.vault, self.base)
+        self.assertFalse(custody.exists())
+        custody.mkdir()
+        maintenance._check_trial_settings(self.vault, self.base)
+
+        for relative in ("state/custody", "vault/inbox"):
+            with self.subTest(directory=relative):
+                workspace = self.base / relative.replace("/", "-")
+                root, state = workspace / "vault", workspace / "state"
+                control = root / ".git/healdan"
+                control.mkdir(parents=True)
+                state.mkdir()
+                trial = SimpleNamespace(root=root, state=state, control=control, config={},
+                                        repository=SimpleNamespace(worktree_roots=lambda: {root}))
+                alias = workspace / relative
+                target = workspace / "synthetic directory"
+                target.mkdir()
+                if os.name == "nt":
+                    import _winapi
+                    _winapi.CreateJunction(str(target), str(alias))
+                else:
+                    alias.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(Blocked, "Symlink path is forbidden|canonical workspace directory"):
+                    maintenance._check_trial_settings(trial, workspace)
+                self.assertEqual(alias.resolve(), target)
+                self.assertEqual(list(target.iterdir()), [])
+
     def test_changes_to_build_dependency_and_config_expire_only_the_applicable_trials(self):
         backup_key = self.base / "separate backup key fixture"
         atomic(backup_key, b"synthetic key material")
