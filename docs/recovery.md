@@ -23,6 +23,9 @@ staged vault and recovered files in the external state. A changed file is
 preserved and reported as a pending recovery. For a restore by ID from a working controller, use
 `restore ID DESTINATION --recovery-state NEW_STATE`.
 
+On POSIX, restored Git files use the regular or executable mode recorded in
+the backed-up commit, filtered by the restoring process's umask.
+
 Each recovered task or session that needs attention reports reconciliation
 and preserves origin paths and launch evidence in its history. The recovered
 controller starts with recovery trust settings and needs its own runtime
@@ -31,6 +34,15 @@ unavailable. Add `--remap FILE.json` to supply verified external copies by
 material ID and original zero-based copy index, for example
 `{"inbox-MATERIAL":{"0":"/path/to/preserved-file"}}`. Restored copies are
 inventoried in the new state under the original material ID.
+
+To close a restored task and release its reserved writing capacity, run
+`healdan --vault NEW_VAULT --state NEW_STATE task reconcile-restored ID --confirm`.
+The controller verifies linked conversation captures in local custody before
+closing the task. If a long backup omitted a required body, supply the verified
+encrypted copy with `--remap` when restoring. Repeat the command after an
+interruption to finish recording the same closure. The closure receipt links
+the original task record to the recovered controller. Sessions remain inactive,
+and origin worktree and process identities stay in the task's history.
 
 Backups created on a recovered controller carry forward the historical
 manifests, receipts and origin records. A new recovery keeps distinct versions

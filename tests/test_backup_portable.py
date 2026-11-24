@@ -49,6 +49,42 @@ class BackupPortable(VaultTest):
         git(self.root, "add", "-A")
         return git(self.root, "commit", "-m", name)
 
+    def tracked_modes(self):
+        files = {"templates/regular.txt": (b"regular file\n", 0o644),
+                 "templates/executable.sh": (b"#!/bin/sh\nexit 0\n", 0o755)}
+        for name, (body, _) in files.items():
+            atomic(self.root / name, body)
+        git(self.root, "add", "--", *files)
+        git(self.root, "update-index", "--chmod=+x", "--", "templates/executable.sh")
+        git(self.root, "commit", "-m", "Tracked regular and executable fixtures")
+        return files
+
+    def assert_tracked_modes(self, root, files, mask):
+        entries = {name: mode for name, mode, _, _ in backup_snapshot.tree_entries(root, "HEAD")}
+        for name, (body, mode) in files.items():
+            self.assertEqual((root / name).read_bytes(), body)
+            self.assertEqual(entries[name], f"100{mode:o}")
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE((root / name).stat().st_mode), mode & ~mask)
+        self.assertFalse(git(root, "status", "--porcelain", "--", *files))
+
+    def test_1_portable_restores_regular_and_executable_git_modes(self):
+        self.configure()
+        files = self.tracked_modes()
+        record = self.create()
+        for mask in (0o022, 0o077) if os.name != "nt" else (0o022,):
+            with self.subTest(mask=oct(mask)):
+                root, state = self.base / f"mode-{mask}", self.base / f"mode-state-{mask}"
+                previous = os.umask(mask)
+                try:
+                    self.restore(record, root, state)
+                finally:
+                    os.umask(previous)
+                self.assert_tracked_modes(root, files, mask)
+                if os.name != "nt":
+                    for path in (root / ".git/healdan/materials.json", state / "config.json"):
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def conversation(self, name, *, classification="common", closed_at=None):
         origin = self.state / name
         atomic(origin / "conversation.jsonl", b'{"sessionId":"disposable","type":"assistant"}\n')
@@ -169,6 +205,12 @@ class BackupPortable(VaultTest):
         capabilities["journal"].remove(backup_snapshot.RECOVERY_HISTORY)
         with self.assertRaisesRegex(Blocked, backup_snapshot.RECOVERY_HISTORY):
             compatibility.check(twice, capabilities)
+        closed = tasks.reconcile_restored(twice, task["id"], confirmed=True)
+        original = closed["reconciliation_history"][-1]
+        self.assertEqual(original["origin"]["backup"], record["id"])
+        receipt = read_json(twice.control / "receipts" / (original["receipt"] + ".json"))
+        self.assertEqual(receipt["payload"]["recovery_receipt"], second_result["receipt"])
+        self.assertEqual(tasks.get_session(twice, session["operation"])["state"], "reconciliation_required")
 
     def test_1_invalid_replica_or_manifest(self):
         self.configure(2)
@@ -885,6 +927,144 @@ class BackupPortable(VaultTest):
         self.assertFalse(any((restored.state / name).exists() for name in ("authentication", "launchd", "tasks")))
         self.assertFalse(git(restored.root, "remote"))
 
+        task_id = task["id"]
+        with self.assertRaisesRegex(Blocked, "Writing capacity is occupied"):
+            tasks.create(restored, "Second task before reconciliation")
+        with self.assertRaisesRegex(Blocked, "Restored task requires reconciliation"):
+            tasks.preserve_and_close(restored, task_id)
+        with self.assertRaisesRegex(Blocked, "Restored task requires reconciliation"):
+            tasks.reconcile_expired(restored, task_id, utc() + timedelta(days=2))
+        cli = [sys.executable, "-m", "healdan", "--vault", restored.root, "--state", restored.state, "task", "reconcile-restored", task_id]
+        refused = run(cli, env=controller_environment(), check=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("--confirm", decode(refused.stdout)["error"])
+        task_history = restored.control / "historical/tasks" / (task_id + ".json")
+        session_history = restored.control / "historical/sessions" / (session["operation"] + ".json")
+        self.assertEqual(task_history.read_bytes(), tasks.task_path(self.vault, task_id).read_bytes())
+        self.assertEqual(session_history.read_bytes(), (self.vault.control / "sessions" / session_history.name).read_bytes())
+        history_bytes = task_history.read_bytes()
+        atomic(task_history, {**decode(history_bytes), "closed_at": "2000-01-01T00:00:00Z"})
+        with self.assertRaisesRegex(Blocked, "Restored task origin record .* differs"):
+            tasks.reconcile_restored(restored, task_id, confirmed=True)
+        atomic(task_history, history_bytes)
+
+        active_path = tasks.task_path(restored, task_id)
+        atomic(active_path, {**active, "processes": task["processes"]})
+        with self.assertRaisesRegex(Blocked, "Local task processes"):
+            tasks.reconcile_restored(restored, task_id, confirmed=True)
+        atomic(active_path, active)
+        local_base = restored.state / "tasks" / task_id
+        atomic(local_base / "local-evidence", b"needs separate handling")
+        with self.assertRaisesRegex(Blocked, "Local task workspace"):
+            tasks.reconcile_restored(restored, task_id, confirmed=True)
+        (local_base / "local-evidence").unlink()
+        local_base.rmdir()
+        original_stat = Path.stat
+        with patch("healdan.tasks.os.killpg", create=True, side_effect=AssertionError("origin process signal")), \
+                patch("healdan.tasks.os.kill", side_effect=AssertionError("origin process signal")), \
+                patch("healdan.core.run", wraps=run) as processes, \
+                patch("pathlib.Path.stat", autospec=True) as stats:
+            def no_origin_access(path, *args, **kwargs):
+                self.assertFalse(path.is_relative_to(self.state) or path.is_relative_to(self.root), str(path))
+                return original_stat(path, *args, **kwargs)
+
+            stats.side_effect = no_origin_access
+            closed = tasks.reconcile_restored(restored, task_id, confirmed=True)
+            for call in processes.call_args_list:
+                args = list(map(str, call.args[0]))
+                self.assertIn(Path(args[0]).stem, {"git", "ssh-keygen", "age"})
+                self.assertFalse(any(str(self.state) in value or str(self.root) in value for value in args), args)
+        self.assertEqual(closed["state"], "closed")
+        self.assertFalse(closed["capacity_held"])
+        self.assertEqual(closed["created_at"], task["created_at"])
+        self.assertEqual(closed["reconciliation_history"][0]["origin"], active["reconciliation"])
+        self.assertEqual(tasks.get_session(restored, session["operation"]), recovered)
+        self.assertEqual(tasks.get_task(self.vault, task_id), task)
+        retry = run([*cli, "--confirm"], env=controller_environment())
+        self.assertEqual(decode(retry.stdout), closed)
+        git(restored.root, "config", "user.name", "Recovery operator")
+        git(restored.root, "config", "user.email", "recovery@example.invalid")
+        fresh = tasks.create(restored, "New writer after reconciliation")
+        self.assertNotEqual(fresh["id"], task_id)
+        self.assertTrue(fresh["capacity_held"])
+        with self.assertRaisesRegex(Blocked, "Restored task"):
+            tasks.reconcile_restored(restored, fresh["id"], confirmed=True)
+
+    def test_1_restored_task_reconciliation_verifies_custody_and_resumes(self):
+        self.configure()
+        task = tasks.create(self.vault, "Waiting source task with a linked capture")
+        task_id = task["id"]
+        waiting = tasks.present(self.vault, task_id, "Which source is authoritative?", "presentation-proof")
+        purpose = {"purpose": "Disposable task preservation", "necessity": "Coverage of B04 custody",
+                   "owner": "fixture", "link": task_id}
+        material_id = custody.capture_tree(self.vault, Path(task["worktree"]), task=task_id,
+                                           classification="unknown", purpose=purpose)
+        material = custody.materials(self.vault)[material_id]
+        material["dependencies"].append("pending-predecessor")
+        custody.save_material(self.vault, material)
+        custody.hold(self.vault, material_id, "Preserve pending evidence", "human")
+        policy = self.policy()
+        record = self.create()
+
+        unavailable = self.restore(record, self.base / "missing-capture", self.base / "missing-capture-state")
+        missing = Vault(unavailable["destination"], unavailable["state"])
+        with self.assertRaisesRegex(Blocked, "No verified capture ciphertext"):
+            tasks.reconcile_restored(missing, task_id, confirmed=True)
+        self.assertTrue(tasks.get_task(missing, task_id)["capacity_held"])
+        self.assertIsNone(custody.materials(missing)[material_id].get("closed_at"))
+
+        original_copy = material["copies"][0]
+        copy = self.base / "remapped-task-capture.age"
+        atomic(copy, (Path(original_copy["root"]) / original_copy["path"]).read_bytes())
+        result = self.restore(record, remap={material_id: {"0": str(copy)}})
+        restored = Vault(result["destination"], result["state"])
+        policy_bytes = storage_policy.history_path(restored).read_bytes()
+        local = restored.state / "custody" / (material_id + ".age")
+        cipher = local.read_bytes()
+        atomic(local, b"damaged local fixture")
+        with self.assertRaisesRegex(Blocked, "Ciphertext changed"):
+            tasks.reconcile_restored(restored, task_id, confirmed=True)
+        self.assertTrue(tasks.get_task(restored, task_id)["capacity_held"])
+        atomic(local, cipher)
+
+        def interrupt_close(path, value, **kwargs):
+            if path == tasks.task_path(restored, task_id) and value["state"] == "closed":
+                raise OSError("fixture interruption before closing state")
+            return atomic(path, value, **kwargs)
+
+        with patch("healdan.tasks.atomic", side_effect=interrupt_close), self.assertRaisesRegex(OSError, "fixture interruption"):
+            tasks.reconcile_restored(restored, task_id, confirmed=True)
+        pending = tasks.get_task(restored, task_id)
+        self.assertTrue(pending["capacity_held"])
+        intent = pending["restored_closure_pending"]
+        receipt = {"kind": "task-restored-reconciled", **intent}
+        receipt_id = digest(receipt)
+        self.assertEqual(read_json(restored.control / "receipts" / (receipt_id + ".json")), receipt)
+        tasks.reconcile_clock(restored, pending, utc(waiting["presented_at"]) + timedelta(days=8))
+        closed = tasks.reconcile_restored(restored, task_id, confirmed=True)
+        self.assertEqual(tasks.reconcile_restored(restored, task_id, confirmed=True), closed)
+        self.assertEqual(closed["presented_at"], waiting["presented_at"])
+        self.assertEqual(closed["delivery_receipt"], waiting["delivery_receipt"])
+        self.assertEqual(closed["reconciliation_history"][-1]["receipt"], receipt_id)
+        receipts = [(path.stem, read_json(path)) for path in (restored.control / "receipts").glob("*.json")]
+        closure_receipts = [(key, receipt) for key, receipt in receipts if receipt["kind"] == "task-restored-reconciled"]
+        self.assertEqual(len(closure_receipts), 1)
+        self.assertEqual(closure_receipts[0][0], receipt_id)
+        self.assertEqual(digest(closure_receipts[0][1]), receipt_id)
+        self.assertEqual(storage_policy.history(restored), [policy])
+        self.assertEqual(storage_policy.history_path(restored).read_bytes(), policy_bytes)
+
+        later = utc(closed["closed_at"]) + timedelta(days=8)
+        plan = retention.plan(restored, later)
+        guarded = retention.execute(restored, plan["id"], later)
+        preserved = custody.materials(restored)[material_id]
+        self.assertEqual(preserved["closed_at"], closed["closed_at"])
+        self.assertEqual(preserved["dependencies"], ["pending-predecessor"])
+        self.assertEqual(preserved["holds"], custody.materials(self.vault)[material_id]["holds"])
+        self.assertEqual(preserved["copies"][0]["status"], "unavailable")
+        self.assertTrue(any(row.get("material") == material_id for row in guarded["pending"]))
+        self.assertEqual(local.read_bytes(), cipher)
+
     def test_1_deleted_replica_proof_after_origin_rebind(self):
         self.configure()
         original_destination = self.state / "backup-inside-state"
@@ -927,6 +1107,7 @@ class BackupPortable(VaultTest):
     def test_1_legacy_envelope_with_backup_off(self):
         self.configure()
         self.policy("off")
+        tracked = self.tracked_modes()
         identifier = str(uuid4())
         expiry = stamp(utc() + timedelta(days=2))
         bundle = self.base / "legacy.bundle"
@@ -959,9 +1140,19 @@ class BackupPortable(VaultTest):
         record["copies"][1]["status"] = "unavailable"
         custody.save_material(self.vault, record)
         self.assertEqual(backups.verify_backup(self.vault, identifier)["pending_replicas"][0]["status"], "unavailable")
-        result = backups.restore(self.vault, identifier, self.base / "restored-legacy")
+        mask = 0o027
+        previous = os.umask(mask)
+        try:
+            result = backups.restore(self.vault, identifier, self.base / "restored-legacy")
+        finally:
+            os.umask(previous)
+        root = Path(result["destination"])
+        self.assert_tracked_modes(root, tracked, mask)
         self.assertIn("Legacy backup omitted", result["pending_copies"][0])
-        self.assertEqual((Path(result["destination"]) / member_name).read_bytes(), member_cipher)
+        self.assertEqual((root / member_name).read_bytes(), member_cipher)
+        if os.name != "nt":
+            for path in (root / member_name, root / backup_snapshot.MATERIALS, root / ".git/healdan/restored-from.json"):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         legacy_state = self.base / "legacy-adopted-state"
         adoption = binding.adopt(result["destination"], legacy_state)
         self.assertEqual(adoption["provenance"][0]["kind"], "restored-backup")

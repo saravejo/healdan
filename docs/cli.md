@@ -28,6 +28,7 @@ JSON. `--help` lists exact arguments.
 | `task present ID --question TEXT --receipt TEXT` | Record successful human presentation and start waiting clock |
 | `task close ID` | Verified encrypted preservation, worktree removal, reconciled closure |
 | `task reconcile ID` | Preserve and dismantle an expired worktree while keeping the task/waiting clock |
+| `task reconcile-restored ID --confirm` | Verify recovered custody, close a restored task, and release its writing capacity |
 | `task answer ID DECISION.json` | Sign a timely human response without resetting worktree age |
 | `task reopen ID DECISION.json` | Explicitly link a new task to a reconciled closed task and carry prior consumption |
 | `session create TASK --role ROLE --action-name ACTION --context FILE` | Measure context; allocate S-/UUID and external profile identity |

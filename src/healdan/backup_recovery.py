@@ -15,6 +15,7 @@ from .lineage import sha256
 JOURNAL = snapshot.RESTORE_JOURNAL
 JOURNAL_FILE = "backup-restore.json"
 LOCK = "backup-restore.lock"
+GIT_FILE_MODES = {"100644": 0o644, "100755": 0o755}
 
 
 def location(path):
@@ -48,6 +49,8 @@ def proof_receipt(control, kind, payload, at):
 
 
 def reconcile_task(record, identifier):
+    # An interrupted closure on another controller is historical, not a local intent.
+    record = {key: value for key, value in record.items() if key != "restored_closure_pending"}
     if not record.get("processes") and (record["state"] in {"closed", "cancelled"} or
             record["state"] == "reconciliation_required" and isinstance(record.get("reconciliation"), dict)):
         return record
@@ -376,6 +379,10 @@ def reconcile_copies(archive, contents, records, state, control, journal, remaps
     return pending
 
 
+def write_git_file(root, name, body, mode):
+    atomic(safe_path(root, name), body, mode=GIT_FILE_MODES.get(mode) if os.name != "nt" else None)
+
+
 def build_portable(staging, state, journal, verified, raw_manifest, remaps):
     archive, contents, records = verified
     bundle = safe_path(staging, snapshot.BUNDLE)
@@ -386,10 +393,7 @@ def build_portable(staging, state, journal, verified, raw_manifest, remaps):
     for name, entry in archive["files"].items():
         if entry["kind"] != "knowledge":
             continue
-        target = safe_path(staging, name)
-        atomic(target, contents[name])
-        if entry["mode"] == "100755" and os.name != "nt":
-            target.chmod(0o755)
+        write_git_file(staging, name, contents[name], entry["mode"])
         knowledge.add(name)
     omitted = {name for name, *_ in snapshot.tree_entries(staging, archive["git"]["head"])} - knowledge
     if omitted:
@@ -483,9 +487,11 @@ def build_legacy(staging, archive, signed, signers, backup_signers, *, external_
     git(root, "bundle", "unbundle", str(bundle))
     snapshot.install_refs(root, identity)
     git(root, "read-tree", head)
+    modes = {name: mode for name, mode, kind, _ in snapshot.tree_entries(root, head)
+             if kind == "blob" and mode in GIT_FILE_MODES and not snapshot.reserved(name)}
     for relative, body in members.items():
         if relative != Path(snapshot.BUNDLE) and relative.parts[0] != "custody":
-            atomic(safe_path(root, relative), body)
+            write_git_file(root, relative, body, modes.get(relative.as_posix()))
     for relative in expected_members:
         target = safe_path(external_state if external_state is not None else root, relative)
         if target.exists():

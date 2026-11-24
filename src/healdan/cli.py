@@ -85,6 +85,9 @@ def parser():
     close.add_argument("--reason", default="completed")
     reconcile = task.add_parser("reconcile")
     reconcile.add_argument("id")
+    reconcile_restored = task.add_parser("reconcile-restored", help="Close a restored task after verifying its recovered custody")
+    reconcile_restored.add_argument("id")
+    reconcile_restored.add_argument("--confirm", action="store_true")
     for operation in ("answer", "reopen"):
         response = task.add_parser(operation)
         response.add_argument("id")
@@ -313,6 +316,8 @@ def dispatch(args):
             return tasks.preserve_and_close(vault, args.id, reason=args.reason)
         if args.action == "reconcile":
             return tasks.reconcile_expired(vault, args.id)
+        if args.action == "reconcile-restored":
+            return tasks.reconcile_restored(vault, args.id, confirmed=args.confirm)
         if args.action == "answer":
             return tasks.answer(vault, args.id, read_json(args.decision))
         if args.action == "reopen":
