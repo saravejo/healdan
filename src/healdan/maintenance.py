@@ -31,7 +31,7 @@ def execute_plan(vault, identifier, now=None, *, automatic=False, previous=None)
 def daily(vault, now=None, *, report_custody=False):
     from . import retention
     from .custody import integrity_findings
-    from .tasks import get_task, preserve_and_close, reconcile_clock, reconcile_expired, task_ids
+    from .tasks import get_task, preserve_and_close, reconcile_clock, reconcile_expired, require_reconciled, task_ids
 
     now = utc(now)
     notices, pending, results = [], [], []
@@ -47,6 +47,7 @@ def daily(vault, now=None, *, report_custody=False):
             try:
                 task = get_task(vault, identifier)
                 require(task["id"] == identifier, "Task identity does not match its record", 5)
+                require_reconciled(task)
                 if not task.get("capacity_held"):
                     continue
                 updates = reconcile_clock(vault, task, now)

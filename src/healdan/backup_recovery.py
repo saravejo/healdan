@@ -6,7 +6,7 @@ import shutil
 import stat
 from uuid import uuid4
 
-from . import backup_snapshot as snapshot, binding
+from . import backup_snapshot as snapshot, binding, trials
 from .core import (Blocked, atomic, decode, digest, file_digest, git, git_bytes, lock, read_json,
                    require, safe_path, stamp, sync_directory, utc)
 from .custody import INACTIVE_COPIES, archive_members, material_copy_error, unresolved_material_copy
@@ -409,7 +409,9 @@ def build_portable(staging, state, journal, verified, raw_manifest, remaps):
         if name in prior:
             continue
         is_task = name.startswith(("tasks/", "sessions/"))
-        if name in snapshot.HISTORICAL_STATE | {"materials.json"} or name.startswith("restorations/") or is_task:
+        history_only = (name in snapshot.HISTORICAL_STATE | {"materials.json"} or name.startswith("restorations/") or
+                        name in trials.RECEIPTS)
+        if history_only or is_task:
             historical = "historical/" + name
             if historical in prior:
                 historical = f"historical/generations/{generation}/{name}"
@@ -418,7 +420,7 @@ def build_portable(staging, state, journal, verified, raw_manifest, remaps):
         if is_task:
             reconcile = reconcile_task if name.startswith("tasks/") else reconcile_session
             atomic(safe_path(control, name), reconcile(records[name], generation))
-        elif name not in snapshot.HISTORICAL_STATE | {"materials.json"} and not name.startswith("restorations/"):
+        elif not history_only:
             atomic(safe_path(control, name), data)
     manifest_path = f"historical/{generation}.manifest.json"
     require(manifest_path not in prior, "Recovery would overwrite an earlier generation manifest", 5)

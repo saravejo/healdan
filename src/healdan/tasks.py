@@ -181,6 +181,7 @@ def reopen(vault, task_id, decision):
 
 
 def reconcile_clock(vault, task, now=None):
+    require_reconciled(task)
     now = utc(now)
     updates = []
     if age_status(task, now) == "expired" and task["state"] not in {"closed", "cancelled"}:

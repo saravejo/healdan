@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unicodedata
 from uuid import UUID
 
-from . import originals
+from . import originals, trials
 from .core import (REQUIRED_REGISTRIES, Blocked, atomic, decode, digest, git, git_bytes, json_paths,
                    parse_jsonl, require, safe_path, stamp)
 from .custody import unresolved_material_copy
@@ -236,6 +236,9 @@ def historical_record(name):
         generation, parts = parts[2], parts[3:]
     else:
         parts = parts[1:]
+    relative = "/".join(parts)
+    if relative in trials.RECEIPTS:
+        return generation, relative
     if len(parts) == 1:
         filename = parts[0]
         if filename in HISTORICAL_STATE | {"materials.json"}:
@@ -257,7 +260,7 @@ def state_path(name):
     if len(parts) == 1:
         return name in STATE_FILES
     return (len(parts) == 2 and parts[0] in STATE_FOLDERS and parts[-1].endswith(".json") or
-            historical_record(name) is not None)
+            name in trials.RECEIPTS or historical_record(name) is not None)
 
 
 def historical_paths(control, *, folders=None):
@@ -267,7 +270,7 @@ def historical_paths(control, *, folders=None):
     if generations.exists():
         require(generations.is_dir(), "Invalid backup history directory", 5)
         prefixes.extend("historical/generations/" + child.name for child in generations.iterdir() if identifier(child.name))
-    selected = ("", *sorted(HISTORICAL_FOLDERS)) if folders is None else folders
+    selected = ("", *sorted(HISTORICAL_FOLDERS), *trials.RECEIPT_FOLDERS) if folders is None else folders
     for prefix in prefixes:
         root = safe_path(control, prefix)
         require(not root.is_junction(), "Unsafe backup history directory", 5)
@@ -284,10 +287,11 @@ def historical_paths(control, *, folders=None):
 def control_records(vault):
     try:
         names = [name for name in sorted(STATE_FILES) if safe_path(vault.control, name).exists()]
-        for folder in sorted(STATE_FOLDERS):
+        for folder in (*sorted(STATE_FOLDERS), *trials.RECEIPT_FOLDERS):
             root = safe_path(vault.control, folder)
             require(not root.is_junction(), "Unsafe controller record directory: " + folder, 5)
-            names.extend(f"{folder}/{path.name}" for path in json_paths(root))
+            paths = [f"{folder}/{path.name}" for path in json_paths(root)]
+            names.extend(paths if folder in STATE_FOLDERS else (name for name in paths if name in trials.RECEIPTS))
         names.extend(historical_paths(vault.control))
         paths_compatible(names)
         return {name: safe_path(vault.control, name, exists=True).read_bytes() for name in names}
@@ -573,6 +577,19 @@ def check_historical_journal(name, value, source_vault):
                 isinstance(binding.get("destination"), str), "Invalid historical conversation restoration journal", 5)
 
 
+def check_trial_receipt(name, logical_name, receipt, source_vault):
+    require(isinstance(receipt, dict) and SIGNATURE_FIELDS == receipt.keys() and receipt["namespace"] == "trial" and
+            sha256(receipt["digest"]) and all(isinstance(receipt[key], str) and receipt[key] for key in ("signature", "identity")),
+            "Invalid signed trial receipt: " + name, 5)
+    payload = receipt["payload"]
+    require(isinstance(payload, dict), "Invalid signed trial payload: " + name, 5)
+    trial, versioned = trials.RECEIPTS.get(logical_name, (payload.get("name"), "format" in payload))
+    try:
+        trials.check_preserved_evidence(payload, trial, source_vault, versioned=versioned)
+    except (Blocked, ValueError, OverflowError) as exc:
+        raise Blocked(f"Invalid historical trial receipt {name}: {exc}", 5) from exc
+
+
 def check_records(archive, contents, signers, backup_signers):
     from .ids import identity as id_identity
     from .retention import plan_digest
@@ -583,12 +600,16 @@ def check_records(archive, contents, signers, backup_signers):
         value = decode(data)
         require(isinstance(value, list if name == "storage-policy.json" else dict),
                 "Invalid controller backup record: " + name, 5)
-        check_signatures(value, signers, backup_signers, proven)
         records[name] = value
         history = historical_record(name)
         logical_name = history[1] if history else name
         parent, _, filename = logical_name.partition("/")
         stem = filename.removesuffix(".json")
+        if logical_name in trials.RECEIPTS:
+            check_trial_receipt(name, logical_name, value, archive["source_vault"])
+        elif parent == "receipts" and value.get("kind") == "trial-signature":
+            check_trial_receipt(name, logical_name, value.get("payload"), archive["source_vault"])
+        check_signatures(value, signers, backup_signers, proven)
         if history:
             check_historical_journal(logical_name, value, archive["source_vault"])
         if logical_name == "materials.json":

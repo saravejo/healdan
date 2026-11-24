@@ -70,6 +70,17 @@ JSON. `--help` lists exact arguments.
 `maintenance plan` returns code `5` when it reports per-material inventory
 findings in `pending`. It saves the plan for entries whose discovery completed.
 
+`maintenance daily` reports a restored task that needs explicit reconciliation
+in `pending` and leaves its clocks untouched. Independent retention and backup
+work still runs. Use `task reconcile-restored ID --confirm` to close the task.
+
+With a verified retained replica, `backup verify ID` returns its JSON inventory
+report. It returns code `0` when every known replica is verified or has verified
+deletion proof. It reports `status: pending` and returns `4` when replicas are
+unavailable, or `5` when a replica or the inventory is invalid. It fails with
+code `5` when no retained replica verifies. `restore ID DESTINATION` can still
+complete from a verified replica and reports the known replica findings.
+
 To set an independent backup and retention policy, supply a reason and both
 modes in the policy request. For example, an installation without scheduled or
 manual backups can use:

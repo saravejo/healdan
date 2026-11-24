@@ -607,12 +607,12 @@ def replica_availability(vault, copy):
     if copy["status"] != "present":
         return "unavailable"
     root = replica_root(vault, copy)
-    if not root.is_dir():
-        return "unavailable"
-    path = safe_path(root, copy["path"])
-    if not path.exists() or copy.get("manifest") and not safe_path(root, copy["manifest"]).exists():
-        return "unavailable"
-    return "available"
+    require(not root.exists() or root.is_dir(), "Backup replica root is not a directory", 5)
+    paths = [safe_path(root, copy["path"])]
+    if copy.get("manifest"):
+        paths.append(safe_path(root, copy["manifest"]))
+    require(all(not path.exists() or path.is_file() for path in paths), "Backup replica member is not a regular file", 5)
+    return "available" if all(path.exists() for path in paths) else "unavailable"
 
 
 def replica_entries(vault, record, manifest, *, allow_partial):
@@ -719,7 +719,7 @@ def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allo
     if not checks and not (allow_retired and retired and not pending):
         raise Blocked("Backup has no verified retained replicas" +
                       (": " + "; ".join(entry["reason"] for entry in pending) if pending else ""), 5)
-    report = {"id": record["id"], "status": "complete", "copies": checks, "deleted_copies": retired,
+    report = {"id": record["id"], "status": "pending" if pending else "complete", "copies": checks, "deleted_copies": retired,
               "replicas": replicas, "pending_replicas": pending}
     if selected:
         report["replica"] = str(selected[0])

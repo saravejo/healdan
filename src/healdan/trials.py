@@ -1,14 +1,18 @@
 """Capture and verify the effective environment of signed native acceptance trials."""
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
+import re
 import sys
 
 from .build import require_active
 from .core import Blocked, atomic, digest, executable, read_json, require, run, safe_path, utc
+from .lineage import sha256
 from .signing import human_sign, trusted_signers, verify
 
 TRIAL_FORMAT = "healdan-native-trial-v2"
 TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", "launchd")
+RECEIPT_FOLDERS = ("trials", "trials/v2")
+RECEIPTS = {f"{folder}/{name}.json": (name, folder == "trials/v2") for folder in RECEIPT_FOLDERS for name in TRIALS}
 PROFILE_TRIALS = frozenset(TRIALS[:3])
 PROFILE_CONFIG = ("signing_key", "age_identity", "backup_signing_key", "storage_roots", "backup_destinations")
 RECOVERY_CONFIG = ("age_recipients", "offline_recipients", "age_identity", "backup_signing_identity", "backup_signing_key",
@@ -148,6 +152,34 @@ def _validate_evidence(evidence):
             evidence.get("started_at") and evidence.get("completed_at"),
             "Trial needs real macOS evidence, a procedure, start and completion times, and a passing result", 2)
     require(utc(evidence["completed_at"]) >= utc(evidence["started_at"]), "Invalid trial times", 2)
+
+
+def check_preserved_evidence(payload, name, vault_id, *, versioned):
+    require(isinstance(payload, dict) and name in TRIALS and payload.get("name") == name and
+            all(isinstance(payload.get(key), str) for key in ("started_at", "completed_at")),
+            "Trial evidence has an invalid name or timestamps", 5)
+    _validate_evidence(payload)
+    artifacts = payload.get("artifacts")
+    require(isinstance(artifacts, list) and artifacts and all(
+        isinstance(artifact, dict) and isinstance(artifact.get("path"), str) and artifact["path"] and
+        sha256(artifact.get("sha256")) for artifact in artifacts), "Invalid trial artifact inventory", 5)
+    if versioned:
+        measured = payload.get("environment")
+        require(payload.get("format") == TRIAL_FORMAT and isinstance(measured, dict) and measured.get("vault_id") == vault_id,
+                "Trial receipt has the wrong format or source vault identity", 5)
+        profile, controller = measured.get("profile"), measured.get("controller")
+        require(isinstance(profile, dict) and profile.get("trial") == name and isinstance(controller, dict) and
+                isinstance(controller.get("version"), str) and sha256(controller.get("sha256")) and
+                sha256(measured.get("config_sha256")) and all(isinstance(measured.get(key), dict) and measured[key]
+                                                            for key in ("platform", "python", "tools")),
+                "Invalid measured trial environment", 5)
+        paths = [artifact["path"] for artifact in artifacts]
+        require(len(set(paths)) == len(paths) and all(PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
+                                                     for path in paths), "Invalid measured trial artifact paths", 5)
+    else:
+        commit = payload.get("commit")
+        require("format" not in payload and isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) and
+                payload.get("versions"), "Invalid legacy trial commit or dependency versions", 5)
 
 
 def attest(vault, name, evidence):

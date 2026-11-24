@@ -423,7 +423,11 @@ def dispatch(args):
             return backups.create(vault, args.kind, args.expires_at, args.members)
         if args.action == "reconcile":
             return backups.reconcile(vault, args.id)
-        return backups.verify_backup(vault, args.id)
+        report = backups.verify_backup(vault, args.id)
+        pending = report["pending_replicas"]
+        if any(row["status"] == "invalid" for row in pending):
+            return report, 5
+        return report, 4 if pending else 0
     if args.command == "restore":
         return backups.restore(vault, args.backup, args.destination,
                                state=args.recovery_state or args.portable_state, remap=args.remap)
