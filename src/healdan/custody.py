@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from . import storage_policy
 from .core import Blocked, atomic, canonical, canonical_storage_path, decode, digest, executable, file_digest, json_paths, lock, read_json, require, run, safe_path, stamp, sync_directory
+from .lineage import sha256
 from .signing import trusted_signers, verify
 
 INACTIVE_COPIES = {"deleted", "moved", "absent"}
@@ -139,6 +140,33 @@ def verified_capture(vault, record, cipher=None):
 
 def materials(vault):
     return read_json(vault.control / "materials.json", {})
+
+
+def material_copy_error(copy):
+    if isinstance(copy, dict) and copy.get("status") == "unavailable" and copy.get("kind") is None:
+        reason = copy.get("inventory_error")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
+def export_copy_hash(copy):
+    if not isinstance(copy, dict):
+        return None
+    if copy.get("kind") == "export":
+        value = copy.get("sha256")
+    elif material_copy_error(copy) and not ({"root", "path", "sha256"} & copy.keys()):
+        value = copy.get("export_sha256_evidence")
+    else:
+        return None
+    return value if sha256(value) else None
+
+
+def unresolved_material_copy(kind, copy, reason):
+    pending = {"status": "unavailable", "kind": None, "inventory_error": material_copy_error(copy) or reason}
+    if kind == "export" and (export_hash := export_copy_hash(copy)):
+        pending["export_sha256_evidence"] = export_hash
+    return pending
 
 
 def save_material(vault, record):

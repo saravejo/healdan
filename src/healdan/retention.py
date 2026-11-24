@@ -5,7 +5,8 @@ from uuid import uuid4
 
 from . import backup_snapshot, storage_policy
 from .core import Blocked, atomic, canonical_storage_path, digest, json_paths, read_json, require, safe_path, stamp, sync_directory, utc
-from .custody import INACTIVE_COPIES, materials, native_guard, save_material, verified_capture
+from .custody import INACTIVE_COPIES, material_copy_error, materials, native_guard, save_material, verified_capture
+from .lineage import sha256
 from .inbox import pending_archive_paths
 from .tasks import get_task
 
@@ -163,6 +164,37 @@ def deletion_payload(entry, material, index):
     return {"material": material, "copy_index": index, "sha256": entry["copy"]["sha256"], "intent": entry.get("intent")}
 
 
+def check_deletion_proof(record, index, copy, read_record, matches_path, *, generation_digest=None, reason):
+    receipt_id = copy.get("deletion_receipt")
+    require(sha256(receipt_id), reason, 5)
+    receipt = read_record(f"receipts/{receipt_id}.json")
+    require(isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict), reason, 5)
+    payload = receipt["payload"]
+    intent = payload.get("intent")
+    require(isinstance(intent, dict), reason, 5)
+    expected = generation_locator(record, index, copy)
+    intent_slot = intent.get("slot")
+    generations = intent.get("generations", [])
+    require(isinstance(generations, list), reason, 5)
+    primary = intent_slot == [expected["material"], expected["copy_index"], expected["identity"]]
+    association = intent if primary else next((item for item in generations if isinstance(item, dict) and
+                                                all(item.get(key) == value for key, value in expected.items())), None)
+    require(digest(receipt) == receipt_id and receipt.get("kind") == "deletion-copy" and
+            isinstance(receipt.get("at"), str) and receipt["at"] == copy.get("deleted_at") == intent.get("at") and
+            payload.get("material") == record["id"] and type(payload.get("copy_index")) is int and
+            payload["copy_index"] == index and payload.get("sha256") == copy["sha256"] and association is not None and
+            association.get("generation_digest") == generation_digest and
+            isinstance(intent.get("path"), str) and matches_path(intent["path"], copy), reason, 5)
+    plan_id = intent.get("plan_id")
+    require(isinstance(plan_id, str) and plan_id and Path(plan_id).name == plan_id, reason, 5)
+    plan = read_record(f"deletions/{plan_id}.json")
+    require(isinstance(plan, dict) and plan.get("id") == plan_id and plan.get("digest") == intent.get("plan_digest") and
+            plan_digest(plan) == plan["digest"] and any(list(slot(entry)) == intent_slot and
+                entry.get("status") in {"deleting", "deleted"} and entry.get("intent") == intent
+                for entry in plan["entries"]), reason, 5)
+    return receipt_id
+
+
 def deletion_receipt(vault, entry, material, index, at):
     return vault.receipt("deletion-copy", deletion_payload(entry, material, index), at=at)
 
@@ -275,7 +307,7 @@ def has_active_checkpoints(record):
 
 def unresolved_custody_copies(record):
     for index, copy in enumerate(record.get("copies", [])):
-        reason = backup_snapshot.material_copy_error(copy)
+        reason = material_copy_error(copy)
         if reason:
             yield index, reason
 

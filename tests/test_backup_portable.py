@@ -490,6 +490,41 @@ class BackupPortable(VaultTest):
         old_plan = retention.plan(self.vault)
         independent, independent_source = export("independent", utc() - timedelta(days=2))
         unavailable, _ = export("unavailable", old)
+
+        task = tasks.create(self.vault, "Retired worktree checkpoint")
+        atomic(Path(task["worktree"]) / "draft.txt", b"Verified checkpoint")
+        closed = tasks.preserve_and_close(self.vault, task["id"])
+        preserved = custody.materials(self.vault)[closed["preservation"]]
+        moved_checkpoint = next(copy for copy in preserved["copies"] if copy["path"].endswith("/draft.txt"))
+        self.assertEqual(moved_checkpoint["status"], "moved")
+
+        empty = self.root / "inbox" / "empty-for-archive.txt"
+        atomic(empty, b"")
+        inbox.inventory(self.vault)
+        inbox.decide(self.vault, digest(b""), "archive", owner="human", classification="common", destination="archive")
+        archived = {"id": "archived-empty", "kind": "export", "classification": "common", "captured_at": stamp(),
+                    "holds": [], "dependencies": [],
+                    "copies": [{"root": str(self.root), "path": "inbox/" + empty.name, "kind": "export",
+                                "sha256": digest(b""), "status": "present"}]}
+        custody.save_material(self.vault, archived)
+        inbox.archive_empty(self.vault, digest(b""))
+        moved_empty = custody.materials(self.vault)[archived["id"]]["copies"][0]
+        self.assertEqual(moved_empty["status"], "moved")
+
+        before_move = self.root / "inbox" / "before.txt"
+        atomic(before_move, b"Tracked export renamed in the inbox")
+        move_sha = digest(before_move.read_bytes())
+        renamed = {"id": "renamed-export", "kind": "export", "classification": "common", "captured_at": stamp(),
+                   "source_sha256": move_sha, "holds": [], "dependencies": [],
+                   "copies": [{"root": str(before_move.parent), "path": before_move.name, "kind": "export",
+                               "sha256": move_sha, "status": "present"}]}
+        custody.save_material(self.vault, renamed)
+        before_move.rename(before_move.with_name("after.txt"))
+        inbox.inventory(self.vault)
+        retention.plan(self.vault)
+        moved_export = custody.materials(self.vault)[renamed["id"]]["copies"][0]
+        self.assertEqual(moved_export["status"], "moved")
+
         record = self.create()
         (self.state / "custody" / unavailable["copies"][0]["path"]).unlink()
         with self.assertRaisesRegex(Blocked, "Remapped custody copy hash mismatch"):
@@ -504,6 +539,10 @@ class BackupPortable(VaultTest):
         self.assertEqual(current[independent["id"]]["captured_at"], independent["captured_at"])
         self.assertEqual(current[deleted["id"]]["copies"][0]["status"], "deleted")
         self.assertEqual(current[unavailable["id"]]["copies"][0]["status"], "unavailable")
+        recovered_checkpoint = next(copy for copy in current[preserved["id"]]["copies"] if copy.get("path") == moved_checkpoint["path"])
+        self.assertEqual(recovered_checkpoint, {**moved_checkpoint, "origin_status": "moved"})
+        self.assertEqual(current[archived["id"]]["copies"][0], {**moved_empty, "origin_status": "moved"})
+        self.assertEqual(current[renamed["id"]]["copies"][0], {**moved_export, "origin_status": "moved"})
         self.assertEqual(read_json(new.control / "deletions" / (old_plan["id"] + ".json")), old_plan)
         local = current[independent["id"]]["copies"][1]
         local_path = Path(local["root"]) / local["path"]
@@ -1025,9 +1064,13 @@ class BackupPortable(VaultTest):
         atomic(kept, b"Independent export bytes")
         intact = {"root": str(kept.parent), "path": kept.name, "kind": "export", "status": "present",
                   "sha256": digest(kept.read_bytes())}
+        misplaced = self.state / "misplaced-export.txt"
+        atomic(misplaced, b"Export with a known digest and an unsafe locator")
+        misplaced_sha = digest(misplaced.read_bytes())
+        unsafe = {**intact, "path": "../" + misplaced.name, "sha256": misplaced_sha}
         key = "unrelated-export"
         record = {"id": key, "kind": "export", "classification": "common", "captured_at": stamp(),
-                  "copies": [None, {k: v for k, v in intact.items() if k != "kind"}, intact],
+                  "copies": [None, {k: v for k, v in intact.items() if k != "kind"}, intact, unsafe],
                   "holds": [], "dependencies": []}
         custody.save_material(self.vault, record)
         original = self.vault.control / "materials.json"
@@ -1036,33 +1079,59 @@ class BackupPortable(VaultTest):
         archive = decode(custody.decrypt(self.vault, self.paths(generation)[1].read_bytes()))
         checked = backup_snapshot.check_entries(archive, generation["approval"]["payload"])
         self.assertEqual(backup_snapshot.records_from(checked)["materials.json"], raw)
+        with self.assertRaisesRegex(Blocked, "Unsafe backup path"):
+            self.restore(generation, remap={key: {"3": str(misplaced)}})
         restored = self.restore(generation, remap={key: {"2": str(kept)}})
         recovered = Vault(restored["destination"], restored["state"])
         self.assertEqual((recovered.control / "historical/materials.json").read_bytes(), raw)
-        copies = custody.materials(recovered)[key]["copies"]
+        restored_export = custody.materials(recovered)[key]
+        copies = restored_export["copies"]
         self.assertEqual([(index, copy["status"]) for index, copy in enumerate(copies)],
-                         [(0, "unavailable"), (1, "unavailable"), (2, "unavailable"), (3, "present")])
-        receipt = read_json(recovered.control / "receipts" / (copies[3]["recovery_receipt"] + ".json"))
+                         [(0, "unavailable"), (1, "unavailable"), (2, "unavailable"),
+                          (3, "unavailable"), (4, "present")])
+        receipt = read_json(recovered.control / "receipts" / (copies[4]["recovery_receipt"] + ".json"))
         self.assertEqual(receipt["payload"]["origin_copy_index"], 2)
+        self.assertFalse({"root", "path", "sha256"} & copies[3].keys())
+        self.assertIsNone(copies[3]["kind"])
+        self.assertEqual(backup_snapshot.project_material_copies(restored_export), copies)
+        classification = admission.Classification(recovered, admission.published_rows(recovered))
+        with self.subTest(restored_hash=misplaced_sha):
+            self.assertEqual(classification.current(misplaced_sha), ("common", None))
+        self.assertEqual(misplaced.read_bytes(), b"Export with a known digest and an unsafe locator")
 
-        # The valid sibling still contributes its classification to the canonical source.
+        # The same digest carries the restriction even when the copy's locator is unsafe.
         restricted_path = kept.with_name("restricted-export.txt")
         atomic(restricted_path, (self.root / "resources/sources/F-0001/original.txt").read_bytes())
         restricted = {**intact, "path": restricted_path.name, "sha256": digest(restricted_path.read_bytes())}
-        custody.save_material(self.vault, {**record, "classification": "personal", "copies": [None, restricted]})
-        with self.assertRaisesRegex(Blocked, "Conflicting source classifications"):
-            self.create()
+        for relative in (restricted_path.name, "../custody/" + restricted_path.name):
+            with self.subTest(path=relative):
+                custody.save_material(self.vault, {**record, "classification": "personal",
+                                                  "copies": [None, {**restricted, "path": relative}]})
+                with self.assertRaisesRegex(Blocked, "Conflicting source classifications"):
+                    self.create()
 
     def test_2_malformed_origin_slot_preserves_recovered_conversation(self):
         self.configure()
         now = utc()
-        conversation = self.conversation("retained-checkpoint", closed_at=now - timedelta(days=40))
-        key = conversation["id"]
-        cipher, checkpoint = conversation["copies"]
-        encrypted = Path(cipher["root"]) / cipher["path"]
-        ciphertext = encrypted.read_bytes()
-        malformed = {k: v for k, v in checkpoint.items() if k != "kind"}
-        custody.save_material(self.vault, {**conversation, "copies": [cipher, malformed]})
+        closed = now - timedelta(days=40)
+        retired = self.conversation("verified-checkpoint-deletion", closed_at=closed)
+        retained_cipher = retention.slot({"material": retired["id"], "copy_index": 0, "copy": retired["copies"][0]})
+        plan = retention.plan(self.vault, now, exclude=[retained_cipher])
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        retired_checkpoint = custody.materials(self.vault)[retired["id"]]["copies"][1]
+        self.assertEqual(retired_checkpoint["status"], "deleted")
+        self.assertFalse((Path(retired_checkpoint["root"]) / retired_checkpoint["path"]).exists())
+
+        malformed = self.conversation("malformed-checkpoint", closed_at=closed)
+        unproven_name = "unproven-checkpoint-deletion"
+        atomic(self.state / unproven_name / "claimed-moved.txt", b"Checkpoint with no move record")
+        atomic(self.state / unproven_name / "claimed-absent.txt", b"Checkpoint with no absence record")
+        unproven = self.conversation(unproven_name, closed_at=closed)
+        malformed_copy = {k: v for k, v in malformed["copies"][1].items() if k != "kind"}
+        custody.save_material(self.vault, {**malformed, "copies": [malformed["copies"][0], malformed_copy]})
+        claims = {"conversation.jsonl": "deleted", "claimed-moved.txt": "moved", "claimed-absent.txt": "absent"}
+        custody.save_material(self.vault, {**unproven, "copies": [
+            unproven["copies"][0], *({**copy, "status": claims[copy["path"]]} for copy in unproven["copies"][1:])]})
         independent = self.state / "custody" / "expired-export.txt"
         atomic(independent, b"Independently eligible for deletion")
         export = {"id": "independent-export", "kind": "export", "classification": "common",
@@ -1070,35 +1139,51 @@ class BackupPortable(VaultTest):
                   "copies": [{"root": str(independent.parent), "path": independent.name,
                               "kind": "export", "sha256": digest(independent.read_bytes()), "status": "present"}]}
         custody.save_material(self.vault, export)
-        restored = self.restore(self.create(), remap={key: {"0": str(encrypted)}, export["id"]: {"0": str(independent)}})
+        conversations = (malformed, unproven, retired)
+        encrypted = {record["id"]: Path(record["copies"][0]["root"]) / record["copies"][0]["path"]
+                     for record in conversations}
+        ciphertext = {key: path.read_bytes() for key, path in encrypted.items()}
+        restored = self.restore(self.create(), remap={**{key: {"0": str(path)} for key, path in encrypted.items()},
+                                                       export["id"]: {"0": str(independent)}})
         recovered = Vault(restored["destination"], restored["state"])
         inventory = custody.materials(recovered)
-        projected = inventory[key]
-        self.assertEqual(projected["copies"][1]["status"], "unavailable")
-        self.assertNotIn("path", projected["copies"][1])
-        recovered_cipher = recovered.state / "custody" / encrypted.name
+        recovered_cipher = {key: recovered.state / "custody" / path.name for key, path in encrypted.items()}
         independent_copy = inventory[export["id"]]["copies"][1]
         independent_target = Path(independent_copy["root"]) / independent_copy["path"]
-        self.assertEqual(recovered_cipher.read_bytes(), ciphertext)
+        for key, path in recovered_cipher.items():
+            self.assertEqual(path.read_bytes(), ciphertext[key])
         self.assertTrue(independent_target.is_file())
+        self.assertEqual(inventory[retired["id"]]["copies"][1], {**retired_checkpoint, "origin_status": "deleted"})
 
         # A plan created with an intact inventory can still refer to the same local ciphertext.
-        pending = projected["copies"][1]
-        projected["copies"][1] = {**checkpoint, "status": "unavailable"}
-        custody.save_material(recovered, projected)
+        for record in (malformed, unproven):
+            projected = inventory[record["id"]]
+            copies = [projected["copies"][0], *({**copy, "status": "unavailable"} for copy in record["copies"][1:]),
+                      projected["copies"][-1]]
+            custody.save_material(recovered, {**projected, "copies": copies})
         old_plan = retention.plan(recovered, now)
-        self.assertTrue(any(row["material"] == key and row["copy_index"] == 2 for row in old_plan["entries"]))
-        projected["copies"][1] = pending
-        custody.save_material(recovered, projected)
+        for record in (malformed, unproven):
+            key = record["id"]
+            self.assertTrue(any(row["material"] == key and row["copy_index"] == len(record["copies"])
+                                for row in old_plan["entries"]))
+            custody.save_material(recovered, inventory[key])
 
         planned = retention.plan(recovered, now)
         outcome = retention.execute(recovered, old_plan["id"], now)
-        self.assertTrue(recovered_cipher.is_file())
-        self.assertEqual(recovered_cipher.read_bytes(), ciphertext)
-        self.assertTrue(any(row["material"] == key and row["copy_index"] == 1 for row in planned["pending"]))
-        self.assertFalse(any(row["material"] == key for row in planned["entries"]))
-        self.assertTrue(any(row["material"] == key and row["copy_index"] == 2 and "Invalid backed-up custody copy" in row["reason"]
-                            for row in outcome["pending"]))
+        for record in (malformed, unproven):
+            key = record["id"]
+            with self.subTest(material=record["task"]):
+                self.assertTrue(recovered_cipher[key].is_file())
+                self.assertEqual(recovered_cipher[key].read_bytes(), ciphertext[key])
+                for index, copy in enumerate(inventory[key]["copies"][1:-1], start=1):
+                    self.assertEqual(copy["status"], "unavailable")
+                    self.assertFalse({"root", "path", "sha256"} & copy.keys())
+                    self.assertTrue(any(row["material"] == key and row["copy_index"] == index for row in planned["pending"]))
+                self.assertFalse(any(row["material"] == key for row in planned["entries"]))
+                self.assertTrue(any(row["material"] == key and row["copy_index"] == len(record["copies"]) and
+                                    "requires reconciliation" in row["reason"]
+                                    for row in outcome["pending"]))
+        self.assertFalse(recovered_cipher[retired["id"]].exists())
         self.assertFalse(independent_target.exists())
         self.assertTrue(independent.is_file())
 

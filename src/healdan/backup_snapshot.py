@@ -11,6 +11,7 @@ from uuid import UUID
 from . import originals
 from .core import (REQUIRED_REGISTRIES, Blocked, atomic, decode, digest, git, git_bytes, json_paths,
                    parse_jsonl, require, safe_path, stamp)
+from .custody import unresolved_material_copy
 from .lineage import sha256
 from .signing import verify
 
@@ -466,14 +467,6 @@ def check_material_copy(key, copy):
     portable_path(copy.get("path"), historical=True)
 
 
-def material_copy_error(copy):
-    if isinstance(copy, dict) and copy.get("status") == "unavailable" and copy.get("kind") is None:
-        reason = copy.get("inventory_error")
-        if isinstance(reason, str) and reason:
-            return reason
-    return None
-
-
 def project_material_copies(record):
     key = record["id"]
     portable = portable_backup_record(record)
@@ -488,8 +481,7 @@ def project_material_copies(record):
                         copy["status"] in ("planned", "present", "deleted", "absent", "unavailable"),
                         "Invalid backed-up replica location: " + key, 5)
         except Blocked as exc:
-            projected.append({"status": "unavailable", "kind": None,
-                              "inventory_error": material_copy_error(copy) or str(exc)})
+            projected.append(unresolved_material_copy(record["kind"], copy, str(exc)))
         else:
             projected.append(copy)
     return projected

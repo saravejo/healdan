@@ -5,7 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .core import INGEST_JOURNAL, Blocked, atomic, digest, extend_jsonl, parse_jsonl, read_json, require, safe_path, stamp, sync_directory
-from .custody import decrypt, materials, retention_deadline, validate_purpose
+from .custody import decrypt, export_copy_hash, materials, retention_deadline, validate_purpose
 from .ids import next_ids, registry_records, reserve
 from .lineage import Lineage, PageHistory, sha256
 from .originals import REGISTRY, committed_sources, source_path, verify_body, verify_committed, verify_storage
@@ -58,7 +58,7 @@ def receipt(vault, identifier, kind):
 def material_hashes(vault, material):
     hashes = {material.get("source_sha256")}
     if material.get("kind") == "export":
-        hashes.update(c.get("sha256") for c in material.get("copies", []) if c["kind"] == "export")
+        hashes.update(export_copy_hash(copy) for copy in material.get("copies", []))
     quarantine = material.get("quarantine_receipt")
     if quarantine:
         incident = receipt(vault, quarantine, "quarantine")

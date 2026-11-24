@@ -1,15 +1,16 @@
 """Recover verified backup bytes through a journaled, staged directory publication."""
 from copy import deepcopy
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import stat
 from uuid import uuid4
 
 from . import backup_snapshot as snapshot, binding
 from .core import (Blocked, atomic, decode, digest, file_digest, git, git_bytes, lock, read_json,
-                   require, safe_path, stamp, sync_directory)
-from .custody import INACTIVE_COPIES, archive_members
+                   require, safe_path, stamp, sync_directory, utc)
+from .custody import INACTIVE_COPIES, archive_members, material_copy_error, unresolved_material_copy
+from .lineage import sha256
 
 JOURNAL = snapshot.RESTORE_JOURNAL
 JOURNAL_FILE = "backup-restore.json"
@@ -99,8 +100,130 @@ def remapped_copies(remap, records, destination, state):
     return selected
 
 
+def origin_paths(path, copy, bindings):
+    path_type = PureWindowsPath if PureWindowsPath(copy["root"]).drive else PurePosixPath
+    source, root = path_type(path), path_type(copy["root"])
+    if not source.is_absolute() or ".." in source.parts:
+        return
+    yield source, root / copy["path"]
+    for origin in bindings:
+        if snapshot.origin_path_type(origin["location"]) == path_type:
+            yield (binding.relocated_path(source, origin, path_type=path_type),
+                   binding.relocated_path(root, origin, path_type=path_type) / copy["path"])
+
+
+def matches_origin_path(path, copy, bindings):
+    return any(expected == recorded for expected, recorded in origin_paths(path, copy, bindings))
+
+
+def verified_export_move(record, index, copy, kind, payload, bindings):
+    path_type = PureWindowsPath if PureWindowsPath(copy["root"]).drive else PurePosixPath
+    root = path_type(copy["root"])
+    if payload.get("sha256") != copy["sha256"]:
+        return False
+    if kind == "retention-copy-move":
+        indices = payload.get("inventory_copies")
+        if (root.name != "inbox" or payload.get("material") != record["id"] or
+                payload.get("from") != copy["path"] or not isinstance(indices, list)):
+            return False
+        for sibling_index in indices:
+            if type(sibling_index) is not int or sibling_index == index or not 0 <= sibling_index < len(record["copies"]):
+                continue
+            sibling = record["copies"][sibling_index]
+            try:
+                snapshot.check_material_copy(record["id"], sibling)
+            except Blocked:
+                continue
+            if (sibling["kind"] == "export" and sibling["sha256"] == copy["sha256"] and sibling["path"] != copy["path"] and
+                    matches_origin_path(str(path_type(sibling["root"]) / sibling["path"]),
+                                        {**copy, "path": sibling["path"]}, bindings)):
+                return True
+        return False
+    if kind != "zero-byte-archive":
+        return False
+    source = snapshot.portable_path(payload.get("source"), historical=True)
+    destination = f"{copy['sha256']}/{PurePosixPath(source).name}"
+    recorded_destination = payload.get("destination")
+    worktree = payload.get("worktree")
+    if (copy["sha256"] != digest(b"") or payload.get("size") != 0 or not source.startswith("inbox/") or
+            not isinstance(recorded_destination, str) or recorded_destination.replace("\\", "/") != "archive/" + destination):
+        return False
+    if worktree is None:
+        origin = root / copy["path"]
+        levels = len(PurePosixPath(source).parts)
+        if levels >= len(origin.parts):
+            return False
+        worktree = str(origin.parents[levels - 1])
+    if not snapshot.valid_origin_root(worktree) or not matches_origin_path(str(path_type(worktree) / source), copy, bindings):
+        return False
+    target_index = copy.get("archive_copy_index")
+    target = str(path_type(worktree) / "archive" / destination)
+    return sum(
+        isinstance(sibling, dict) and sibling.get("kind") == "archive" and sibling.get("sha256") == copy["sha256"] and
+        snapshot.valid_origin_root(sibling.get("root")) and sibling.get("path") == destination and
+        (target_index is None or type(target_index) is int and sibling_index == target_index) and
+        matches_origin_path(target, sibling, bindings)
+        for sibling_index, sibling in enumerate(record["copies"])
+    ) == 1
+
+
+def check_origin_move(record, index, copy, records, bindings):
+    reason = f"Origin custody copy {index} lacks a verified move receipt"
+    identifier = copy.get("move_receipt")
+    require(sha256(identifier), reason, 5)
+    receipt = records.get(f"receipts/{identifier}.json", {})
+    payload = receipt.get("payload")
+    require(digest(receipt) == identifier and isinstance(payload, dict), reason, 5)
+    kind = receipt["kind"]
+    moved_at = copy.get("moved_at")
+    require(isinstance(moved_at, str) and
+            (utc(receipt["at"]) <= utc(moved_at) if kind == "retention-copy-move" else receipt["at"] == moved_at), reason, 5)
+    if copy["kind"] == "checkpoint" and record["kind"] == "conversation" and kind == "worktree-preservation":
+        artifact = record.get("artifact_inventory", {}).get(copy["path"], {})
+        worktree = payload.get("worktree")
+        indices = payload.get("copy_indices")
+        require(payload.get("material") == record["id"] and payload.get("task") == record.get("task") and
+                record.get("decryption_verified") and sha256(record.get("cipher_sha256")) and
+                record["cipher_sha256"] == payload.get("cipher_sha256") and artifact.get("sha256") == copy["sha256"] and
+                receipt["at"] == record.get("captured_at") and snapshot.identifier(payload.get("removal_capture")) and
+                isinstance(indices, list) and all(type(slot) is int for slot in indices) and index in indices and
+                isinstance(worktree, str) and any(path != root and path.is_relative_to(root)
+                    for root, path in origin_paths(worktree, copy, bindings)), reason, 5)
+        return
+    require(record["kind"] == "export" and copy["kind"] == "export" and
+            verified_export_move(record, index, copy, kind, payload, bindings), reason, 5)
+
+
+def check_inactive_origin(record, index, copy, records, bindings):
+    from .backups import check_replica_absence_proof, legacy_replica_proof, writing_generation
+    from .retention import check_deletion_proof
+
+    status = copy["status"]
+    backup = record["kind"] == "backup"
+    if status == "absent":
+        require(backup, f"Origin custody copy {index} has an unsupported absence state", 5)
+        check_replica_absence_proof(record, index, copy, records.get)
+    elif status == "moved":
+        check_origin_move(record, index, copy, records, bindings)
+    elif status == "deleted":
+        reason = f"Origin custody copy {index} lacks a verified deletion receipt"
+        if backup and not writing_generation(record) and "deletion_receipt" not in copy:
+            plans = ((Path(name).stem, value) for name, value in records.items() if name.startswith("deletions/"))
+            receipts = ((Path(name).stem, value) for name, value in records.items() if name.startswith("receipts/"))
+            require(legacy_replica_proof(record, copy, index, plans, receipts), reason, 5)
+        else:
+            check_deletion_proof(record, index, copy, records.get,
+                                 lambda path, claim: matches_origin_path(path, claim, bindings),
+                                 generation_digest=record["approval"]["digest"] if backup and not writing_generation(record) else None,
+                                 reason=reason)
+
+
 def reconcile_copies(archive, contents, records, state, control, journal, remaps):
-    inventory = deepcopy(records)
+    inventory = deepcopy(records["materials.json"])
+    bindings = [value for name, value in records.items()
+                if (historical := snapshot.historical_record(name)) and historical[1] == "binding.json"]
+    if origin := archive.get(snapshot.SOURCE_BINDING):
+        bindings.append(origin)
     sources = {entry["sha256"]: contents[name] for name, entry in archive["files"].items()
                if entry["kind"] == "knowledge" and snapshot.originals.source_path(name)}
     pending = []
@@ -108,7 +231,13 @@ def reconcile_copies(archive, contents, records, state, control, journal, remaps
         local = []
         record["copies"] = snapshot.project_material_copies(record)
         for index, copy in enumerate(record["copies"]):
-            reason = snapshot.material_copy_error(copy)
+            if copy["status"] in INACTIVE_COPIES:
+                try:
+                    check_inactive_origin(record, index, copy, records, bindings)
+                except (Blocked, KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+                    reason = str(exc) if isinstance(exc, Blocked) else f"Invalid origin custody proof for copy {index}"
+                    copy = record["copies"][index] = unresolved_material_copy(record["kind"], copy, reason)
+            reason = material_copy_error(copy)
             if reason:
                 pending.append({"material": key, "copy_index": index, "status": "invalid", "reason": reason})
                 continue
@@ -198,7 +327,7 @@ def build_portable(staging, state, journal, verified, raw_manifest, remaps):
         proof = f"historical/generations/{generation}/binding.json"
         require(proof not in prior, "Recovery would overwrite earlier binding evidence", 5)
         atomic(safe_path(control, proof), archive[snapshot.SOURCE_BINDING])
-    pending = reconcile_copies(archive, contents, records["materials.json"], state, control, journal, remaps)
+    pending = reconcile_copies(archive, contents, records, state, control, journal, remaps)
     return len(knowledge), pending
 
 

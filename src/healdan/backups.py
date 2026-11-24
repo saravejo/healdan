@@ -433,32 +433,36 @@ def interrupted_absence(plan, record, index, copy, root_identity):
             "copy_index": index, "identity": digest(copy_identity(copy)), "root_identity": root_identity}
 
 
+def check_replica_absence_proof(record, index, copy, read_record):
+    from .retention import copy_identity, plan_digest
+
+    reason = "Interrupted backup has an unproven absent replica"
+    identifier = copy.get("absence_receipt")
+    require(writing_generation(record) and sha256(identifier), reason, 5)
+    proof = read_record(f"receipts/{identifier}.json") or {}
+    payload = proof.get("payload", {})
+    plan_id = payload.get("plan")
+    require(isinstance(plan_id, str) and plan_id and Path(plan_id).name == plan_id, reason, 5)
+    plan = read_record(f"deletions/{plan_id}.json") or {}
+    root_identity = payload.get("root_identity")
+    require(proof.get("kind") == "backup-replica-absent" and proof.get("at") == copy.get("absent_at") and
+            isinstance(proof.get("at"), str) and utc(proof["at"]) >= utc(record["expires_at"]) and
+            digest(proof) == identifier and plan.get("id") == plan_id and plan_digest(plan) == plan["digest"] and
+            isinstance(root_identity, list) and len(root_identity) == 2 and all(type(value) is int for value in root_identity) and
+            payload == interrupted_absence(plan, record, index, copy, root_identity) and any(
+                entry["material"] == record["id"] and entry["copy_index"] == index and
+                copy_identity(entry["copy"]) == copy_identity(copy) for entry in plan["entries"]), reason, 5)
+
+
 def inspect_writing_generation(vault, record):
-    from .lineage import sha256
-    from .retention import authorized_target, copy_identity, plan_digest
+    from .retention import authorized_target
 
     check_writing_generation(vault, record)
     verify_replica_deletions(vault, record)
     unresolved = False
     for index, copy in enumerate(record["copies"]):
         if copy["status"] == "absent":
-            identifier = copy.get("absence_receipt")
-            require(sha256(identifier), "Interrupted backup has an unproven absent replica", 5)
-            proof = read_json(safe_path(vault.control, f"receipts/{identifier}.json"), {})
-            payload = proof.get("payload", {})
-            plan_id = payload.get("plan")
-            require(isinstance(plan_id, str) and plan_id and Path(plan_id).name == plan_id,
-                    "Interrupted backup has an unproven absent replica", 5)
-            plan = read_json(safe_path(vault.control, f"deletions/{plan_id}.json"), {})
-            root_identity = payload.get("root_identity")
-            require(proof.get("kind") == "backup-replica-absent" and proof.get("at") == copy.get("absent_at") and
-                    isinstance(proof.get("at"), str) and utc(proof["at"]) >= utc(record["expires_at"]) and
-                    digest(proof) == identifier and plan.get("id") == plan_id and plan_digest(plan) == plan["digest"] and
-                    isinstance(root_identity, list) and len(root_identity) == 2 and all(type(value) is int for value in root_identity) and
-                    payload == interrupted_absence(plan, record, index, copy, root_identity) and any(
-                        entry["material"] == record["id"] and entry["copy_index"] == index and
-                        copy_identity(entry["copy"]) == copy_identity(copy) for entry in plan["entries"]),
-                    "Interrupted backup has an unproven absent replica", 5)
+            check_replica_absence_proof(record, index, copy, lambda name: read_json(safe_path(vault.control, name)))
         if copy["status"] in {"deleted", "absent"}:
             root = vault.relocated_path(copy["root"])
             require(not root.is_dir() or not safe_path(root, copy["path"]).exists(),
@@ -494,20 +498,33 @@ def verified_replica(vault, record, copy):
 
 
 def legacy_replica_receipt(vault, record, copy, index):
-    from .retention import copy_identity, plan_digest
-
     if not (copy.get("deleted_at") and record.get("expires_at") and utc(copy["deleted_at"]) >= utc(record["expires_at"])):
         return None
     root = vault.relocated_path(copy["root"])
     if "origin_status" not in copy and root.is_dir() and safe_path(root, copy["path"]).exists():
         return None
+
+    def entries(folder):
+        directory = safe_path(vault.control, folder)
+        for path in sorted(directory.glob("*.json")):
+            try:
+                yield path.stem, read_json(safe_path(directory, path.name, exists=True))
+            except (Blocked, OSError, ValueError, KeyError, TypeError):
+                continue
+
+    return legacy_replica_proof(record, copy, index, entries("deletions"), entries("receipts"))
+
+
+def legacy_replica_proof(record, copy, index, deletion_plans, deletion_receipts):
+    from .retention import copy_identity, plan_digest
+
+    if not (copy.get("deleted_at") and record.get("expires_at") and utc(copy["deleted_at"]) >= utc(record["expires_at"])):
+        return None
     identity = copy_identity(copy)
     plans = {}
-    directory = safe_path(vault.control, "deletions")
-    for path in directory.glob("*.json"):
+    for key, plan in deletion_plans:
         try:
-            plan = read_json(safe_path(directory, path.name, exists=True))
-            if (plan["id"] == path.stem and plan["status"] in {"pending", "complete"} and plan_digest(plan) == plan["digest"] and
+            if (plan["id"] == key and plan["status"] in {"pending", "complete"} and plan_digest(plan) == plan["digest"] and
                     utc(plan["created_at"]) <= utc(copy["deleted_at"]) and any(
                         entry["material"] == record["id"] and entry["copy_index"] == index and
                         entry["status"] == "deleted" and entry.get("at") == copy["deleted_at"] and
@@ -518,10 +535,8 @@ def legacy_replica_receipt(vault, record, copy, index):
             continue
     if not plans:
         return None
-    directory = safe_path(vault.control, "receipts")
-    for path in sorted(directory.glob("*.json")):
+    for key, receipt in deletion_receipts:
         try:
-            receipt = read_json(safe_path(directory, path.name, exists=True))
             if not isinstance(receipt, dict):
                 continue
             payload = receipt.get("payload", {})
@@ -529,15 +544,15 @@ def legacy_replica_receipt(vault, record, copy, index):
                     set(payload) == {"plan", "digest", "status"} and
                     payload["plan"] in plans and payload["digest"] == plans[payload["plan"]] and
                     payload["status"] in {"pending", "complete"} and utc(receipt["at"]) >= utc(copy["deleted_at"]) and
-                    digest(receipt) == path.stem):
-                return path.stem
+                    digest(receipt) == key):
+                return key
         except (Blocked, OSError, ValueError, KeyError, TypeError):
             continue
     return None
 
 
 def verify_replica_deletion(vault, record, index, copy):
-    from .retention import copy_identity, plan_digest, slot
+    from .retention import check_deletion_proof
 
     writing = writing_generation(record)
     root = str(vault.relocated_path(copy["root"]))
@@ -546,32 +561,9 @@ def verify_replica_deletion(vault, record, index, copy):
         legacy = None if writing else legacy_replica_receipt(vault, record, copy, index)
         require(legacy, reason, 5)
         return {"copy_index": index, "root": root, "receipt": legacy, "proof": "legacy-round"}
-    receipt_id = copy.get("deletion_receipt")
-    require(sha256(receipt_id), reason, 5)
-    receipt = read_json(safe_path(vault.control, f"receipts/{receipt_id}.json"), {})
-    require(isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict), reason, 5)
-    payload = receipt["payload"]
-    intent = payload.get("intent")
-    expected_slot = [record["id"], index, digest(copy_identity(copy))]
-    require(isinstance(intent, dict), reason, 5)
-    primary = intent.get("slot") == expected_slot
-    generation = next((item for item in intent.get("generations", []) if
-                       [item["material"], item["copy_index"], item["identity"]] == expected_slot), {})
-    require(digest(receipt) == receipt_id and receipt.get("kind") == "deletion-copy" and
-            receipt.get("at") == copy.get("deleted_at") and payload.get("material") == record["id"] and
-            payload.get("copy_index") == index and payload.get("sha256") == copy["sha256"] and
-            intent.get("at") == receipt["at"] and
-            (intent if primary else generation).get("generation_digest") == (None if writing else record["approval"]["digest"]) and
-            intent.get("path") and deletion_location(vault, intent["path"], copy),
-            reason, 5)
-    directory = safe_path(vault.control, "deletions")
-    plan_id = intent.get("plan_id")
-    require(isinstance(plan_id, str) and Path(plan_id).name == plan_id and plan_id, reason, 5)
-    plan = read_json(safe_path(directory, plan_id + ".json"), {})
-    require(isinstance(plan, dict) and plan.get("id") == plan_id and plan.get("digest") == intent.get("plan_digest") and
-            plan_digest(plan) == plan["digest"] and any(list(slot(entry)) == intent.get("slot") and
-                entry.get("status") in {"deleting", "deleted"} and entry.get("intent") == intent
-                for entry in plan["entries"]), reason, 5)
+    receipt_id = check_deletion_proof(record, index, copy, lambda name: read_json(safe_path(vault.control, name)),
+                                      lambda path, claim: deletion_location(vault, path, claim),
+                                      generation_digest=None if writing else record["approval"]["digest"], reason=reason)
     return {"copy_index": index, "root": root, "receipt": receipt_id}
 
 
