@@ -1,12 +1,11 @@
 """Preflight a moved vault without rewriting signed custody or historical records."""
 import base64
-import os
 from pathlib import Path
-import platform
 import plistlib
 
 from .binding import CONFIG_PATHS, CONFIG_ROOTS, git_location, relocated_path
-from .core import atomic, digest, executable, git, read_json, require, run, safe_path
+from .core import atomic, digest, git, read_json, require, safe_path
+from .launchd import JOBS, installed_jobs, job_label, legacy_labels, require_removed
 
 SESSION_PATHS = ("proposal", "active_profile", "recovery_profile")
 
@@ -187,16 +186,11 @@ def _plists(binding):
 def _validate_jobs(old, new):
     state = Path(new["location"]["state"])
     labels = {path.stem for path in safe_path(state, "launchd").glob("org.healdan.*.plist")}
-    for job in ("lint", "daily"):
-        labels.add(f"org.healdan.{old['vault_id']}.{job}")
-        for location in [old["location"], *old["previous"]]:
-            labels.add("org.healdan." + digest(location["common"])[:12] + "." + job)
-    for label in sorted(labels):
-        installed = Path.home() / "Library/LaunchAgents" / (label + ".plist")
-        loaded = (platform.system() == "Darwin" and
-                  run([executable("launchctl"), "print", f"gui/{os.getuid()}/{label}"], check=False).returncode == 0)
-        require(not loaded and not installed.exists() and not installed.is_symlink(),
-                "Unload and remove the installed LaunchAgent before reassociation: " + label, 5)
+    labels.update(job_label(old["vault_id"], job) for job in JOBS)
+    labels.update(job_label(old["vault_id"], job, trial=True) for job in JOBS)
+    for location in [old["location"], *old["previous"]]:
+        labels.update(legacy_labels(location["common"]))
+    require_removed(installed_jobs(labels), "reassociation")
 
 
 def _validate_move(repository, old, new):

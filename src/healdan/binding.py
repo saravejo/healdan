@@ -5,6 +5,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from .core import Blocked, atomic, digest, git, git_bytes, lock, read_json, require, safe_path
+from .launchd import legacy_jobs, require_removed
 
 FORMAT = "healdan-vault-binding-v1"
 MARKER = "binding.json"
@@ -160,6 +161,8 @@ def _finish(repository, transaction):
     common_marker, state_marker = marker(repository.control), marker(state)
     require(common_marker in (old, new) and state_marker in (old, new),
             "Binding recovery found an unexpected marker; no marker was replaced", 5)
+    if transaction["mode"] == "adopt":
+        require_removed(legacy_jobs(new["location"]), "adoption")
     if transaction["relocation"] is not None:
         from .relocation import apply_relocation
         apply_relocation(repository, new, transaction["relocation"])
@@ -301,13 +304,19 @@ def adopt(root, state=None, confirmation=None):
         return {"status": "adopted", "binding": value}
     existing = marker(repository.control)
     if existing:
-        return {"status": "already-bound", "binding": bound(repository, state)}
+        existing = bound(repository, state)
+        jobs = legacy_jobs(existing["location"], existing["previous"])
+        if confirmation is not None:
+            require_removed(jobs, "adoption")
+        return {"status": "already-bound", "binding": existing, "legacy_launchagents": jobs}
     candidate = Path(state).resolve() if state is not None else repository.default_state
     plan = _legacy_plan(repository, candidate)
     if confirmation is None:
-        return {"status": "preview", "confirmation": digest(plan), **plan}
+        return {"status": "preview", "confirmation": digest(plan), **plan,
+                "legacy_launchagents": legacy_jobs(plan["location"])}
     require(confirmation == digest(plan), "Adoption differs from the confirmed preview", 5)
     with pair_lock(repository, candidate):
+        require_removed(legacy_jobs(plan["location"]), "adoption")
         pending = _pending(repository)
         if pending:
             require(pending["mode"] == "adopt" and pending["confirmation"] == confirmation and

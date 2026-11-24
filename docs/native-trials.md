@@ -63,19 +63,47 @@ not change an existing generation expiry. Do not copy recovery keys into logs.
 
 ## launchd
 
-Use disposable fixture jobs first to establish calendar behavior, including
-sleep/wake, logout/login and timezone changes. Record actual start/end UTC
-times, not merely the plist installation. Then validate the generated Monday
-09:00 lint and daily 02:00 maintenance plists. Confirm one daily sequence runs
-retention before backup, failures prevent a complete round, and an interrupted
-round resumes its existing plan. Verify exactly eight days does not warn and
-eight days plus one tick does. Do not change the Mac clock on a production host.
+1. Run `healdan --vault TARGET maintenance prepare-launchd-trial DIRECTORY`
+   from the verified build selected for the target vault. Choose an existing
+   external directory in the disposable macOS account or VM. The command
+   creates a fresh workspace and returns its vault and external state paths.
+   Commit the initialized test data locally. Configure new trial keys,
+   authorized storage and backup destinations inside the returned workspace.
+   Use only disposable content, keys and age recipients.
+2. Complete the other native trials for this fixture and sign their receipts
+   there. With the fixture selected, save `maintenance trial-environment
+   launchd` before testing. Run `maintenance schedule --trial --activate` to
+   register the two jobs under `org.healdan.trial.<vault-id>.*` in the logged-in
+   account. Both activation and execution require the other readiness checks
+   to pass. These jobs use the fixture's active build, primary worktree,
+   identity, state and log paths. Use the same absolute tool search path when
+   measuring the environment and generating the plists.
+3. Run both jobs through launchd. Exercise the Monday 09:00 lint and daily
+   02:00 maintenance schedules over sleep/wake, logout/login and timezone
+   changes. Record actual start/end UTC times, `launchctl print` output, the
+   plists, job output and artifact hashes. Confirm that retention precedes
+   backup, failures prevent a complete round, and an interrupted round
+   resumes its existing plan. Verify exactly eight days does not warn and
+   eight days plus one tick does. Use the disposable account or VM for clock
+   and timezone experiments.
+4. Unload the two trial labels with `launchctl bootout "gui/$(id -u)/LABEL"`
+   and remove their installed plists in `~/Library/LaunchAgents`. Preserve
+   the evidence files externally. For a production receipt, run `maintenance
+   trial-environment launchd` with the target vault selected. Review the target
+   build digest, policy, tools, configuration and proposed production plists
+   against the measured fixture environment and actual execution artifacts.
+   Use the target measurement as `environment` and include the fixture's
+   measurement, plists, logs and retention/backup evidence in `artifacts`.
+   Document the differences in `procedure`. Only attest the target after
+   verifying the applicability and outcome of the trial. Production activation
+   and production jobs require all native receipts for the target vault.
 
 ## Evidence and release gate
 
-Each trial JSON contains platform `Darwin`, exact commit, passed=true only on
-success, versions, procedure, started_at, completed_at, and artifacts (external
-path plus SHA-256). Sign each with `maintenance attest TRIAL EVIDENCE.json` for
+Each trial JSON contains platform `Darwin`, `passed` set to `true` on success,
+the measured `environment`, `procedure`, `started_at`, `completed_at`, and
+`artifacts` containing external paths and SHA-256 hashes. Sign each with
+`maintenance attest TRIAL EVIDENCE.json` for
 claude-auth, native-resume, native-cleanup, offline-recovery and launchd.
 Failed/incomplete trials remain pending and cannot be signed as passed.
 

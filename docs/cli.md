@@ -50,6 +50,8 @@ JSON. `--help` lists exact arguments.
 | `maintenance trial-environment TRIAL [--profile PATH]` | Record the measured environment for a native trial |
 | `maintenance attest TRIAL EVIDENCE.json` | Sign native acceptance evidence for the vault, controller build, and trial environment |
 | `maintenance schedule [--activate]` | Generate/activate local-calendar launchd jobs after readiness |
+| `maintenance prepare-launchd-trial DIRECTORY` | Create a disposable vault and state for the launchd trial with the target build |
+| `maintenance schedule --trial [--activate]` | Generate/activate isolated launchd jobs from a prepared disposable trial vault |
 | `backup create --kind long --expires-at UTC` | Encrypted generation to all configured destinations |
 | `backup verify ID`, `restore ID DESTINATION` | Verify every copy and restore to a fresh directory |
 | `migration inventory`, `migration purge-check` | Read-only legacy/width inventory and purge prerequisites |

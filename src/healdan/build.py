@@ -235,10 +235,12 @@ def require_active(vault):
 
 def activate(vault, sha256, store=None):
     from .compatibility import check
+    from .launchd import legacy_jobs, require_removed
 
     require(SHA256.fullmatch(sha256), "Expected the prepared controller SHA-256", 2)
     prefix = Path(store if store is not None else store_path()).resolve() / sha256
     with vault.locked():
+        require_removed(legacy_jobs(vault.binding["location"], vault.binding["previous"]), "build activation")
         external(prefix, vault.repository, vault.state)
         build = verify_build(prefix)
         previous = read_selection(vault.control, vault.identity)

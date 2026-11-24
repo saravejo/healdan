@@ -28,8 +28,13 @@ omitted.
 For an existing installation, first prepare the new controller with
 `python3 scripts/setup.py --prepare-only` and use the printed controller path
 to run `healdan --vault PATH --state STATE state adopt`. Review the reported
-paths and evidence of ownership. Repeat the command with
-`--confirm DIGEST` using the preview's `confirmation` value, then run setup.
+paths and evidence of ownership. On macOS, use the `legacy_launchagents` preview
+to identify the vault's old jobs. For each loaded job, run
+`launchctl bootout "gui/$(id -u)/LABEL"`. Remove the corresponding installed
+plist shown in the preview so the job cannot reload at login. Repeat the
+command with `--confirm DIGEST` using the preview's `confirmation` value,
+then run setup. Build activation also checks for legacy jobs on already
+bound vaults.
 For a vault or state that has moved, use `state rebind` at the new location
 with the same preview and confirmation steps. Supply `--state` if the state
 directory moved. Preserve both original binding markers during the move. On
@@ -69,6 +74,8 @@ Only activate schedules after configuration and verified recovery using
 `healdan maintenance schedule --activate`. Each scheduled run checks the
 readiness of the active build. Schedules use local calendar time. Deadlines use
 elapsed UTC time. The daily job runs retention before backup.
+Use the disposable procedure in [native trials](native-trials.md#launchd) to
+collect launchd evidence before activating a production schedule.
 
 Troubleshooting: check `healdan status`, `healdan doctor`, the external state
 path, executable PATH, and the run receipt. An inaccessible backup destination

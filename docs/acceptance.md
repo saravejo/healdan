@@ -65,7 +65,9 @@ as `profile`.
 Use `maintenance attest TRIAL EVIDENCE.json` to compare the current environment
 to the recorded measurements and sign the evidence. Cleanup trials cover two
 projects with old and recent sessions. Schedule trials cover sleep, logout and
-timezone changes. Keep authenticated credentials in the personal environment.
+timezone changes. Use the [disposable launchd procedure](native-trials.md#launchd)
+to collect execution evidence before signing for the target environment.
+Keep authenticated credentials in the personal environment.
 
 Activate the wheel from the successful Actions attempt for the release commit.
 Run `python scripts/release_check.py --vault PATH --ci-run RUN_ID`. Use

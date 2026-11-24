@@ -108,8 +108,8 @@ def environment(vault, name, profile=None, *, build=None, measured_tools=None):
         tools = ["age", "git", "ssh", "ssh-keygen"]
         relevant = RECOVERY_CONFIG
         if name == "launchd":
-            from .maintenance import schedule_definitions
-            values["schedules"] = schedule_definitions(vault, build)
+            from .maintenance import schedule_definitions, trial_workspace
+            values["schedules"] = schedule_definitions(vault, build, trial=trial_workspace(vault) is not None)
             tools.append("launchctl")
             relevant = SCHEDULE_CONFIG
     values["tools"] = {name: tool(name) for name in tools}

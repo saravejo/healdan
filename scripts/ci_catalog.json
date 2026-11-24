@@ -70,6 +70,7 @@
     "test_installation.ImmutableInstallation.test_compatible_rollback_and_rejection_preserve_external_state_bytes",
     "test_installation.ImmutableInstallation.test_concurrent_repeat_reuses_verified_environment",
     "test_installation.ImmutableInstallation.test_distinct_builds_and_same_entry_point_routes_by_vault",
+    "test_installation.ImmutableInstallation.test_launchd_trial_uses_disposable_vault_and_keeps_production_gated",
     "test_installation.ImmutableInstallation.test_migrating_one_vault_preserves_shared_legacy_environment",
     "test_installation.ImmutableInstallation.test_preparation_and_activation_failures_preserve_the_previous_command",
     "test_knowledge.Pages.test_complete_segment_utf8_preview_is_pure",

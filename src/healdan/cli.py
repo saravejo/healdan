@@ -11,7 +11,7 @@ from .core import Blocked, Vault, atomic, canonical, digest, jsonl, read_json, r
 def parser():
     result = argparse.ArgumentParser(prog="healdan", description="Local evidence-based wiki controller")
     result.add_argument("--version", action="version", version=__version__)
-    result.add_argument("--vault", default=".")
+    result.add_argument("--vault")
     result.add_argument("--state", help="External controller state directory")
     result.add_argument("--vault-id", help="Require the selected vault identity")
     commands = result.add_subparsers(dest="command", required=True)
@@ -134,8 +134,12 @@ def parser():
     execute.add_argument("plan")
     schedule = maintenance.add_parser("schedule")
     schedule.add_argument("--activate", action="store_true")
+    schedule.add_argument("--trial", action="store_true", help="Use a disposable launchd trial vault")
+    trial = maintenance.add_parser("prepare-launchd-trial", help="Create a disposable launchd trial vault")
+    trial.add_argument("directory", type=Path)
     scheduled = maintenance.add_parser("run-scheduled", help=argparse.SUPPRESS)
     scheduled.add_argument("job", choices=("lint", "daily"))
+    scheduled.add_argument("--trial", action="store_true")
     attest = maintenance.add_parser("attest")
     attest.add_argument("trial")
     attest.add_argument("evidence", type=Path)
@@ -314,7 +318,7 @@ def dispatch(args):
         return transactions.apply(vault, args.package, recover=args.recover)
     if args.command == "maintenance":
         if args.action == "run-scheduled":
-            result = maintenance.run_scheduled(vault, args.job, args.vault_id)
+            result = maintenance.run_scheduled(vault, args.job, args.vault_id, trial=args.trial)
             return result, 5 if args.job == "lint" and (result["status"] != "complete" or result["findings"]) else 0
         if args.action == "daily":
             return maintenance.daily(vault)
@@ -326,7 +330,9 @@ def dispatch(args):
             from .retention import execute
             return execute(vault, args.plan)
         if args.action == "schedule":
-            return maintenance.schedule(vault, activate=args.activate)
+            return maintenance.schedule(vault, activate=args.activate, trial=args.trial)
+        if args.action == "prepare-launchd-trial":
+            return maintenance.prepare_launchd_trial(vault, args.directory)
         if args.action == "attest":
             return maintenance.attest(vault, args.trial, read_json(args.evidence))
         if args.action == "trial-environment":
@@ -388,7 +394,16 @@ def redirect(args, argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    args = parser().parse_args(argv)
+    commands = parser()
+    args = commands.parse_args(argv)
+    # The original B02 plists supplied all three selectors with the manual command spelling.
+    if args.vault_id is not None and args.state is not None and args.vault is not None:
+        job = (args.command,) if args.command == "lint" else (args.command, getattr(args, "action", None))
+        if job in {("lint",), ("maintenance", "daily")}:
+            argv = [*argv[:-len(job)], "maintenance", "run-scheduled", job[-1]]
+            args = commands.parse_args(argv)
+    if args.vault is None:
+        args.vault = "."
     try:
         redirected = redirect(args, argv)
         if redirected is not None:
