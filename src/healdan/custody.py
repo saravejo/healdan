@@ -16,11 +16,31 @@ INACTIVE_COPIES = {"deleted", "moved"}
 def archive_tree(root):
     root = Path(root).resolve()
     files = {}
-    for path in sorted(root.rglob("*")):
-        require(not path.is_symlink(), "Cannot preserve a symlink tree")
-        if path.is_file():
-            rel = path.relative_to(root).as_posix()
-            data = safe_path(root, rel, exists=True).read_bytes()
+    directories = [root]
+    while directories:
+        directory = directories.pop()
+        try:
+            if directory != root:
+                safe_path(root, directory.relative_to(root))
+                require(directory.resolve() == directory, "Cannot preserve an aliased directory")
+            with os.scandir(directory) as scan:
+                paths = sorted((Path(entry.path) for entry in scan))
+        except OSError as exc:
+            raise Blocked(f"Cannot enumerate preservation directory {directory}: {exc}", 5) from exc
+        for path in paths:
+            try:
+                metadata = path.lstat()
+                require(not stat.S_ISLNK(metadata.st_mode) and not path.is_junction(),
+                        "Cannot preserve a symlink tree or junction: " + str(path))
+                if stat.S_ISDIR(metadata.st_mode):
+                    directories.append(path)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                rel = path.relative_to(root).as_posix()
+                data = safe_path(root, rel, exists=True).read_bytes()
+            except OSError as exc:
+                raise Blocked(f"Cannot read preservation path {path}: {exc}", 5) from exc
             files[rel] = {"sha256": digest(data), "size": len(data),
                           "body": base64.b64encode(data).decode("ascii")}
     return {"format": "healdan-tree-v1", "files": files}

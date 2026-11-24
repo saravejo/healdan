@@ -1,6 +1,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -378,6 +379,61 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(draft.read_bytes(), b"draft changed during verification")
         self.assertTrue(tasks.get_task(self.vault, task["id"])["capacity_held"])
         self.assertFalse(tasks.preserve_and_close(self.vault, task["id"])["capacity_held"])
+
+    def test_worktree_preservation_rejects_incomplete_inventory_until_access_returns(self):
+        self.age()
+        self.change_policy()
+        scandir = os.scandir
+        read_bytes = Path.read_bytes
+        for expire in (False, True):
+            with self.subTest(flow="expiry" if expire else "closure"):
+                task = tasks.create(self.vault, "Incomplete worktree inventory")
+                worktree = Path(task["worktree"])
+                draft = worktree / "notes" / "draft.txt"
+                data = b"local draft with unpublished bytes"
+                atomic(draft, data)
+
+                def operate():
+                    if expire:
+                        return tasks.reconcile_expired(self.vault, task["id"], now=utc(task["created_at"]) + timedelta(days=2))
+                    return tasks.preserve_and_close(self.vault, task["id"])
+
+                for unavailable_scan in (None, 1, 2):
+                    seen = []
+
+                    def scan(path):
+                        if Path(path) == draft.parent:
+                            seen.append(path)
+                            if unavailable_scan is None or len(seen) == unavailable_scan:
+                                raise PermissionError("Fixture temporarily unavailable ordinary directory")
+                        return scandir(path)
+
+                    with patch("os.scandir", side_effect=scan):
+                        with self.assertRaisesRegex(Blocked, "Cannot enumerate preservation directory.*notes"):
+                            operate()
+                    self.assertEqual(len(seen), unavailable_scan or 1)
+                    self.assertEqual(draft.read_bytes(), data)
+                    self.assertTrue(tasks.get_task(self.vault, task["id"])["capacity_held"])
+                    self.assertIn(worktree, self.vault.repository.worktree_roots())
+
+                def read(path):
+                    if path == draft:
+                        raise PermissionError("Fixture temporarily unavailable regular file")
+                    return read_bytes(path)
+
+                with patch.object(Path, "read_bytes", read):
+                    with self.assertRaisesRegex(Blocked, "Cannot read preservation path.*draft.txt"):
+                        operate()
+                self.assertEqual(draft.read_bytes(), data)
+                self.assertTrue(tasks.get_task(self.vault, task["id"])["capacity_held"])
+                result = operate()
+                self.assertEqual(result["capacity_held"], expire)
+                self.assertFalse(worktree.exists())
+                identifier = result["expiry_preservation" if expire else "preservation"]
+                record = custody.materials(self.vault)[identifier]
+                _, plain = custody.verified_capture(self.vault, record)
+                member = draft.relative_to(worktree.parent).as_posix()
+                self.assertEqual(base64.b64decode(decode(plain)["files"][member]["body"]), data)
 
     def test_expired_worktree_reconciles_captures_before_and_after_process_supervision(self):
         keys = self.age()
