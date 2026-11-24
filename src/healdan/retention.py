@@ -15,9 +15,9 @@ CHECKPOINT_REPLICAS_PENDING = "Verified ciphertext is needed by checkpoints awai
 PRESERVATION_AUTHORIZATION_PENDING = "Expired signed backup awaits individual preservation authorization"
 
 
-def reconcile_closures(vault):
+def reconcile_closures(vault, records):
     closures, open_tasks = {}, set()
-    for record in materials(vault).values():
+    for record in records:
         identifier = record.get("task")
         if not isinstance(identifier, str) or not identifier or record.get("closed_at"):
             continue
@@ -415,7 +415,7 @@ def reconcile_inbox(vault, now):
 
 def plan(vault, now=None, *, exclude=(), skip_empty=False):
     with vault.locked():
-        open_tasks = reconcile_closures(vault)
+        open_tasks = reconcile_closures(vault, materials(vault).values())
         reconcile_inbox(vault, now)
         now = stamp(now)
         pending = pending_archive_paths(vault)
@@ -509,6 +509,8 @@ def apply_entry(vault, path, plan, entry, now):
             return
         location = copy_path(vault, copy)
         slots = active_slots(vault, inventory, location)
+        # A shared path depends on every active material's retention deadline.
+        reconcile_closures(vault, [material, *(other for other, _, _ in slots if other is not material)])
         guard(vault, material, copy, now, policy, slots=slots)
         reservation = pending_deletion_paths(vault, target=location, exclude=(plan["id"], slot(entry)))
         require(not reservation, "Another deletion plan is reconciling this copy", 5)

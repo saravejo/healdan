@@ -1150,6 +1150,66 @@ class StorageLifecycle(VaultTest):
         self.assertEqual((code, recovered["status"]), (0, "complete"), recovered)
         self.assertFalse(target.exists())
 
+    def test_explicit_retention_execute_recovers_missing_task_origin_in_the_same_plan(self):
+        self.age()
+        past = utc() - timedelta(days=40)
+        task = tasks.create(self.vault, "Closed task with temporarily unavailable record", now=past)
+        checkpoint = self.state / "plan-recovery" / "checkpoint.jsonl"
+        atomic(checkpoint, b"ordinary conversation fixture")
+        capture = custody.capture_tree(self.vault, checkpoint.parent, task=task["id"], classification="common")
+        cipher = self.state / "custody" / (capture + ".age")
+        original = {path: path.read_bytes() for path in (checkpoint, cipher)}
+        with patch("healdan.tasks.stamp", return_value=stamp(past)):
+            tasks.preserve_and_close(self.vault, task["id"])
+        task_file = tasks.task_path(self.vault, task["id"])
+        read = Path.read_bytes
+        failed_reads = []
+
+        def invoke(*args, unavailable):
+            def delayed_read(path):
+                if path == unavailable:
+                    failed_reads.append(path)
+                    raise PermissionError("Fixture task closure temporarily unavailable")
+                return read(path)
+
+            output = BytesIO()
+            with patch.object(Path, "read_bytes", delayed_read), patch("healdan.cli.sys.stdout") as stdout:
+                stdout.buffer = output
+                code = cli.main(["--vault", str(self.root), "--state", str(self.state), "maintenance", *args])
+            return code, decode(output.getvalue())
+
+        code, plan = invoke("plan", unavailable=task_file)
+        self.assertEqual(code, 0, plan)
+        identifier = plan["id"]
+        code, pending = invoke("execute", identifier, unavailable=task_file)
+        self.assertEqual((code, pending["status"], pending["digest"]), (5, "pending", plan["digest"]), pending)
+        self.assertTrue(any(row["material"] == capture and "origin or deadline is unknown" in row["reason"]
+                            for row in pending["pending"]))
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
+        self.assertNotIn("closed_at", custody.materials(self.vault)[capture])
+
+        independent = tasks.create(self.vault, "Unrelated task outside the original plan")
+        other = self.state / "outside-plan" / "checkpoint.jsonl"
+        atomic(other, b"unrelated conversation fixture")
+        custody.capture_tree(self.vault, other.parent, task=independent["id"], classification="common")
+        unrelated_file = tasks.task_path(self.vault, independent["id"])
+        failed_reads.clear()
+        code, completed = invoke("execute", identifier, unavailable=unrelated_file)
+        self.assertEqual((code, completed["id"], completed["status"], completed["digest"]),
+                         (0, identifier, "complete", plan["digest"]), completed)
+        self.assertFalse(checkpoint.exists() or cipher.exists())
+        self.assertEqual(other.read_bytes(), b"unrelated conversation fixture")
+        restored = custody.materials(self.vault)[capture]
+        self.assertEqual(restored["closed_at"], stamp(past))
+        entries = [entry for entry in completed["entries"] if entry["material"] == capture]
+        for entry in entries:
+            self.assertEqual(entry["intent"]["plan_digest"], plan["digest"])
+            self.assertEqual(entry["receipt"], restored["copies"][entry["copy_index"]]["deletion_receipt"])
+        self.assertEqual({retention.slot(entry) for entry in entries},
+                         {retention.slot(entry) for entry in plan["entries"] if entry["material"] == capture})
+        self.assertEqual(invoke("execute", identifier, unavailable=unrelated_file), (0, completed))
+        self.assertEqual(failed_reads, [])
+
     def test_overlapping_rounds_reconcile_all_plans_and_discover_new_slots(self):
         self.change_policy()
         _, first = self.export("first")
