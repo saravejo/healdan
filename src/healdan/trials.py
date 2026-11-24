@@ -3,9 +3,11 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import platform
 import re
 import sys
+from uuid import UUID
 
 from .build import require_active
 from .core import Blocked, atomic, digest, executable, read_json, require, run, safe_path, utc
+from .launchd import JOBS, job_label
 from .lineage import sha256
 from .signing import human_sign, trusted_signers, verify
 
@@ -14,6 +16,13 @@ TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", 
 RECEIPT_FOLDERS = ("trials", "trials/v2")
 RECEIPTS = {f"{folder}/{name}.json": (name, folder == "trials/v2") for folder in RECEIPT_FOLDERS for name in TRIALS}
 PROFILE_TRIALS = frozenset(TRIALS[:3])
+PROFILE_POLICY_FIELDS = {"srt_version", "cleanupPeriodDays", "context_bytes"}
+PROFILE_OPTIONAL_FILES = (".claude.json", "settings.local.json")
+PROFILE_TOOLS = ("claude", "node", "srt")
+RECOVERY_TOOLS = ("age", "git", "ssh", "ssh-keygen")
+TRIAL_TOOLS = {"claude-auth": PROFILE_TOOLS, "native-resume": (*PROFILE_TOOLS, "age", "ssh", "ssh-keygen"),
+               "native-cleanup": (*PROFILE_TOOLS, "age", "ssh", "ssh-keygen"),
+               "offline-recovery": RECOVERY_TOOLS, "launchd": (*RECOVERY_TOOLS, "launchctl")}
 PROFILE_CONFIG = ("signing_key", "age_identity", "backup_signing_key", "storage_roots", "backup_destinations")
 RECOVERY_CONFIG = ("age_recipients", "offline_recipients", "age_identity", "backup_signing_identity", "backup_signing_key",
                    "backup_allowed_signers", "backup_destinations", "storage_roots")
@@ -56,7 +65,7 @@ def _profile(vault, name, requested):
     path = configured or requested or _profile_directory(vault, vault.state / "authentication")
     settings = safe_path(path, "settings.json", exists=True)
     files = {"settings.json": digest(settings.read_bytes())}
-    for name in (".claude.json", "settings.local.json"):
+    for name in PROFILE_OPTIONAL_FILES:
         candidate = safe_path(path, name)
         if candidate.is_file():
             files[name] = digest(candidate.read_bytes())
@@ -108,22 +117,18 @@ def environment(vault, name, profile=None, *, build=None, measured_tools=None):
               "python": {"version": platform.python_version(), "command": str(Path(sys.executable).resolve())}}
     if name in PROFILE_TRIALS:
         values["profile"].update(_profile(vault, name, profile))
-        tools = ["claude", "node", "srt"]
         relevant = PROFILE_CONFIG
-        values["policy"] = {key: vault.policy[key] for key in ("srt_version", "cleanupPeriodDays", "context_bytes")}
+        values["policy"] = {key: vault.policy[key] for key in PROFILE_POLICY_FIELDS}
         if name in {"native-resume", "native-cleanup"}:
-            tools.extend(("age", "ssh", "ssh-keygen"))
             relevant = (*relevant, *RECOVERY_CONFIG)
     else:
         require(profile is None, "This trial uses the vault's recovery or schedule configuration", 2)
-        tools = ["age", "git", "ssh", "ssh-keygen"]
         relevant = RECOVERY_CONFIG
         if name == "launchd":
             from .maintenance import schedule_definitions, trial_workspace
             values["schedules"] = schedule_definitions(vault, build, trial=trial_workspace(vault) is not None)
-            tools.append("launchctl")
             relevant = SCHEDULE_CONFIG
-    values["tools"] = {name: tool(name) for name in tools}
+    values["tools"] = {dependency: tool(dependency) for dependency in TRIAL_TOOLS[name]}
     if "srt" in values["tools"]:
         from .launcher import validate_runtime
         validate_runtime(vault, values["tools"]["srt"]["version"], values["tools"]["node"]["version"])
@@ -154,6 +159,78 @@ def _validate_evidence(evidence):
     require(utc(evidence["completed_at"]) >= utc(evidence["started_at"]), "Invalid trial times", 2)
 
 
+def _absolute_path(value):
+    if isinstance(value, str):
+        for path_type in (PurePosixPath, PureWindowsPath):
+            path = path_type(value)
+            if path.is_absolute():
+                return path
+    return None
+
+
+def _measured_tool(name, value):
+    if not isinstance(value, dict) or not _absolute_path(value.get("path")) or not sha256(value.get("sha256")):
+        return False
+    if name in TOOL_ARGUMENTS:
+        return value.keys() == {"path", "sha256", "version"} and isinstance(value["version"], str) and bool(value["version"].strip())
+    return value.keys() == {"path", "sha256"}
+
+
+def _measured_profile(profile, policy, tools):
+    from .launcher import validate_runtime_versions
+
+    files = profile.get("configuration")
+    if not (profile.keys() == {"trial", "path", "configuration"} and _absolute_path(profile["path"]) and
+            isinstance(files, dict) and {"settings.json"} <= files.keys() <= {"settings.json", *PROFILE_OPTIONAL_FILES} and
+            all(sha256(checksum) for checksum in files.values()) and isinstance(policy, dict) and
+            policy.keys() == PROFILE_POLICY_FIELDS and isinstance(policy["srt_version"], str) and
+            type(policy["cleanupPeriodDays"]) is int):
+        return False
+    limits = policy["context_bytes"]
+    if not (isinstance(limits, dict) and limits.keys() == {"reader", "extractor", "reviewer", "editor"} and
+            all(type(limit) is int and limit > 0 for limit in limits.values())):
+        return False
+    try:
+        validate_runtime_versions(tools["srt"]["version"], tools["node"]["version"], policy["srt_version"])
+    except (Blocked, ValueError):
+        return False
+    return True
+
+
+def _measured_schedule(row, job, vault_id, *, trial):
+    required = {"Label", "ProgramArguments", "StartCalendarInterval", "StandardOutPath", "StandardErrorPath"}
+    if not (isinstance(row, dict) and required <= row.keys() <= required | {"EnvironmentVariables"} and
+            isinstance(row["Label"], str) and _absolute_path(row["StandardOutPath"]) and _absolute_path(row["StandardErrorPath"])):
+        return False
+    command, calendar = row["ProgramArguments"], row["StartCalendarInterval"]
+    variables = row.get("EnvironmentVariables", {"PATH": ""})
+    if not (isinstance(command, list) and len(command) >= 8 and all(isinstance(arg, str) for arg in command) and
+            command[1:7:2] == ["--vault", "--state", "--vault-id"] and command[6] == vault_id and
+            all(_absolute_path(command[index]) for index in (0, 2, 4)) and isinstance(calendar, dict) and
+            {"Hour", "Minute"} <= calendar.keys() <= {"Weekday", "Hour", "Minute"} and
+            all(type(value) is int for value in calendar.values()) and isinstance(variables, dict) and
+            variables.keys() == {"PATH"} and isinstance(variables["PATH"], str)):
+        return False
+    state = _absolute_path(command[4])
+    current = ["maintenance", "run-scheduled", job, *(["--trial"] if trial else [])]
+    legacy = ["lint"] if job == "lint" else ["maintenance", "daily"]
+    return (_absolute_path(row["StandardOutPath"]) == state / (job + ".out") and
+            _absolute_path(row["StandardErrorPath"]) == state / (job + ".err") and
+            (command[7:] == current or not trial and command[7:] == legacy))
+
+
+def _measured_schedules(values, vault_id):
+    if not (isinstance(values, list) and len(values) == len(JOBS) and
+            all(isinstance(row, dict) and isinstance(row.get("Label"), str) for row in values)):
+        return False
+    rows = {row["Label"]: row for row in values}
+    for trial in (False, True):
+        labels = {job_label(vault_id, job, trial=trial): job for job in JOBS}
+        if rows.keys() == labels.keys():
+            return all(_measured_schedule(rows[label], job, vault_id, trial=trial) for label, job in labels.items())
+    return False
+
+
 def measured_environment_shape(value):
     if not (isinstance(value, dict) and isinstance(value.get("vault_id"), str) and sha256(value.get("config_sha256"))):
         return False
@@ -163,13 +240,31 @@ def measured_environment_shape(value):
         measurement = value.get(name)
         if not isinstance(measurement, dict) or not all(isinstance(measurement.get(field), str) for field in fields):
             return False
+    try:
+        if str(UUID(value["vault_id"])) != value["vault_id"]:
+            return False
+    except ValueError:
+        return False
+    profile = value["profile"]
+    trial = profile["trial"]
     tools = value.get("tools")
-    return sha256(value["controller"].get("sha256")) and isinstance(tools, dict) and bool(tools) and all(
-        isinstance(tool, dict) and isinstance(tool.get("path"), str) and sha256(tool.get("sha256")) and
-        (name not in TOOL_ARGUMENTS or isinstance(tool.get("version"), str)) for name, tool in tools.items())
+    required = {*text_fields, "vault_id", "config_sha256", "tools"}
+    if not (trial in TRIAL_TOOLS and value["controller"].keys() == {"version", "sha256"} and
+            sha256(value["controller"]["sha256"]) and value["platform"].keys() == set(text_fields["platform"]) and
+            value["platform"]["system"] == "Darwin" and value["python"].keys() == set(text_fields["python"]) and
+            _absolute_path(value["python"]["command"]) and isinstance(tools, dict) and
+            tools.keys() == set(TRIAL_TOOLS[trial]) and all(_measured_tool(name, tool) for name, tool in tools.items())):
+        return False
+    if trial in PROFILE_TRIALS:
+        return value.keys() == required | {"policy"} and _measured_profile(profile, value["policy"], tools)
+    if profile.keys() != {"trial"}:
+        return False
+    if trial == "launchd":
+        return value.keys() == required | {"schedules"} and _measured_schedules(value["schedules"], value["vault_id"])
+    return value.keys() == required
 
 
-def check_preserved_evidence(payload, name, vault_id, *, versioned):
+def check_preserved_evidence(payload, name, *, versioned):
     require(isinstance(payload, dict) and name in TRIALS and payload.get("name") == name,
             "Trial evidence has an invalid name", 5)
     if not versioned:
@@ -192,13 +287,14 @@ def check_preserved_evidence(payload, name, vault_id, *, versioned):
         sha256(artifact.get("sha256")) for artifact in artifacts), "Invalid trial artifact inventory", 5)
     if versioned:
         measured = payload.get("environment")
-        require(payload.get("format") == TRIAL_FORMAT and isinstance(measured, dict) and measured.get("vault_id") == vault_id,
-                "Trial receipt has the wrong format or source vault identity", 5)
+        require(payload.get("format") == TRIAL_FORMAT, "Trial receipt has the wrong format", 5)
         require(measured_environment_shape(measured) and measured["profile"]["trial"] == name,
                 "Invalid measured trial environment", 5)
-        paths = [artifact["path"] for artifact in artifacts]
-        require(len(set(paths)) == len(paths) and all(PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
-                                                     for path in paths), "Invalid measured trial artifact paths", 5)
+        requested = payload.get("profile")
+        require(requested is None or name in PROFILE_TRIALS and _absolute_path(requested) == _absolute_path(measured["profile"]["path"]),
+                "Invalid measured trial profile", 5)
+        paths = [_absolute_path(artifact["path"]) for artifact in artifacts]
+        require(None not in paths and len(set(paths)) == len(paths), "Invalid measured trial artifact paths", 5)
 
 
 def attest(vault, name, evidence):

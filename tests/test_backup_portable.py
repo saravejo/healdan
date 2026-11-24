@@ -5,12 +5,14 @@ import os
 from pathlib import Path
 import stat
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest, controller_environment
 from healdan import admission, backup_recovery, backup_snapshot, backups, binding, compatibility, custody, inbox, maintenance, retention, storage_policy, tasks, trials
 from healdan.core import Blocked, Vault, atomic, canonical, decode, digest, git, read_json, run, stamp, utc
+from healdan.setup import initialize
 from healdan.signing import envelope, human_sign
 
 
@@ -1114,19 +1116,24 @@ class BackupPortable(VaultTest):
         self.assertEqual(closed["presented_at"], waiting["presented_at"])
         self.assertFalse(closed["capacity_held"])
 
-    def trial_evidence(self, name):
+    def trial_evidence(self, name, *, vault=None):
+        vault = self.vault if vault is None else vault
         artifact = self.base / "origin-only trial artifact.json"
         atomic(artifact, {"fixture": "historical artifact body"})
         evidence = {"platform": "Darwin", "passed": True, "procedure": "Disposable fixture",
                     "started_at": "2026-06-01T00:00:00Z", "completed_at": "2026-06-01T00:01:00Z",
                     "artifacts": [{"path": str(artifact), "sha256": digest(artifact.read_bytes())}]}
-        measurements = {"vault_id": self.vault.identity, "controller": {"version": "fixture", "sha256": "b" * 64},
-                        "profile": {"trial": name}, "platform": {"system": "Darwin", "release": "25.0.0",
-                        "machine": "arm64", "version": "26.0"},
-                        "python": {"command": str(self.base / "origin-python"), "version": "3.12.10"},
-                        "tools": {tool: {"path": str(self.base / tool), "sha256": digest(tool), "version": "fixture"}
-                                  for tool in ("age", "git", "ssh", "ssh-keygen")},
-                        "config_sha256": "a" * 64}
+        build = SimpleNamespace(identity={"version": "fixture", "sha256": "b" * 64}, entry_point=Path(sys.executable))
+
+        def tool(tool_name):
+            result = {"path": str(self.base / tool_name), "sha256": digest(tool_name)}
+            if tool_name in trials.TOOL_ARGUMENTS:
+                result["version"] = {"srt": vault.policy["srt_version"], "node": "v22.12.0"}.get(tool_name, "fixture")
+            return result
+
+        with patch("healdan.trials.platform.system", return_value="Darwin"), \
+             patch("healdan.trials._tool", side_effect=tool):
+            measurements = trials.environment(vault, name, build=build)
         return artifact, evidence, measurements
 
     def test_1_native_trial_receipts_survive_as_inactive_history(self):
@@ -1269,18 +1276,19 @@ class BackupPortable(VaultTest):
         self.configure()
         qa = {"identity": "fixture identity", "namespace": "local label", "signature": "artifact description"}
         receipt_bytes, nominal_bytes = {}, {}
-        for name in ("native-resume", "native-cleanup", "offline-recovery"):
+        for name in trials.TRIALS:
             _, evidence, measured = self.trial_evidence(name)
-            common = {**evidence, "name": name, "commit": self.vault.head(), "qa": qa}
-            if name == "native-resume":
-                legacy = {**common, "versions": ["age"], "environment": {"vault_id": "legacy-audit-value"}}
-            elif name == "native-cleanup":
-                legacy = {**common, "versions": "fixture", "procedure": {"steps": ["Disposable fixture"]},
-                          "environment": {"vault_id": self.vault.identity},
-                          "artifacts": [{**evidence["artifacts"][0], "role": "recorded rehearsal"}]}
-            else:
-                legacy = {**common, "versions": {"age": "fixture"},
-                          "environment": {**measured, "python": {"version": ["legacy evidence"], "command": False}}}
+            common = {**evidence, "name": name, "commit": self.vault.head(), "qa": qa, "versions": {"age": "fixture"}}
+            artifact = evidence["artifacts"][0]
+            variant = {
+                "claude-auth": {"environment": {**measured, "profile": {"trial": name}, "policy": {}}},
+                "native-resume": {"versions": ["age"], "environment": {"vault_id": "legacy-audit-value"}},
+                "native-cleanup": {"versions": "fixture", "procedure": {"steps": ["Disposable fixture"]},
+                                   "artifacts": [{**artifact, "role": "recorded rehearsal"}]},
+                "offline-recovery": {"artifacts": [artifact, {**artifact, "role": "second evidence entry"}]},
+                "launchd": {"environment": {**measured, "schedules": []}},
+            }[name]
+            legacy = {**common, "environment": measured, **variant}
             older = human_sign(self.vault, {**legacy, "format": trials.TRIAL_FORMAT}, "trial")
             nominal = self.vault.control / "trials" / f"{name}.json"
             atomic(nominal, older)
@@ -1292,12 +1300,21 @@ class BackupPortable(VaultTest):
             self.assertNotEqual(read_json(nominal), older)
             nominal_bytes[f"trials/{name}.json"] = nominal.read_bytes()
 
-        with patch("healdan.trials.environment", return_value=measured):
-            measured_approval = trials.attest(self.vault, name, {**evidence, "environment": measured})
-        (self.vault.control / "trials/v2" / f"{name}.json").unlink()
-        measured_mirror, = [path for path in (self.vault.control / "receipts").glob("*.json")
-                            if read_json(path).get("payload") == measured_approval]
-        receipt_bytes[measured_mirror.name] = measured_mirror.read_bytes()
+            measurements = [measured]
+            if name == "launchd":
+                historical = deepcopy(measured)
+                for row in historical["schedules"]:
+                    job = row["ProgramArguments"][9]
+                    row["ProgramArguments"][7:] = ["lint"] if job == "lint" else ["maintenance", "daily"]
+                    row.pop("EnvironmentVariables")
+                measurements.append(historical)
+            for measurement in measurements:
+                with patch("healdan.trials.environment", return_value=measurement):
+                    measured_approval = trials.attest(self.vault, name, {**evidence, "environment": measurement})
+                (self.vault.control / "trials/v2" / f"{name}.json").unlink()
+                measured_mirror, = [path for path in (self.vault.control / "receipts").glob("*.json")
+                                    if read_json(path).get("payload") == measured_approval]
+                receipt_bytes[measured_mirror.name] = measured_mirror.read_bytes()
 
         record = self.create()
         plain = custody.decrypt(self.vault, self.paths(record)[1].read_bytes())
@@ -1314,9 +1331,16 @@ class BackupPortable(VaultTest):
             self.assertFalse((recovered.control / relative).exists())
         self.assertFalse(any(row["passed"] for row in trials.status(recovered)))
 
-        foreign_payload = {**common, "format": trials.TRIAL_FORMAT, "versions": {"age": "fixture"},
-                           "environment": {**measured, "vault_id": str(uuid4())}}
-        unrelated = self.signed(foreign_payload, "trial")
+        foreign_root, foreign_state = self.base / "foreign", self.base / "foreign-state"
+        initialize(foreign_root, foreign_state)
+        foreign = Vault(foreign_root, foreign_state)
+        foreign.config.update(self.vault.config)
+        atomic(foreign.config_path, foreign.config)
+        name = "offline-recovery"
+        _, evidence, measured = self.trial_evidence(name, vault=foreign)
+        with patch("healdan.trials.environment", return_value=measured):
+            unrelated = trials.attest(foreign, name, {**evidence, "commit": self.vault.head(), "versions": {"age": "fixture"},
+                                                      "environment": measured})
         forged = {**older, "signature": "Invalid SSH fixture"}
         inventory = custody.materials(self.vault)
         files = sorted(self.destinations[0].iterdir())
@@ -1342,15 +1366,20 @@ class BackupPortable(VaultTest):
         approved = self.signed(payload, "trial")
         wrong_measurement = {**measured, "python": {"command": 0, "version": "3.12.10"}}
         legacy_extras = {"commit": self.vault.head(), "versions": {"age": "fixture"}}
+        missing_tool = {tool: value for tool, value in measured["tools"].items() if tool != "age"}
+        unrelated_tool = {**missing_tool, "other-tool": measured["tools"]["age"]}
         path = self.vault.control / f"trials/v2/{name}.json"
         for value, reason in (
             ({"payload": payload}, "Invalid signed trial receipt"),
             (self.signed({**payload, "name": "launchd"}, "trial"), "invalid name"),
             (self.signed({**payload, "environment": {**measured, "vault_id": str(uuid4())}}, "trial"), "source vault"),
             (self.signed({**payload, **legacy_extras, "environment": wrong_measurement}, "trial"), "measured trial environment"),
+            (self.signed({**payload, "environment": {**measured, "tools": missing_tool}}, "trial"), "measured trial environment"),
+            (self.signed({**payload, "environment": {**measured, "tools": unrelated_tool}}, "trial"), "measured trial environment"),
             (self.signed({**payload, "procedure": {"steps": ["Disposable"]}}, "trial"), "a procedure"),
             (self.signed({**payload, "procedure": " \t"}, "trial"), "a procedure"),
             (self.signed({**payload, "artifacts": [{"path": "/origin/fixture", "sha256": "invalid"}]}, "trial"), "artifact inventory"),
+            (self.signed({**payload, **legacy_extras, "artifacts": evidence["artifacts"] * 2}, "trial"), "measured trial artifact paths"),
             (self.signed({**payload, "completed_at": "2026-01-01T00:00:00Z"}, "trial"), "Invalid trial times"),
             ({**approved, "payload": {**payload, "procedure": "Changed evidence"}}, "Signed payload was changed"),
         ):

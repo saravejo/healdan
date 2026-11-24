@@ -593,13 +593,22 @@ def check_trial_receipt(name, receipt, source_vault, signers, proven, expected=N
             "Invalid signed trial receipt: " + name, 5)
     payload = receipt["payload"]
     require(isinstance(payload, dict), "Invalid signed trial payload: " + name, 5)
-    if expected is None:
-        # Without a matching nominal record, only the complete measured shape identifies v2.
-        versioned = payload.get("format") == trials.TRIAL_FORMAT and trials.measured_environment_shape(payload.get("environment"))
-        expected = payload.get("name"), versioned
-    trial, versioned = expected
     try:
-        trials.check_preserved_evidence(payload, trial, source_vault, versioned=versioned)
+        if expected is None and payload.get("format") == trials.TRIAL_FORMAT:
+            # Classify the signed evidence before checking the vault binding.
+            trial = payload.get("name")
+            try:
+                trials.check_preserved_evidence(payload, trial, versioned=True)
+            except (Blocked, ValueError, OverflowError):
+                versioned = False
+                trials.check_preserved_evidence(payload, trial, versioned=False)
+            else:
+                versioned = True
+        else:
+            trial, versioned = expected if expected is not None else (payload.get("name"), False)
+            trials.check_preserved_evidence(payload, trial, versioned=versioned)
+        if versioned:
+            require(payload["environment"]["vault_id"] == source_vault, "Trial receipt has the wrong source vault identity", 5)
     except (Blocked, ValueError, OverflowError) as exc:
         raise Blocked(f"Invalid historical trial receipt {name}: {exc}", 5) from exc
     token = digest(receipt)
