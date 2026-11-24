@@ -101,6 +101,40 @@ class SourcePolicy(VaultTest):
         self.assertIn("C-0001", " ".join(preview["pending_evidence"][0]["reasons"]))
         self.assertEqual(self.vault.rows(transactions.LEDGER), [approval, legacy_approval])
 
+    def test_unmerged_page_ancestry_cannot_supply_claim_revisions(self):
+        side_evidence = self.capture("side.txt", b"Synthetic evidence on the side")
+        main_evidence = self.capture("main.txt", b"Synthetic evidence on the main history")
+        git(self.root, "add", "--", "resources/sources")
+        git(self.root, "commit", "-m", "Preserve both observations")
+        side = self.base / "side worktree"
+        git(self.root, "worktree", "add", "-b", "side-history", side, "HEAD")
+        name = "wiki/topics/instrument.md"
+        body = b'<!-- healdan:current:start -->\n<a id="C-0001"></a>\n<!-- healdan:current:end -->\n'
+        side_claim = self.claim_for([side_evidence])
+        atomic(side / name, body)
+        atomic(side / "wiki/claims.jsonl", jsonl([side_claim]))
+        git(side, "add", "--", "wiki")
+        git(side, "commit", "-m", "Publish side-only legacy page ancestry")
+        main_head = self.vault.head()
+        copied = self.capture("copied-page.md", body)
+        self.assertEqual(copied["origin"]["kind"], "wiki")
+        self.assertEqual(copied["origin"]["pages"], [])
+        claim = self.claim_for([copied], id="C-0002", entity="copied-page", minimum_observations=1)
+        self.knowledge([side_claim, claim])
+        result = query(self.vault, {"entity": "copied-page"}, CUT)
+        self.assertEqual(result["code"], 20, result)
+        self.assertIn("lacks verified claim lineage", " ".join(result["diagnostics"]))
+        self.assertEqual(self.vault.head(), main_head)
+
+        main_claim = self.claim_for([main_evidence])
+        self.knowledge([main_claim, claim])
+        atomic(self.root / name, body)
+        git(self.root, "add", "--", "wiki", "resources/sources", "control/approvals")
+        git(self.root, "commit", "-m", "Publish the same legacy page bytes with main ancestry")
+        result = query(self.vault, {"entity": "copied-page"}, CUT)
+        self.assertEqual(result["code"], 0, result)
+        self.assertEqual(result["observations"], [main_evidence["sha256"]])
+
     def test_two_conversions_share_one_observation(self):
         root = self.capture("original.txt", b"This is a unique observation\r\n")
         first = self.capture("normalization.txt", b"This is a unique observation\n", [root])

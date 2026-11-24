@@ -2,6 +2,7 @@
 from datetime import timedelta
 import os
 from pathlib import Path
+import stat
 
 from . import admission, custody
 from .core import Blocked, atomic, canonical_storage_path, digest, read_json, require, safe_path, stamp, sync_directory, utc
@@ -110,23 +111,37 @@ def decide(vault, sha256, decision, *, owner, classification, entered_at=None, e
         return item
 
 
+def worktree_roots(vault):
+    return {root for root in vault.repository.worktree_roots() if (root / ".git").exists()}
+
+
+def archive_destination_verified(vault, root, destination, records, sha, archived_at):
+    target = safe_path(root, destination)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return custody.verified_archive_deletion(vault, records, target, sha, archived_at)
+    return stat.S_ISREG(info.st_mode) and info.st_size == 0 and digest(target.read_bytes()) == sha
+
+
 def archive_complete(vault, item):
     sha = item["sha256"]
     paths = set(item["paths"])
     if not paths or sha != digest(b""):
         return False
-    pending = read_json(safe_path(vault.control, ARCHIVE_JOURNAL), {})
-    for path in paths:
-        move = pending.get(path)
-        if move and ("worktree" not in move or vault.relocated_path(move["worktree"]) == vault.root):
-            return False
-        try:
-            safe_path(vault.root, path).lstat()
-            return False
-        except FileNotFoundError:
-            pass
-        except (Blocked, OSError):
-            return False
+    if paths & read_json(safe_path(vault.control, ARCHIVE_JOURNAL), {}).keys():
+        return False
+    roots = worktree_roots(vault)
+    for root in roots:
+        for path in paths:
+            try:
+                safe_path(root, path).lstat()
+                return False
+            except FileNotFoundError:
+                pass
+            except (Blocked, OSError):
+                return False
+    records = custody.materials(vault).values()
     archived = set()
     for identifier in item.get("receipts", []):
         if not admission.sha256(identifier):
@@ -137,10 +152,26 @@ def archive_complete(vault, item):
         payload = value.get("payload", {})
         if not isinstance(payload, dict):
             continue
-        source = payload.get("source")
-        if (isinstance(source, str) and source in paths and payload.get("sha256") == sha and payload.get("size") == 0 and
-                payload.get("destination") == f"archive/{sha}/{Path(source).name}"):
-            archived.add(source)
+        source, destination = payload.get("source"), payload.get("destination")
+        if not (isinstance(source, str) and source in paths and isinstance(destination, str) and
+                payload.get("sha256") == sha and payload.get("size") == 0 and
+                destination.replace("\\", "/") == f"archive/{sha}/{Path(source).name}"):
+            continue
+        destination = destination.replace("\\", "/")
+        bound_root = payload.get("worktree")
+        try:
+            candidates = roots if bound_root is None else roots & {vault.relocated_path(bound_root)}
+            owned = {root: custody.archived_origin_records(vault, records, safe_path(root, source), sha, identifier)
+                     for root in candidates}
+            if bound_root is None:
+                candidates = {root for root, links in owned.items() if links} or candidates
+            proven = [root for root in candidates if archive_destination_verified(
+                vault, root, destination, owned[root], sha, value["at"])]
+        except (Blocked, OSError, KeyError, TypeError, ValueError):
+            return False
+        if len(proven) != 1:
+            return False
+        archived.add(source)
     return archived == paths
 
 
@@ -214,10 +245,15 @@ def archive_empty(vault, sha256):
             payload = {"source": relative, "destination": target_name, "sha256": sha256, "size": 0}
             move = pending.get(relative)
             if move is None:
-                move = {"at": stamp(), "payload": payload, "worktree": str(vault.root)}
+                move = {"at": stamp(), "payload": {**payload, "worktree": str(vault.root)}, "worktree": str(vault.root)}
                 pending[relative] = move
                 atomic(journal_path, pending)
-            require(move["payload"] == payload, "Archive journal differs from the requested move", 5)
+            # A legacy journal may already have recorded the receipt using this exact payload.
+            frozen = move["payload"]
+            require(frozen == payload or ("worktree" in frozen and frozen == {**payload, "worktree": frozen["worktree"]} and
+                    vault.relocated_path(frozen["worktree"]) == vault.root),
+                    "Archive journal differs from the requested move", 5)
+            payload = frozen
             receipt_fields = {"at": move["at"], "payload": payload}
             receipt_id = digest({"kind": "zero-byte-archive", **receipt_fields})
             if receipt_id not in item["receipts"]:

@@ -124,7 +124,7 @@ class PageHistory:
             return pages
         oid = git_bytes(root, "hash-object", "--no-filters", "--stdin", data=body).strip()
         if self.history_trees is None:
-            commits = git(root, "log", "--reverse", "--full-history", "--format=%H", "--all", head, "--", "wiki").splitlines()
+            commits = git(root, "log", "--reverse", "--full-history", "--format=%H", head, "--", "wiki").splitlines()
             self.history_trees = [(commit, git_bytes(root, "ls-tree", "-rz", commit, "--", "wiki").split(b"\0")[:-1])
                                   for commit in commits]
         seen = set()

@@ -6,7 +6,7 @@ import re
 from .core import Blocked, atomic, digest, read_json, require, stamp, utc
 from .custody import INACTIVE_COPIES, materials, retention_deadline, validate_purpose
 from .ids import inventory as id_inventory
-from .inbox import findings as inbox_findings, ordinary
+from .inbox import findings as inbox_findings, ordinary, worktree_roots
 from .knowledge import Knowledge
 from .pages import validate_pages
 from .regression import suite
@@ -45,10 +45,11 @@ def collect(vault, now=None):
         for message in inbox_findings(item, now, vault=vault):
             add("inbox", item["sha256"] + ":" + message, message)
     known = {p for i in items.values() for p in i["paths"]}
-    for path in (vault.root / "inbox").rglob("*"):
-        relative = path.relative_to(vault.root).as_posix()
-        if path.is_file() and ordinary(relative) and relative not in known:
-            add("inbox", relative, "File has no triage inventory")
+    for root in sorted(worktree_roots(vault)):
+        for path in (root / "inbox").rglob("*"):
+            relative = path.relative_to(root).as_posix()
+            if path.is_file() and ordinary(relative) and relative not in known:
+                add("inbox", relative, "File has no triage inventory")
     for task in all_tasks(vault):
         if task.get("capacity_held") and age_status(task, now) != "active":
             add("worktrees", task["id"], age_status(task, now))

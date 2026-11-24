@@ -29,7 +29,7 @@ def copy_path(vault, copy):
 
 
 def copy_identity(copy):
-    state = {"status", "deleted_at", "moved_at", "move_receipt"}
+    state = {"status", "deleted_at", "moved_at", "move_receipt", "verified_archive_sha256"}
     return {key: value for key, value in copy.items() if key not in state}
 
 
@@ -131,6 +131,8 @@ def execute(vault, identifier, now=None):
                 present = target.exists()
                 if present:
                     require(digest(target.read_bytes()) == copy["sha256"], "Copy hash changed; deletion stopped", 5)
+                    if copy["kind"] == "archive":
+                        entry["verified_archive_sha256"] = copy["sha256"]
                 # Reserve the path until custody records the deletion, even if the file is already absent.
                 entry["status"] = "deleting"
                 atomic(path, record)
@@ -139,6 +141,8 @@ def execute(vault, identifier, now=None):
                 require(not target.exists(), "Copy still exists after deletion", 5)
                 copy["status"] = "deleted"
                 copy["deleted_at"] = stamp(now)
+                if entry.get("verified_archive_sha256") == copy["sha256"]:
+                    copy["verified_archive_sha256"] = copy["sha256"]
                 save_material(vault, material)
                 entry.update(status="deleted", at=stamp(now))
                 entry.pop("error", None)

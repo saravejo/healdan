@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from support import VaultTest
 from healdan import admission, backups, custody, inbox, linting, originals, pages, retention, setup, tasks, transactions
-from healdan.core import Blocked, atomic, digest, git, git_bytes, jsonl, read_json, run, stamp, utc
+from healdan.core import Blocked, Vault, atomic, digest, git, git_bytes, jsonl, read_json, run, stamp, utc
 from healdan.ids import reserve
 from healdan.knowledge import Knowledge, query
 
@@ -43,6 +43,13 @@ class OriginalAdmission(VaultTest):
         record["copies"].append({"root": str(self.root / "inbox"), "path": relative.removeprefix("inbox/"),
                                  "kind": "export", "status": "present", "sha256": digest(b"")})
         custody.save_material(self.vault, record)
+
+    def defer_empty(self, path):
+        atomic(self.root / path, b"")
+        inbox.inventory(self.vault)
+        return inbox.decide(self.vault, digest(b""), "defer", owner="human", classification="common",
+                            entered_at="2026-04-01T00:00:00Z", entry_origin="Original fixture evidence",
+                            defer_until=utc() + timedelta(hours=1))
 
     def source_proposal(self, body):
         identifier, = reserve(self.vault, "F", 1, str(uuid4()))
@@ -134,9 +141,16 @@ class OriginalAdmission(VaultTest):
             inbox.archive_empty(self.vault, key)
         self.assertEqual(destination.read_bytes(), b"")
         self.assertTrue((self.root / name).exists())
+        journal_path = self.vault.control / inbox.ARCHIVE_JOURNAL
+        pending = read_json(journal_path)
+        legacy = pending[name]
+        del legacy["payload"]["worktree"]
+        atomic(journal_path, pending)
         inbox.archive_empty(self.vault, key)
         self.assertFalse((self.root / name).exists())
-        self.assertEqual(len(self.archive_receipts()), 1)
+        self.assertEqual(self.archive_receipts(), [legacy["payload"]])
+        legacy_receipt = digest({"kind": "zero-byte-archive", "at": legacy["at"], "payload": legacy["payload"]})
+        self.assertTrue((self.vault.control / "receipts" / (legacy_receipt + ".json")).is_file())
 
     def test_reclassified_empty_copies_keep_signed_decision_and_custody_on_resume(self):
         first, second = "inbox/a/nota.txt", "inbox/b/nota.txt"
@@ -320,12 +334,8 @@ class OriginalAdmission(VaultTest):
 
     def test_lint_uses_completed_archive_receipts_until_an_inbox_path_reappears(self):
         first, second = "inbox/a/first.txt", "inbox/b/second.txt"
-        atomic(self.root / first, b"")
-        inbox.inventory(self.vault)
-        sha = digest(b"")
-        captured = "2026-04-01T00:00:00Z"
-        deferred = inbox.decide(self.vault, sha, "defer", owner="human", classification="common", entered_at=captured,
-                                entry_origin="Original fixture evidence", defer_until=utc() + timedelta(hours=1))
+        deferred = self.defer_empty(first)
+        sha = deferred["sha256"]
         receipt = self.vault.control / "receipts" / (deferred["decision_receipt"] + ".json")
         original = receipt.read_bytes()
         now = utc() + timedelta(days=8)
@@ -350,6 +360,119 @@ class OriginalAdmission(VaultTest):
         for field in ("classification", "decision", "decision_receipt", "decided_at", "defer_until", "entered_at"):
             self.assertEqual(stored[field], deferred[field])
         self.assertEqual(receipt.read_bytes(), original)
+
+    def test_lint_keeps_followup_open_for_pending_linked_inbox_paths(self):
+        relative = "inbox/a/linked.txt"
+        deferred = self.defer_empty(relative)
+        sha = deferred["sha256"]
+        linked = self.base / "linked vault"
+        git(self.root, "worktree", "add", "--detach", linked, "HEAD")
+        linked_vault = Vault(linked, self.state)
+        now = utc() + timedelta(days=8)
+        expected = {"original_triage_overdue", "deferral_due"}
+
+        def lint(vault, messages, followup):
+            record = linting.lint(vault, now)
+            self.assertEqual(record["status"], "complete", record["errors"])
+            self.assertEqual({f["message"] for f in record["findings"].values() if f["category"] == "inbox"}, messages)
+            self.assertEqual(read_json(vault.control / "followups.json")["inbox"]["state"], followup)
+
+        lint(self.vault, expected, "open")
+        inbox.archive_empty(self.vault, sha)
+        lint(linked_vault, set(), "resolved")
+        atomic(linked / relative, b"")
+        atomic(linked / "inbox/uninventoried.txt", b"New synthetic material")
+        lint(self.vault, expected | {"File has no triage inventory"}, "open")
+        (linked / "inbox/uninventoried.txt").unlink()
+        inbox.inventory(linked_vault)
+        lint(linked_vault, expected, "open")
+        lint(self.vault, expected, "open")
+        self.assertEqual((linked / relative).read_bytes(), b"")
+        inbox.archive_empty(linked_vault, sha)
+        lint(self.vault, set(), "resolved")
+        self.assertEqual({row["worktree"] for row in self.archive_receipts()}, {str(self.root), str(linked)})
+
+        target = f"archive/{sha}/linked.txt"
+        (self.root / target).unlink()
+        lint(linked_vault, expected, "open")
+        self.assertEqual((linked / target).read_bytes(), b"")
+        atomic(self.root / target, b"")
+        lint(self.vault, set(), "resolved")
+
+    def test_lint_requires_archive_bytes_or_verified_retention_deletion(self):
+        relative = "inbox/first.txt"
+        deferred = self.defer_empty(relative)
+        sha = deferred["sha256"]
+        self.expiring_export("deferred-inbox", (self.root / "inbox", "first.txt", "export"))
+        now = utc() + timedelta(days=8)
+        expected = {"original_triage_overdue", "deferral_due"}
+        target = self.root / f"archive/{sha}/first.txt"
+
+        def findings(messages):
+            found, errors = linting.collect(self.vault, now)
+            self.assertEqual(errors, [])
+            self.assertEqual({row["message"] for row in found.values() if row["category"] == "inbox"}, messages)
+
+        completed = inbox.archive_empty(self.vault, sha)
+        receipt = self.vault.control / "receipts" / (completed["archive_moves"][0]["receipt"] + ".json")
+        original_receipt = receipt.read_bytes()
+        findings(set())
+        target.unlink()
+        findings(expected)
+        atomic(target, b"Changed synthetic destination")
+        findings(expected)
+        atomic(target, b"")
+        findings(set())
+
+        plan = retention.plan(self.vault, now)
+        save = retention.save_material
+
+        def stop_before_record(vault, record):
+            if not target.exists():
+                raise RuntimeError("Interrupted before saving the verified deletion")
+            return save(vault, record)
+
+        with patch("healdan.retention.save_material", side_effect=stop_before_record), self.assertRaisesRegex(RuntimeError, "Interrupted"):
+            retention.execute(self.vault, plan["id"], now)
+        self.assertFalse(target.exists())
+        findings(expected)
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        findings(set())
+        self.assertEqual(receipt.read_bytes(), original_receipt)
+
+        second = "inbox/second.txt"
+        atomic(self.root / second, b"")
+        inbox.inventory(self.vault)
+        self.track_empty_copy("deferred-inbox", second)
+        inbox.archive_empty(self.vault, sha)
+        (self.root / f"archive/{sha}/second.txt").unlink()
+        plan = retention.plan(self.vault, now)
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        findings(expected)
+
+    def test_legacy_archive_receipt_accepts_unique_verified_destination(self):
+        relative = "inbox/legacy.txt"
+        deferred = self.defer_empty(relative)
+        sha = deferred["sha256"]
+        destination = f"archive/{sha}/legacy.txt"
+        atomic(self.root / destination, b"")
+        identifier = self.vault.receipt("zero-byte-archive", {"source": relative, "destination": destination.replace("/", "\\"),
+                                                              "sha256": sha, "size": 0})
+        receipt = self.vault.control / "receipts" / (identifier + ".json")
+        original_receipt = receipt.read_bytes()
+        (self.root / relative).unlink()
+        journal = self.vault.control / "inbox.json"
+        items = read_json(journal)
+        items[sha]["receipts"].append(identifier)
+        atomic(journal, items)
+        linked = self.base / "linked vault"
+        git(self.root, "worktree", "add", "--detach", linked, "HEAD")
+        self.assertTrue(inbox.archive_complete(self.vault, items[sha]))
+        atomic(linked / destination, b"")
+        self.assertFalse(inbox.archive_complete(self.vault, items[sha]))
+        (linked / destination).unlink()
+        self.assertTrue(inbox.archive_complete(self.vault, items[sha]))
+        self.assertEqual(receipt.read_bytes(), original_receipt)
 
     def test_stale_deleted_copy_plan_preserves_reused_archive_destination(self):
         first = "inbox/a/nota.txt"
