@@ -105,21 +105,11 @@ def reconcile_copies(archive, contents, records, state, control, journal, remaps
                if entry["kind"] == "knowledge" and snapshot.originals.source_path(name)}
     pending = []
     for key, record in inventory.items():
-        portable = snapshot.portable_backup_record(record)
         local = []
+        record["copies"] = snapshot.project_material_copies(record)
         for index, copy in enumerate(record["copies"]):
-            try:
-                snapshot.check_material_copy(key, copy)
-                if record["kind"] == "backup":
-                    require(copy["kind"] == "ciphertext", "Invalid backed-up replica kind: " + key, 5)
-                if portable:
-                    require(copy["path"] == key + ".age" and copy.get("manifest") == key + ".manifest.json" and
-                            copy["status"] in ("planned", "present", "deleted", "absent", "unavailable"),
-                            "Invalid backed-up replica location: " + key, 5)
-            except Blocked as exc:
-                reason = copy.get("inventory_error") if isinstance(copy, dict) else None
-                reason = reason if isinstance(reason, str) and reason else str(exc)
-                record["copies"][index] = {"status": "unavailable", "kind": None, "inventory_error": reason}
+            reason = snapshot.material_copy_error(copy)
+            if reason:
                 pending.append({"material": key, "copy_index": index, "status": "invalid", "reason": reason})
                 continue
             copy.setdefault("origin_status", copy["status"])

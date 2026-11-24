@@ -466,6 +466,35 @@ def check_material_copy(key, copy):
     portable_path(copy.get("path"), historical=True)
 
 
+def material_copy_error(copy):
+    if isinstance(copy, dict) and copy.get("status") == "unavailable" and copy.get("kind") is None:
+        reason = copy.get("inventory_error")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
+def project_material_copies(record):
+    key = record["id"]
+    portable = portable_backup_record(record)
+    projected = []
+    for copy in record["copies"]:
+        try:
+            check_material_copy(key, copy)
+            if record["kind"] == "backup":
+                require(copy["kind"] == "ciphertext", "Invalid backed-up replica kind: " + key, 5)
+            if portable:
+                require(copy["path"] == key + ".age" and copy.get("manifest") == key + ".manifest.json" and
+                        copy["status"] in ("planned", "present", "deleted", "absent", "unavailable"),
+                        "Invalid backed-up replica location: " + key, 5)
+        except Blocked as exc:
+            projected.append({"status": "unavailable", "kind": None,
+                              "inventory_error": material_copy_error(copy) or str(exc)})
+        else:
+            projected.append(copy)
+    return projected
+
+
 def check_materials(inventory):
     # The raw catalog is kept as evidence. Selected and recovered copies are checked before use.
     for key, record in inventory.items():
@@ -649,11 +678,11 @@ def check_snapshot(plain, manifest, signers, backup_signers, *, temporary_root=N
         frozen = canonical_tree(scratch, archive["git"]["head"])
         require(frozen == {name: (entry["mode"], contents[name]) for name, entry in archive["files"].items()
                           if entry["kind"] == "knowledge"}, "Snapshot knowledge differs from the frozen commit", 5)
-        check_knowledge(scratch, archive, frozen, contents, signers, backup_signers)
+        check_knowledge(scratch, archive, frozen, contents, records["materials.json"], signers, backup_signers)
     return archive, contents, records
 
 
-def check_knowledge(root, archive, frozen, contents, signers, backup_signers):
+def check_knowledge(root, archive, frozen, contents, materials, signers, backup_signers):
     from . import storage_policy
     from .knowledge import Knowledge
 
@@ -661,9 +690,11 @@ def check_knowledge(root, archive, frozen, contents, signers, backup_signers):
     for name, (_, data) in frozen.items():
         atomic(safe_path(root, name), data)
     records = records_from(contents)
-    for name in ("inbox.json", "materials.json", "storage-policy.json", "source-classification.json"):
+    for name in ("inbox.json", "storage-policy.json", "source-classification.json"):
         if name in records:
             atomic(safe_path(control, name), records[name])
+    projected = {key: {**record, "copies": project_material_copies(record)} for key, record in materials.items()}
+    atomic(safe_path(control, "materials.json"), projected)
     for name, data in records.items():
         if name.startswith("receipts/"):
             atomic(safe_path(control, name), data)

@@ -368,12 +368,22 @@ class BackupPortable(VaultTest):
         self.assertEqual([row["status"] for row in report["replicas"]], ["unavailable", "verified", "invalid"])
         self.assertIn("duplicates a verified publication slot", report["replicas"][2]["reason"])
 
-        conflicting = {**record, "copies": [first, second, {**first, "status": "unavailable"}]}
+        conflicting = {**record, "copies": [{**first, "status": "unavailable"}, second, first]}
         custody.save_material(self.vault, conflicting)
-        report = backups.verify_backup(self.vault, identifier)
-        self.assertEqual(report["replica"], str(self.paths(record, 1)[1]))
-        self.assertEqual([row["status"] for row in report["replicas"]], ["invalid", "verified", "invalid"])
-        self.assertTrue(all("conflicting catalog entries" in report["replicas"][index]["reason"] for index in (0, 2)))
+        offline = self.destinations[1].rename(self.base / "offline-conflicting-slot")
+        try:
+            report = backups.verify_backup(self.vault, identifier)
+            restored = backups.restore(self.vault, identifier, self.base / "conflicting-restore")
+            for result in (report, restored):
+                self.assertEqual(result["replica"], str(self.paths(record)[1]))
+                self.assertEqual(len(result["copies"]), 1)
+                self.assertEqual([(row["copy_index"], row["status"]) for row in result["replicas"]],
+                                 [(0, "invalid"), (1, "unavailable"), (0, "verified")])
+                self.assertIn("conflicting catalog entries", result["replicas"][0]["reason"])
+            with self.assertRaisesRegex(Blocked, "replica count"):
+                backups.inspect_backup(self.vault, conflicting, decrypt_replicas=True)
+        finally:
+            offline.rename(self.destinations[1])
 
         scheduled = maintenance.backup_round(self.vault, now + timedelta(minutes=1))
         self.assertEqual(scheduled["status"], "complete", scheduled)
@@ -412,6 +422,46 @@ class BackupPortable(VaultTest):
                 with self.assertRaisesRegex(Blocked, issue):
                     backups.inspect_backup(self.vault, older)
                 self.assertEqual(manifest_path.read_bytes(), original)
+
+    def test_1_conflicting_replica_claims_require_deletion_proof(self):
+        self.configure(2)
+        now = utc()
+        record = backups.create(self.vault, "long", now - timedelta(days=1), now=now - timedelta(days=2))
+        identifier = record["id"]
+        first, second = record["copies"]
+        replica = self.paths(record)[1]
+        cipher = replica.read_bytes()
+        claim = {**first, "status": "deleted", "deletion_receipt": "a" * 64}
+        custody.save_material(self.vault, {**record, "copies": [claim, second, first]})
+        report = backups.verify_backup(self.vault, identifier)
+        self.assertEqual([row["status"] for row in report["replicas"]], ["invalid", "verified", "verified"])
+        self.assertIn("deletion receipt", report["replicas"][0]["reason"])
+        self.assertEqual(report["deleted_copies"], [])
+
+        custody.save_material(self.vault, record)
+        plan = retention.plan(self.vault, now)
+        offline = self.destinations[1].rename(self.base / "offline-during-retention")
+        try:
+            result = retention.execute(self.vault, plan["id"], now)
+            self.assertEqual(result["status"], "pending")
+            retired = custody.materials(self.vault)[identifier]["copies"][0]
+            self.assertEqual(retired["status"], "deleted")
+        finally:
+            offline.rename(self.destinations[1])
+
+        # A recreated ciphertext and a stale present claim cannot reverse retirement.
+        atomic(replica, cipher)
+        custody.save_material(self.vault, {**record, "copies": [first, second, retired]})
+        report = backups.verify_backup(self.vault, identifier)
+        self.assertEqual(report["replica"], str(self.paths(record, 1)[1]))
+        self.assertEqual(len(report["copies"]), 1)
+        self.assertEqual([row["status"] for row in report["replicas"]], ["invalid", "verified", "deleted"])
+        self.assertEqual([row["receipt"] for row in report["deleted_copies"]], [retired["deletion_receipt"]])
+        dest = self.base / "retired-copy-cannot-restore"
+        self.destinations[1].rename(self.base / "offline-after-retirement")
+        with self.assertRaisesRegex(Blocked, "no verified retained replicas"):
+            backups.restore(self.vault, identifier, dest)
+        self.assertFalse(dest.exists())
 
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
@@ -965,6 +1015,92 @@ class BackupPortable(VaultTest):
         after = custody.materials(new_vault)[unknown["id"]]
         self.assertEqual(after["captured_at"], unknown["captured_at"])
         self.assertEqual(storage_policy.deadline(after, storage_policy.effective(new_vault)), ("permanent", None))
+
+    def test_2_malformed_export_slots_preserve_history_and_known_hashes(self):
+        self.configure()
+        claim = self.claim()
+        self.knowledge([claim])
+        self.commit("Commit a disposable source")
+        kept = self.state / "custody" / "export-copy.txt"
+        atomic(kept, b"Independent export bytes")
+        intact = {"root": str(kept.parent), "path": kept.name, "kind": "export", "status": "present",
+                  "sha256": digest(kept.read_bytes())}
+        key = "unrelated-export"
+        record = {"id": key, "kind": "export", "classification": "common", "captured_at": stamp(),
+                  "copies": [None, {k: v for k, v in intact.items() if k != "kind"}, intact],
+                  "holds": [], "dependencies": []}
+        custody.save_material(self.vault, record)
+        original = self.vault.control / "materials.json"
+        raw = original.read_bytes()
+        generation = self.create()
+        archive = decode(custody.decrypt(self.vault, self.paths(generation)[1].read_bytes()))
+        checked = backup_snapshot.check_entries(archive, generation["approval"]["payload"])
+        self.assertEqual(backup_snapshot.records_from(checked)["materials.json"], raw)
+        restored = self.restore(generation, remap={key: {"2": str(kept)}})
+        recovered = Vault(restored["destination"], restored["state"])
+        self.assertEqual((recovered.control / "historical/materials.json").read_bytes(), raw)
+        copies = custody.materials(recovered)[key]["copies"]
+        self.assertEqual([(index, copy["status"]) for index, copy in enumerate(copies)],
+                         [(0, "unavailable"), (1, "unavailable"), (2, "unavailable"), (3, "present")])
+        receipt = read_json(recovered.control / "receipts" / (copies[3]["recovery_receipt"] + ".json"))
+        self.assertEqual(receipt["payload"]["origin_copy_index"], 2)
+
+        # The valid sibling still contributes its classification to the canonical source.
+        restricted_path = kept.with_name("restricted-export.txt")
+        atomic(restricted_path, (self.root / "resources/sources/F-0001/original.txt").read_bytes())
+        restricted = {**intact, "path": restricted_path.name, "sha256": digest(restricted_path.read_bytes())}
+        custody.save_material(self.vault, {**record, "classification": "personal", "copies": [None, restricted]})
+        with self.assertRaisesRegex(Blocked, "Conflicting source classifications"):
+            self.create()
+
+    def test_2_malformed_origin_slot_preserves_recovered_conversation(self):
+        self.configure()
+        now = utc()
+        conversation = self.conversation("retained-checkpoint", closed_at=now - timedelta(days=40))
+        key = conversation["id"]
+        cipher, checkpoint = conversation["copies"]
+        encrypted = Path(cipher["root"]) / cipher["path"]
+        ciphertext = encrypted.read_bytes()
+        malformed = {k: v for k, v in checkpoint.items() if k != "kind"}
+        custody.save_material(self.vault, {**conversation, "copies": [cipher, malformed]})
+        independent = self.state / "custody" / "expired-export.txt"
+        atomic(independent, b"Independently eligible for deletion")
+        export = {"id": "independent-export", "kind": "export", "classification": "common",
+                  "captured_at": stamp(now - timedelta(days=40)), "holds": [], "dependencies": [],
+                  "copies": [{"root": str(independent.parent), "path": independent.name,
+                              "kind": "export", "sha256": digest(independent.read_bytes()), "status": "present"}]}
+        custody.save_material(self.vault, export)
+        restored = self.restore(self.create(), remap={key: {"0": str(encrypted)}, export["id"]: {"0": str(independent)}})
+        recovered = Vault(restored["destination"], restored["state"])
+        inventory = custody.materials(recovered)
+        projected = inventory[key]
+        self.assertEqual(projected["copies"][1]["status"], "unavailable")
+        self.assertNotIn("path", projected["copies"][1])
+        recovered_cipher = recovered.state / "custody" / encrypted.name
+        independent_copy = inventory[export["id"]]["copies"][1]
+        independent_target = Path(independent_copy["root"]) / independent_copy["path"]
+        self.assertEqual(recovered_cipher.read_bytes(), ciphertext)
+        self.assertTrue(independent_target.is_file())
+
+        # A plan created with an intact inventory can still refer to the same local ciphertext.
+        pending = projected["copies"][1]
+        projected["copies"][1] = {**checkpoint, "status": "unavailable"}
+        custody.save_material(recovered, projected)
+        old_plan = retention.plan(recovered, now)
+        self.assertTrue(any(row["material"] == key and row["copy_index"] == 2 for row in old_plan["entries"]))
+        projected["copies"][1] = pending
+        custody.save_material(recovered, projected)
+
+        planned = retention.plan(recovered, now)
+        outcome = retention.execute(recovered, old_plan["id"], now)
+        self.assertTrue(recovered_cipher.is_file())
+        self.assertEqual(recovered_cipher.read_bytes(), ciphertext)
+        self.assertTrue(any(row["material"] == key and row["copy_index"] == 1 for row in planned["pending"]))
+        self.assertFalse(any(row["material"] == key for row in planned["entries"]))
+        self.assertTrue(any(row["material"] == key and row["copy_index"] == 2 and "Invalid backed-up custody copy" in row["reason"]
+                            for row in outcome["pending"]))
+        self.assertFalse(independent_target.exists())
+        self.assertTrue(independent.is_file())
 
     def test_2_paths_and_interrupted_publication(self):
         self.configure(2)

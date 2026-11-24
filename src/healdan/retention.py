@@ -183,6 +183,7 @@ def record_shared_deletion(vault, inventory, entry):
     changed = {}
     slots = verified_shared_slots(inventory, entry)
     for material, _, _ in slots:
+        require_custody_inventory(material)
         if material.get("format") == backup_snapshot.MANIFEST:
             check_portable_replica_inventory(vault, material)
     for material, index, copy in slots:
@@ -208,7 +209,10 @@ def deletion_reconciled(vault, inventory, entry):
 
 def record_archive_deletion(vault, inventory, entry, at):
     changed = {}
-    for record, copy in verified_archive_slots(inventory, entry):
+    slots = verified_archive_slots(inventory, entry)
+    for record, _ in slots:
+        require_custody_inventory(record)
+    for record, copy in slots:
         sha = copy["sha256"]
         if copy["status"] != "deleted" or copy.get("verified_archive_sha256") != sha:
             copy.update(status="deleted", deleted_at=copy.get("deleted_at") or at, verified_archive_sha256=sha)
@@ -269,8 +273,21 @@ def has_active_checkpoints(record):
         copy["kind"] == "checkpoint" and copy["status"] not in INACTIVE_COPIES for copy in record["copies"])
 
 
+def unresolved_custody_copies(record):
+    for index, copy in enumerate(record.get("copies", [])):
+        reason = backup_snapshot.material_copy_error(copy)
+        if reason:
+            yield index, reason
+
+
+def require_custody_inventory(record):
+    for index, reason in unresolved_custody_copies(record):
+        raise Blocked(f"Custody copy {index} requires reconciliation: {reason}", 5)
+
+
 def material_guard(vault, record, now, policy):
     from .backups import check_writing_generation, signed_manifest, verify_replica_deletions, writing_generation
+    require_custody_inventory(record)
     require(not preserved(vault, record, policy), "Retention policy preserves material", 5)
     require_expired(record, now, policy)
     if record.get("classification") == "secret":
@@ -488,11 +505,12 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False, inventory_findings=No
             except (Blocked, OSError, ValueError, KeyError, TypeError):
                 # The execution guard will diagnose unproven deadlines or decisions for this material.
                 pass
+            unresolved = list(unresolved_custody_copies(record))
+            if unresolved:
+                findings.extend({"material": identifier, "copy_index": index, "retention": "discovery", "reason": reason}
+                                for index, reason in unresolved)
+                continue
             for index, copy in enumerate(record.get("copies", [])):
-                if copy.get("kind") is None and copy.get("status") == "unavailable" and copy.get("inventory_error"):
-                    findings.append({"material": identifier, "copy_index": index, "retention": "discovery",
-                                     "reason": copy["inventory_error"]})
-                    continue
                 if copy.get("status") in INACTIVE_COPIES:
                     continue
                 try:
@@ -534,6 +552,7 @@ def apply_entry(vault, path, plan, entry, now, policy_snapshot):
     require(material["id"] == entry["material"], "Material identity changed", 5)
     if material.get("format") == backup_snapshot.MANIFEST:
         check_portable_replica_inventory(vault, material)
+    require_custody_inventory(material)
     copy = material["copies"][entry["copy_index"]]
     require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
     at = stamp(now)

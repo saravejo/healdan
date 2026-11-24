@@ -660,17 +660,42 @@ def replica_entries(vault, record, manifest, *, allow_partial):
             by_slot.setdefault(slot, []).append((index, copy, entry))
         rows.append((copy, entry))
 
+    retired = []
     for slot, claims in by_slot.items():
         if len(claims) < 2:
             continue
-        chosen_index, chosen_copy, _ = next((claim for claim in claims if claim[0] == slot), claims[0])
-        identical = all(copy == chosen_copy for _, copy, _ in claims)
-        for index, _, entry in claims:
-            if not identical:
-                entry.update(status="invalid", reason="Backup replica has conflicting catalog entries for its authenticated slot")
-            elif index != chosen_index:
+        claims.sort(key=lambda claim: claim[0] != slot)
+        preferred_copy = claims[0][1]
+        if all(copy == preferred_copy for _, copy, _ in claims):
+            for _, _, entry in claims[1:]:
                 entry.update(status="invalid", reason="Backup replica duplicates a verified publication slot")
-    return rows
+            continue
+
+        conflict = "Backup replica has conflicting catalog entries for its authenticated slot"
+        location = (preferred_copy["root"], preferred_copy["path"], preferred_copy.get("manifest"))
+        chosen = None
+        if all((copy["root"], copy["path"], copy.get("manifest")) == location for _, copy, _ in claims):
+            # Availability is an observation. Only a verified receipt can retire a published slot.
+            for index, copy, entry in claims:
+                if copy["status"] != "deleted":
+                    continue
+                try:
+                    proof = verify_replica_deletion(vault, record, slot, copy)
+                except (Blocked, OSError, KeyError, TypeError, ValueError, IndexError, AttributeError, OverflowError) as exc:
+                    entry.update(status="invalid", reason=f"{conflict}: {exc}")
+                else:
+                    entry.update(status="deleted", root=proof["root"])
+                    retired.append(proof)
+                    chosen = index
+                    break
+            if chosen is None:
+                available_claims = [(index, copy["status"]) for index, copy, _ in claims if copy["status"] != "deleted"]
+                chosen = next((index for index, status in available_claims if status == "present"),
+                              available_claims[0][0] if available_claims else None)
+        for index, _, entry in claims:
+            if index != chosen and "reason" not in entry:
+                entry.update(status="invalid", reason=conflict)
+    return rows, retired
 
 
 def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allow_partial=False):
@@ -679,10 +704,10 @@ def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allo
     count = manifest.get("replica_count") if portable else len(manifest["copies"])
     inventory_problem = replica_inventory_problem(record, manifest, count)
     require(allow_partial or inventory_problem is None, inventory_problem, 5)
-    rows = replica_entries(vault, record, manifest, allow_partial=allow_partial)
-    reordered = any("catalog_index" in entry and "status" not in entry for _, entry in rows)
+    rows, retired = replica_entries(vault, record, manifest, allow_partial=allow_partial)
+    reordered = any("catalog_index" in entry and entry.get("status") != "invalid" for _, entry in rows)
     replicas = [entry for _, entry in rows]
-    checks, retired, selected = [], [], None
+    checks, selected = [], None
     for copy, entry in rows:
         if "status" in entry:
             continue
