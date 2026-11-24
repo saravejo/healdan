@@ -13,9 +13,8 @@ from .signing import trusted_signers, verify
 INACTIVE_COPIES = {"deleted", "moved", "absent"}
 
 
-def archive_tree(root):
+def preservation_files(root, *, regular_only=False):
     root = Path(root).resolve()
-    files = {}
     directories = [root]
     while directories:
         directory = directories.pop()
@@ -36,13 +35,23 @@ def archive_tree(root):
                     directories.append(path)
                     continue
                 if not stat.S_ISREG(metadata.st_mode):
+                    require(not regular_only, "Recovery profile contains a non-regular member: " + str(path), 5)
                     continue
                 rel = path.relative_to(root).as_posix()
-                data = safe_path(root, rel, exists=True).read_bytes()
+                checked = safe_path(root, rel, exists=True)
             except OSError as exc:
                 raise Blocked(f"Cannot read preservation path {path}: {exc}", 5) from exc
-            files[rel] = {"sha256": digest(data), "size": len(data),
-                          "body": base64.b64encode(data).decode("ascii")}
+            yield rel, checked
+
+
+def archive_tree(root):
+    files = {}
+    for name, path in preservation_files(root):
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise Blocked(f"Cannot read preservation path {path}: {exc}", 5) from exc
+        files[name] = {"sha256": digest(data), "size": len(data), "body": base64.b64encode(data).decode("ascii")}
     return {"format": "healdan-tree-v1", "files": files}
 
 
@@ -433,7 +442,7 @@ def recovery_inventory(vault, record, source_id, expected, reconstruction):
 
 
 def recovery_profile(vault, session, identifier):
-    """Materialize an executable profile while the caller holds the vault lock."""
+    """Return the restricted profile and its verified journal under the vault lock."""
     record = materials(vault)[identifier]
     reconstruction = session["reconstruction"]
     source = Path(reconstruction["destination"])
@@ -445,6 +454,7 @@ def recovery_profile(vault, session, identifier):
     expected = {"vault": vault.identity, "material": identifier, "destination": str(source),
                 "cipher_sha256": record.get("cipher_sha256"), "plain_sha256": archive_sha, "session": session["operation"]}
     inventory = recovery_inventory(vault, record, source_id, expected, reconstruction)
+    require(record.get("artifact_inventory", inventory) == inventory, "Recovery inventory does not match the verified capture", 5)
 
     directory = safe_path(vault.state, "recovery-profiles")
     require(directory.resolve() == directory and not directory.is_junction(), "Unsafe recovery profile directory", 5)
@@ -465,8 +475,7 @@ def recovery_profile(vault, session, identifier):
             vault.relocated_path(binding["destination"]) == native and {**binding, "destination": str(source)} == expected and
             journal["inventory"] == inventory, "Recovery profile intention changed", 5)
     if journal["status"] == "complete":
-        # A dedicated profile remains writable for authentication and its own native continuation.
-        check_restricted_directory(native, journal)
+        check_recovery_inventory(native, journal)
     else:
         try:
             reconstruct_capture(vault, record, native, path, journal)
@@ -477,7 +486,7 @@ def recovery_profile(vault, session, identifier):
     if session.get("recovery_profile") != str(native):
         session["recovery_profile"] = str(native)
         atomic(safe_path(vault.control, f"sessions/{session['operation']}.json"), session)
-    return native
+    return native, journal
 
 
 def restore_capture(vault, identifier, destination):
@@ -530,6 +539,27 @@ def check_restricted_directory(node, journal):
     require(restored_directory(node) == journal["stage_identity"] and
             (os.name == "nt" or stat.S_IMODE(node.stat().st_mode) == 0o700),
             "Reconstruction location changed or is not restricted", 5)
+
+
+def check_recovery_inventory(root, journal):
+    check_restricted_directory(root, journal)
+    # Only the root authentication credential can be refreshed outside the verified inventory.
+    credential_name = ".credentials.json"
+    credential = safe_path(root, credential_name)
+    require(not credential.exists() or credential.is_file(), "Recovery profile credential must be a regular file", 5)
+    protected = dict(journal["inventory"])
+    protected.pop(credential_name, None)
+    for name, path in preservation_files(root, regular_only=True):
+        if name == credential_name:
+            continue
+        expected = protected.pop(name, None)
+        try:
+            matches = expected is not None and path.stat().st_size == expected["size"] and file_digest(path) == expected["sha256"]
+        except OSError as exc:
+            raise Blocked(f"Cannot verify recovery profile member {name}: {exc}", 5) from exc
+        require(matches, "Recovery profile member differs from verified reconstruction: " + name, 5)
+    require(not protected, "Recovery profile is missing verified reconstruction members", 5)
+    check_restricted_directory(root, journal)
 
 
 def write_staged_member(target, data):

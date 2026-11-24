@@ -139,11 +139,10 @@ def _profile(vault, operation):
 
 def launch(vault, operation, *, resume=False, recovery_material=None):
     from .build import require_active
-    from .custody import recovery_profile
+    from .custody import check_recovery_inventory, recovery_profile
 
     with vault.locked():
         require_active(vault)
-        _probe(vault)  # Run a fresh OS isolation probe before every launch.
         vault.no_transaction()
         session = get_session(vault, operation)
         task = get_task(vault, session["task"])
@@ -162,8 +161,12 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
         context = (base / "contexts" / (session["id"] + ".txt")).read_bytes()
         require(digest(context) == session["context_sha256"] and len(context) <= vault.policy["context_bytes"][session["role"]],
                 "Prepared context changed or exceeds limit", 5)
-        native = recovery_profile(vault, session, recovery_material) if recovery_material else profile(vault, operation)
+        if recovery_material:
+            native, recovery_journal = recovery_profile(vault, session, recovery_material)
+        else:
+            native = profile(vault, operation)
         require(native.resolve().is_relative_to(vault.state), "Native recovery profile must stay in controller state")
+        _probe(vault)  # Run a fresh OS isolation probe before every launch.
         temporary.mkdir(mode=0o700, parents=True, exist_ok=True)
         if recovery_material:
             context = b"Recovery verification only. Confirm that this conversation resumed. Do not perform task actions or use tools."
@@ -171,6 +174,8 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
         auth = run([executable("claude"), "auth", "status"], env=env, check=False)
         auth_error = "Authenticate this dedicated native profile before launch"
         require(auth.returncode == 0, f"{auth_error} ({native})" if recovery_material else auth_error, 5)
+        if recovery_material:
+            check_recovery_inventory(native, recovery_journal)
         readable = [proposal, temporary, base / "evidence", base / "contexts" / (session["id"] + ".txt"),
                     Path(executable("claude")).resolve().parent, Path(executable("node")).resolve().parent]
         readable.append(native)

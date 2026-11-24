@@ -1526,6 +1526,8 @@ class StorageLifecycle(VaultTest):
         def mocked_command(args, **kwargs):
             if args[1:3] == ["auth", "status"]:
                 authentications.append(Path(kwargs["env"]["CLAUDE_CONFIG_DIR"]))
+                if len(authentications) > 1:
+                    atomic(profile / ".credentials.json", canonical({"fixture": len(authentications)}))
                 return SimpleNamespace(returncode=1 if len(authentications) == 1 else 0)
             self.assertEqual(args[0], "ps")
             return SimpleNamespace(stdout=b"synthetic fixture process identity")
@@ -1564,6 +1566,7 @@ class StorageLifecycle(VaultTest):
                 launcher.launch(self.vault, operation, resume=True, recovery_material=record["id"])
             self.assertIn(str(profile), str(auth_error.exception))
             self.assertTrue(profile.is_dir())
+            atomic(profile / ".credentials.json", b'{"fixture":"authenticated"}')
             launch = launcher.launch(self.vault, operation, resume=True, recovery_material=record["id"])
             proof = {"material": record["id"], "cipher_sha256": record["cipher_sha256"], "plain_sha256": record["plain_sha256"],
                      "reconstruction_sha256": record["plain_sha256"], "launch_receipt": launch["id"], "uuid": session["uuid"],
@@ -1577,6 +1580,7 @@ class StorageLifecycle(VaultTest):
         current = tasks.get_session(self.vault, operation)
         self.assertEqual((current["recovery_profile"], current["reconstruction"]["destination"]), (str(profile), str(external)))
         self.assertEqual(authentications, [profile] * 3)
+        self.assertEqual(read_json(profile / ".credentials.json"), {"fixture": 3})
         self.assertEqual(len(process_launches), 2)
         self.assertEqual({name: (external / name).read_bytes() for name in copies}, copies)
         self.assertEqual(receipt_path.read_bytes(), external_receipt)
@@ -1598,7 +1602,7 @@ class StorageLifecycle(VaultTest):
                 custody.recovery_profile(self.vault, session, record["id"])
         receipt = self.vault.receipt("reconstruction", reconstruction)
         with self.vault.locked():
-            internal = custody.recovery_profile(self.vault, session, record["id"])
+            internal, _ = custody.recovery_profile(self.vault, session, record["id"])
         self.assertEqual(internal.parent, self.state / "recovery-profiles")
         self.assertEqual((internal / "a.jsonl").read_bytes(), (original / "a.jsonl").read_bytes())
         self.assertEqual(session["reconstruction"], reconstruction)
@@ -1607,6 +1611,56 @@ class StorageLifecycle(VaultTest):
         capabilities["journal"].remove("healdan-recovery-profile-v1")
         with self.assertRaisesRegex(Blocked, "healdan-recovery-profile-v1"):
             compatibility.check(self.vault, capabilities)
+
+    def test_recovery_profile_fails_closed_before_runtime_and_after_authentication(self):
+        self.age()
+        task = tasks.create(self.vault, "Verified profile inventory fixture")
+        session = tasks.new_session(self.vault, task["id"], "review", "editor", "fixture")
+        operation = session["operation"]
+        origin = launcher.profile(self.vault, operation)
+        transcript = origin / "conversation.jsonl"
+        atomic(transcript, b'{"fixture":"archived conversation"}\n')
+        session_path = self.vault.control / "sessions" / (operation + ".json")
+        session["launches"].append({"id": "synthetic-prior-launch"})
+        atomic(session_path, session)
+        identifier = custody.capture_tree(self.vault, origin, task=task["id"], classification="common", session=operation)
+        custody.restore_capture(self.vault, identifier, self.base / "operator export")
+        with self.vault.locked():
+            profile, journal = custody.recovery_profile(self.vault, tasks.get_session(self.vault, operation), identifier)
+        atomic(profile / ".credentials.json", b'{"fixture":"authentication state"}')
+        custody.check_recovery_inventory(profile, journal)
+        session_before = session_path.read_bytes()
+        verified_members = {name: (profile / name).read_bytes() for name in journal["inventory"]}
+        measure = custody.file_digest
+
+        for phase, member in (("before", "conversation.jsonl"), ("after", "settings.json")):
+            with self.subTest(phase=phase):
+                authenticated = False
+
+                def authenticate(args, **kwargs):
+                    nonlocal authenticated
+                    self.assertEqual(args[1:3], ["auth", "status"])
+                    authenticated = True
+                    return SimpleNamespace(returncode=0)
+
+                def measured_digest(path):
+                    if path == profile / member and (phase == "before" or authenticated):
+                        return "0" * 64
+                    return measure(path)
+
+                with patch("healdan.custody.file_digest", side_effect=measured_digest), \
+                        patch("healdan.build.require_active"), patch("healdan.launcher._probe") as probe, \
+                        patch("healdan.launcher.executable", side_effect=lambda name: str(self.base / name)), \
+                        patch("healdan.launcher.run", side_effect=authenticate) as runtime, \
+                        patch("healdan.launcher.subprocess") as process, patch.object(Vault, "receipt") as receipt:
+                    with self.assertRaisesRegex(Blocked, "member differs.*" + member) as blocked:
+                        launcher.launch(self.vault, operation, resume=True, recovery_material=identifier)
+                    self.assertEqual(blocked.exception.code, 5)
+                    self.assertEqual((probe.call_count, runtime.call_count), (0, 0) if phase == "before" else (1, 1))
+                    process.Popen.assert_not_called()
+                    receipt.assert_not_called()
+                self.assertEqual(session_path.read_bytes(), session_before)
+                self.assertEqual({name: (profile / name).read_bytes() for name in verified_members}, verified_members)
 
     def test_scheduled_daily_isolates_custody_findings_and_keeps_trial_gate(self):
         self.configure_age()
