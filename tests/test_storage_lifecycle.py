@@ -1662,6 +1662,57 @@ class StorageLifecycle(VaultTest):
                 self.assertEqual(session_path.read_bytes(), session_before)
                 self.assertEqual({name: (profile / name).read_bytes() for name in verified_members}, verified_members)
 
+    def test_recovery_profile_rechecks_resumed_publication_before_runtime(self):
+        self.age()
+        record, origin = self.capture(native=True)
+        identifier = record["id"]
+        operation = record["session"]
+        session_path = self.vault.control / "sessions" / (operation + ".json")
+        session = tasks.get_session(self.vault, operation)
+        session["launches"].append({"id": "synthetic-prior-launch"})
+        atomic(session_path, session)
+        external = self.base / "external restoration"
+        custody.restore_capture(self.vault, identifier, external)
+        source = custody.restoration_id(self.vault, identifier, external)
+        profile = self.state / "recovery-profiles" / source
+        internal = digest(["recovery-profile", self.vault.identity, source])
+        journal_path = self.vault.control / "restorations" / (internal + ".json")
+        receipts = self.vault.control / "receipts"
+
+        with self.vault.locked(), patch("healdan.custody.finish_reconstruction", side_effect=SystemExit("fixture publication stopped")):
+            with self.assertRaises(SystemExit):
+                custody.recovery_profile(self.vault, tasks.get_session(self.vault, operation), identifier)
+        self.assertEqual(read_json(journal_path)["status"], "publishing")
+        self.assertEqual((profile / "a.jsonl").read_bytes(), (origin / "a.jsonl").read_bytes())
+        session_before = session_path.read_bytes()
+        receipts_before = set(receipts.glob("*.json"))
+
+        def refuse(path, journal):
+            self.assertEqual(path, profile)
+            self.assertEqual(journal["status"], "complete")
+            self.assertEqual(read_json(journal_path), journal)
+            raise Blocked("Fixture recovery inventory verification refused", 5)
+
+        with patch("healdan.custody.check_recovery_inventory", side_effect=refuse) as verified, \
+                patch("healdan.build.require_active"), \
+                patch("healdan.launcher._probe", side_effect=AssertionError("Unexpected recovery probe")) as probe, \
+                patch("healdan.launcher.run", side_effect=AssertionError("Unexpected recovery authentication")) as runtime, \
+                patch("healdan.launcher.subprocess") as process:
+            with self.assertRaisesRegex(Blocked, "inventory verification refused") as blocked:
+                launcher.launch(self.vault, operation, resume=True, recovery_material=identifier)
+            self.assertEqual(blocked.exception.code, 5)
+            verified.assert_called_once()
+            probe.assert_not_called()
+            runtime.assert_not_called()
+            process.Popen.assert_not_called()
+        self.assertEqual(session_path.read_bytes(), session_before)
+        reconstruction_receipt, = set(receipts.glob("*.json")) - receipts_before
+        self.assertEqual(read_json(reconstruction_receipt)["kind"], "reconstruction")
+        with self.vault.locked():
+            recovered, journal = custody.recovery_profile(self.vault, tasks.get_session(self.vault, operation), identifier)
+        self.assertEqual((recovered, journal["result"]["receipt"]), (profile, reconstruction_receipt.stem))
+        self.assertEqual(set(receipts.glob("*.json")), receipts_before | {reconstruction_receipt})
+
     def test_scheduled_daily_isolates_custody_findings_and_keeps_trial_gate(self):
         self.configure_age()
         record, _ = self.capture()

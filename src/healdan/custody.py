@@ -474,15 +474,14 @@ def recovery_profile(vault, session, identifier):
     require(journal.get("format") == "healdan-restore-v1" and journal.get("recovery_source") == source_id and
             vault.relocated_path(binding["destination"]) == native and {**binding, "destination": str(source)} == expected and
             journal["inventory"] == inventory, "Recovery profile intention changed", 5)
-    if journal["status"] == "complete":
-        check_recovery_inventory(native, journal)
-    else:
+    if journal["status"] != "complete":
         try:
             reconstruct_capture(vault, record, native, path, journal)
         except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
             journal["error"] = str(exc)
             atomic(path, journal)
             raise
+    check_recovery_inventory(native, journal)
     if session.get("recovery_profile") != str(native):
         session["recovery_profile"] = str(native)
         atomic(safe_path(vault.control, f"sessions/{session['operation']}.json"), session)
