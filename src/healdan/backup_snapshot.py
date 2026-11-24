@@ -448,6 +448,18 @@ def check_signatures(value, signers, backup_signers, proven):
             check_signatures(item, signers, backup_signers, proven)
 
 
+def portable_backup_record(record):
+    return record.get("kind") == "backup" and record.get("format") == MANIFEST
+
+
+def check_material_copy(key, copy):
+    require(isinstance(copy, dict) and isinstance(copy.get("root"), str) and
+            sha256(copy.get("sha256")) and isinstance(copy.get("kind"), str) and
+            copy.get("status") in ("present", "planned", "deleted", "moved", "absent", "unavailable"),
+            "Invalid backed-up custody copy: " + key, 5)
+    portable_path(copy.get("path"), historical=True)
+
+
 def check_materials(inventory):
     for key, record in inventory.items():
         require(isinstance(key, str) and "/" not in portable_path(key) and isinstance(record, dict) and record.get("id") == key and
@@ -455,12 +467,11 @@ def check_materials(inventory):
                 isinstance(record.get("holds"), list) and isinstance(record.get("dependencies"), list),
                 "Invalid backed-up custody record: " + key, 5)
         require(record["kind"] == "export" or identifier(key), "Invalid backup or conversation identity: " + key, 5)
+        if portable_backup_record(record):
+            # Capture the original mutable catalog as evidence, including damaged replica rows.
+            continue
         for copy in record["copies"]:
-            require(isinstance(copy, dict) and isinstance(copy.get("root"), str) and
-                    sha256(copy.get("sha256")) and isinstance(copy.get("kind"), str) and
-                    copy.get("status") in {"present", "planned", "deleted", "moved", "absent", "unavailable"},
-                    "Invalid backed-up custody copy: " + key, 5)
-            portable_path(copy.get("path"), historical=True)
+            check_material_copy(key, copy)
 
 
 def check_recovery_history(archive, contents, records, backup_signers):

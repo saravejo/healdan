@@ -38,6 +38,7 @@
     "test_backup_portable.BackupPortable.test_1_invalid_replica_inventory_does_not_block_fallback",
     "test_backup_portable.BackupPortable.test_1_invalid_replica_or_manifest",
     "test_backup_portable.BackupPortable.test_1_legacy_envelope_with_backup_off",
+    "test_backup_portable.BackupPortable.test_1_portable_manifest_without_signed_publication_plan",
     "test_backup_portable.BackupPortable.test_1_process_and_origin_paths_are_inactive",
     "test_backup_portable.BackupPortable.test_1_signed_replica_count_guards_complete_inventory",
     "test_backup_portable.BackupPortable.test_2_edits_during_capture_use_only_verified_bytes",

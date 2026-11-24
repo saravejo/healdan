@@ -3,10 +3,11 @@ from copy import deepcopy
 import os
 from pathlib import Path
 import shutil
+import stat
 from uuid import uuid4
 
 from . import backup_snapshot as snapshot, binding
-from .core import (atomic, decode, digest, file_digest, git, git_bytes, lock, read_json,
+from .core import (Blocked, atomic, decode, digest, file_digest, git, git_bytes, lock, read_json,
                    require, safe_path, stamp, sync_directory)
 from .custody import INACTIVE_COPIES, archive_members
 
@@ -98,13 +99,27 @@ def remapped_copies(remap, records, destination, state):
 
 
 def reconcile_copies(archive, contents, records, state, control, journal, remaps):
+    from .backups import valid_replica_root
+
     inventory = deepcopy(records)
     sources = {entry["sha256"]: contents[name] for name, entry in archive["files"].items()
                if entry["kind"] == "knowledge" and snapshot.originals.source_path(name)}
     pending = []
     for key, record in inventory.items():
-        local = []
+        portable = snapshot.portable_backup_record(record)
+        original, local = [], []
         for index, copy in enumerate(record["copies"]):
+            if portable:
+                try:
+                    snapshot.check_material_copy(key, copy)
+                    require(valid_replica_root(copy["root"]) and copy["kind"] == "ciphertext" and
+                            copy["path"] == key + ".age" and copy.get("manifest") == key + ".manifest.json" and
+                            copy["status"] in ("planned", "present", "deleted", "absent", "unavailable"),
+                            "Invalid backed-up replica location: " + key, 5)
+                except Blocked as exc:
+                    pending.append({"material": key, "copy_index": index, "status": "invalid", "reason": str(exc)})
+                    continue
+            original.append(copy)
             copy.setdefault("origin_status", copy["status"])
             if copy["status"] in INACTIVE_COPIES:
                 continue
@@ -139,7 +154,7 @@ def reconcile_copies(archive, contents, records, state, control, journal, remaps
             receipt = proof_receipt(control, "backup-copy-recovered", payload, journal["at"])
             local.append({"root": str(target.parent), "path": target.name, "sha256": copy["sha256"], "kind": copy["kind"],
                           "status": "present", "recovery_receipt": receipt})
-        record["copies"].extend(local)
+        record["copies"] = original + local
     atomic(control / "materials.json", inventory)
     return pending
 
@@ -291,7 +306,7 @@ def allocated(journal, journal_path, stage):
     atomic(journal_path, journal)
 
 
-def directory_inventory(stage):
+def directory_inventory(stage, *, modes=False):
     inventory = {}
 
     def unreadable(error):
@@ -302,15 +317,19 @@ def directory_inventory(stage):
         for name in directories:
             directory = safe_path(root, name)
             require(not directory.is_junction(), "Unsafe intermediate recovery directory", 5)
-            inventory[directory.relative_to(stage).as_posix()] = None
+            inventory[directory.relative_to(stage).as_posix()] = stat.S_IMODE(directory.stat().st_mode) if modes else None
         for name in files:
             file = safe_path(root, name, exists=True)
-            inventory[file.relative_to(stage).as_posix()] = file_digest(file)
+            checksum = file_digest(file)
+            entry = {"sha256": checksum, "mode": stat.S_IMODE(file.stat().st_mode)} if modes else checksum
+            inventory[file.relative_to(stage).as_posix()] = entry
     return inventory
 
 
 def staging_digest(stage):
-    return digest(directory_inventory(stage))
+    if os.name == "nt":
+        return digest(directory_inventory(stage))
+    return digest({"mode": stat.S_IMODE(stage.stat().st_mode), "entries": directory_inventory(stage, modes=True)})
 
 
 def recovered_state_digest(state):
@@ -327,13 +346,10 @@ def publish(stage, destination, empty, journal):
     expected = journal.get("empty_identity")
     if destination.exists() and directory_identity(destination) == journal["stage_identity"]:
         require(not stage.exists(), "Recovery destination and staging both exist", 5)
-        if journal["phase"] == "ready":
-            require(staging_digest(destination) == journal["stage_sha256"],
-                    "Recovery destination changed before completion", 5)
         return
     require(stage.exists() and directory_identity(stage) == journal["stage_identity"],
             "Verified recovery staging directory is missing", 5)
-    require(staging_digest(stage) == journal["stage_sha256"], "Recovery staging bytes changed before publication", 5)
+    require(staging_digest(stage) == journal["stage_sha256"], "Recovery staging bytes or modes changed before publication", 5)
     if empty.exists():
         require(directory_identity(empty) == expected and not destination.exists(),
                 "Original empty recovery destination changed", 5)
@@ -430,6 +446,8 @@ def recover(verified, destination, state, report, *, allowed_signers, backup_sig
                     "External recovery state changed before publication", 5)
         publish(stage, destination, empty, journal)
         if journal["phase"] == "ready":
+            require(staging_digest(destination) == journal["stage_sha256"],
+                    "Recovery destination changed before completion", 5)
             require(recovered_state_digest(state) == journal.get("state_sha256"),
                     "External recovery state changed before completion", 5)
         repository = binding.Repository.open(destination)

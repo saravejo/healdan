@@ -2,6 +2,7 @@
 from datetime import timedelta
 import os
 from pathlib import Path
+import stat
 import sys
 from unittest.mock import patch
 from uuid import uuid4
@@ -252,10 +253,20 @@ class BackupPortable(VaultTest):
         record = self.create()
         identifier = record["id"]
         first, second = record["copies"]
+        moved = self.base / "unauthorized-copy-root"
+        moved.mkdir()
+        for path in self.paths(record):
+            atomic(moved / path.name, path.read_bytes())
+        substituted = {**first, "root": str(moved)}
+        substituted["publication_receipt"] = self.vault.receipt(
+            "backup-replica-published", backups.published_copy(record, 0, substituted, first["published_at"]),
+            at=first["published_at"],
+        )
         for label, copy, error in (
             ("manifest-digest", {**first, "manifest_sha256": "0" * 64}, "Portable replica inventory changed"),
             ("malformed-copy", None, "Portable replica inventory changed"),
             ("other-slot", second, "Backup replica publication receipt changed"),
+            ("substituted-root", substituted, "signed publication plan"),
             ("unavailable-copy", {**first, "status": "unavailable"}, None),
         ):
             with self.subTest(label=label):
@@ -265,6 +276,7 @@ class BackupPortable(VaultTest):
                     report = backups.verify_backup(self.vault, identifier)
                 if error:
                     self.assertNotIn(first["root"], [call.args[0] for call in relocated.call_args_list])
+                    self.assertNotIn(str(moved), [call.args[0] for call in relocated.call_args_list])
                     self.assertIn(error, report["replicas"][0]["reason"])
                     with self.assertRaisesRegex(Blocked, error):
                         backups.inspect_backup(self.vault, damaged, allow_retired=True)
@@ -328,6 +340,28 @@ class BackupPortable(VaultTest):
         scheduled = maintenance.backup_round(self.vault, now + timedelta(minutes=1))
         self.assertEqual(scheduled["status"], "complete", scheduled)
         self.assertNotEqual(scheduled["id"], identifier)
+
+    def test_1_portable_manifest_without_signed_publication_plan(self):
+        self.configure()
+        record = self.create()
+        manifest_path, replica = self.paths(record)
+        payload = {key: value for key, value in record["approval"]["payload"].items() if key != "replica_slots_sha256"}
+        approval = envelope(payload, "backup", "backup", self.vault.config["backup_signing_key"])
+        original = canonical(approval) + b"\n"
+        atomic(manifest_path, original)
+        copy = {**record["copies"][0], "manifest_sha256": digest(original)}
+        older = {key: value for key, value in record.items() if key != "replica_slots_sha256"}
+        older.update(approval=approval, copies=[copy])
+        at = copy["published_at"]
+        copy["publication_receipt"] = self.vault.receipt("backup-replica-published", backups.published_copy(older, 0, copy, at), at=at)
+        custody.save_material(self.vault, older)
+        self.assertEqual(backups.verify_portable(record["id"], manifest_path, replica, **self.trust)["status"], "complete")
+        report = backups.verify_backup(self.vault, record["id"])
+        self.assertEqual(report["replica"], str(replica))
+        self.assertIn("authenticated publication plan", report["pending_replicas"][0]["reason"])
+        with self.assertRaisesRegex(Blocked, "authenticated publication plan"):
+            backups.inspect_backup(self.vault, older)
+        self.assertEqual(manifest_path.read_bytes(), original)
 
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
@@ -512,9 +546,22 @@ class BackupPortable(VaultTest):
         self.assertEqual([entry["status"] for entry in report["replicas"]], ["verified", "invalid"])
         with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
             backups.inspect_backup(self.vault, damaged)
-        custody.save_material(self.vault, {**record, "copies": [first]})
-        with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
-            backups.verify_backup(self.vault, identifier)
+        atomic(Path(second["root"]) / second["path"], cipher)
+        for index, copy in enumerate((first, {**second, "status": "present"})):
+            with self.subTest(retained_legacy_slot=index):
+                truncated = {**record, "copies": [copy]}
+                custody.save_material(self.vault, truncated)
+                report = backups.verify_backup(self.vault, identifier)
+                restored = backups.restore(self.vault, identifier, self.base / f"truncated-legacy-{index}")
+                for checked in (report, restored):
+                    self.assertEqual(checked["replica"], str(Path(copy["root"]) / copy["path"]))
+                    self.assertEqual([(row["copy_index"], row["status"]) for row in checked["replicas"]], [(index, "verified")])
+                    self.assertIn("replica count", checked["pending_replicas"][0]["reason"])
+                with self.assertRaisesRegex(Blocked, "replica count"):
+                    backups.inspect_backup(self.vault, truncated)
+                with self.assertRaisesRegex(Blocked, "replica count"):
+                    backups.signed_manifest(self.vault, truncated)
+                self.assertEqual(custody.materials(self.vault)[identifier], truncated)
 
     def test_1_destination_retry_and_verified_bytes(self):
         self.configure()
@@ -575,6 +622,13 @@ class BackupPortable(VaultTest):
                 self.assertRaisesRegex(RuntimeError, "after directory rename"):
             self.restore(record, other, other_state)
         self.assertEqual(read_json(other_state / backup_recovery.JOURNAL_FILE)["phase"], "ready")
+        if os.name != "nt":
+            published = other / "wiki/claims.jsonl"
+            mode = stat.S_IMODE(published.stat().st_mode)
+            published.chmod(mode ^ stat.S_IXUSR)
+            with self.assertRaisesRegex(Blocked, "destination changed before completion"):
+                self.restore(record, other, other_state)
+            published.chmod(mode)
         atomic(other / "wiki/claims.jsonl", b"changed before completion")
         with self.assertRaisesRegex(Blocked, "destination changed before completion"):
             self.restore(record, other, other_state)
@@ -596,6 +650,15 @@ class BackupPortable(VaultTest):
         with patch("healdan.backup_recovery.publish", side_effect=RuntimeError("fixture before publication")), \
                 self.assertRaisesRegex(RuntimeError, "before publication"):
             self.restore(with_remap, destination, external, remap=mapping)
+        if os.name != "nt":
+            ready = read_json(external / backup_recovery.JOURNAL_FILE)
+            staged = destination.parent / ready["stage"] / "wiki/claims.jsonl"
+            mode = stat.S_IMODE(staged.stat().st_mode)
+            staged.chmod(mode ^ stat.S_IXUSR)
+            with self.assertRaisesRegex(Blocked, "staging bytes or modes changed"):
+                self.restore(with_remap, destination, external, remap=mapping)
+            self.assertFalse(any(destination.iterdir()))
+            staged.chmod(mode)
         staged_copy = external / "recovered-copies" / material["id"] / "0" / remapped.name
         self.assertEqual(staged_copy.read_bytes(), remapped_bytes)
         atomic(staged_copy, b"changed while ready")
@@ -607,6 +670,9 @@ class BackupPortable(VaultTest):
         atomic(staged_copy, remapped_bytes)
         completed = self.restore(with_remap, destination, external, remap=mapping)
         atomic(staged_copy, b"normal post-recovery change")
+        if os.name != "nt":
+            recovered = destination / "wiki/claims.jsonl"
+            recovered.chmod(stat.S_IMODE(recovered.stat().st_mode) ^ stat.S_IXUSR)
         self.assertEqual(self.restore(with_remap, destination, external, remap=mapping)["receipt"], completed["receipt"])
 
     def test_2_positive_snapshot_selection(self):
@@ -740,6 +806,12 @@ class BackupPortable(VaultTest):
         now = utc()
         eligible = self.conversation("eligible", closed_at=now)
         unknown = self.conversation("unknown-deadline")
+        previous = self.create()
+        damaged = {**previous, "copies": [None]}
+        custody.save_material(self.vault, damaged)
+        pending = retention.plan(self.vault, now)
+        self.assertEqual(pending["pending"][0]["material"], previous["id"])
+        raw_inventory = (self.vault.control / "materials.json").read_bytes()
         deadline = now + timedelta(days=30)
         working = self.base / "unrelated-launch-directory"
         ordinary = working / "ordinary.txt"
@@ -757,6 +829,13 @@ class BackupPortable(VaultTest):
         record = decode(result.stdout)
         new = self.restore(record)
         recovered = Vault(new["destination"], new["state"])
+        self.assertEqual((recovered.control / "historical/materials.json").read_bytes(), raw_inventory)
+        projected = custody.materials(recovered)[previous["id"]]
+        self.assertEqual(projected["copies"], [])
+        self.assertEqual(projected["approval"], previous["approval"])
+        self.assertTrue(any(row.get("material") == previous["id"] and row.get("copy_index") == 0 and
+                            row.get("status") == "invalid" for row in new["pending_copies"]))
+        self.assertTrue(all(path.is_file() for path in self.paths(previous)))
         current = custody.materials(recovered)[eligible["id"]]
         self.assertEqual(current["closed_at"], eligible["closed_at"])
         self.assertEqual(current["plain_sha256"], eligible["plain_sha256"])
@@ -823,6 +902,32 @@ class BackupPortable(VaultTest):
         self.assertEqual(cipher.read_bytes(), written)
         self.assertFalse(manifest.exists())
         custody.save_material(self.vault, pending)
+        alternate = self.base / "alternate-backup-destination"
+        alternate.mkdir()
+        self.vault.config["backup_destinations"].append(str(alternate))
+        atomic(self.vault.config_path, self.vault.config)
+        first, second = pending["copies"]
+        for root in (first["root"], str(alternate)):
+            redirected = {**pending, "copies": [first, {**second, "root": root}]}
+            custody.save_material(self.vault, redirected)
+            with self.assertRaisesRegex(Blocked, "signed publication plan"):
+                backups.reconcile(self.vault, pending["id"])
+            self.assertEqual(custody.materials(self.vault)[pending["id"]], redirected)
+            self.assertFalse(any(alternate.iterdir()))
+            self.assertEqual(cipher.read_bytes(), written)
+            self.assertFalse(manifest.exists())
+        custody.save_material(self.vault, pending)
+        relocate = self.vault.relocated_path
+
+        def overlap(path):
+            return Path(first["root"]) if path == second["root"] else relocate(path)
+
+        with patch.object(self.vault, "relocated_path", side_effect=overlap), \
+                patch("healdan.backups.publish_file", wraps=backups.publish_file) as write, \
+                self.assertRaisesRegex(Blocked, "publication destinations overlap"):
+            backups.reconcile(self.vault, pending["id"])
+        write.assert_not_called()
+        self.assertEqual(custody.materials(self.vault)[pending["id"]], pending)
         self.policy("off")
         with self.assertRaisesRegex(Blocked, "disabled by policy"):
             backups.reconcile(self.vault, pending["id"])
