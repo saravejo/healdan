@@ -879,6 +879,123 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(self.cli("maintenance", "daily")[0], 0)
         self.assertFalse(target_a.exists())
 
+    def test_daily_retry_read_failure_preserves_pending_plan_and_runs_due_backup(self):
+        self.configure_age(backup_interval_hours=24)
+        self.change_policy(backup="scheduled")
+        material, origin = self.capture()
+        checkpoint = origin / "nested" / "b.jsonl"
+        data = checkpoint.read_bytes()
+        cipher = self.state / "custody" / (material["id"] + ".age")
+        now = utc("2026-02-15T00:00:00Z")
+        plan = retention.plan(self.vault, now)
+        path = self.vault.control / "deletions" / (plan["id"] + ".json")
+        _, independent = self.export("independent-during-retry")
+        read_file = Path.read_bytes
+        read_plan = retention.read_json
+        execute = retention.execute
+        visits = []
+
+        def delayed_file_read(target):
+            if target == checkpoint:
+                raise PermissionError("Fixture checkpoint read temporarily unavailable")
+            return read_file(target)
+
+        def delayed_plan_read(target, *args, **kwargs):
+            if target == path:
+                raise PermissionError("Fixture plan read temporarily unavailable on retry")
+            return read_plan(target, *args, **kwargs)
+
+        def execute_with_retry_failure(vault, identifier, time):
+            visits.append(identifier)
+            if identifier == plan["id"] and visits.count(identifier) == 2:
+                with patch("healdan.retention.read_json", side_effect=delayed_plan_read):
+                    return execute(vault, identifier, time)
+            return execute(vault, identifier, time)
+
+        with patch.object(Path, "read_bytes", delayed_file_read), patch("healdan.retention.execute", side_effect=execute_with_retry_failure):
+            result = maintenance.daily(self.vault, now)
+        self.assertEqual(visits.count(plan["id"]), 2)
+        self.assertEqual(result["status"], "pending", result)
+        self.assertIn({"plan": plan["id"], "reason": "Fixture plan read temporarily unavailable on retry"}, result["pending"])
+        self.assertFalse(independent.exists())
+        self.assertEqual(checkpoint.read_bytes(), data)
+        self.assertTrue(cipher.is_file())
+        self.assertTrue(any("checkpoint read temporarily unavailable" in entry["reason"] for entry in read_json(path)["pending"]))
+        self.assertEqual(result["backup_result"]["status"], "complete", result)
+        self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
+        retry = maintenance.daily(Vault(self.root, self.state), now + timedelta(hours=1))
+        self.assertEqual(retry["status"], "complete", retry)
+        self.assertFalse(checkpoint.exists() or cipher.exists())
+
+    def test_daily_unreadable_plan_inventory_suspends_retention_but_runs_due_backup(self):
+        self.configure_age(backup_interval_hours=24)
+        self.change_policy(backup="scheduled")
+        _, original = self.export("already-planned")
+        now = utc("2026-02-15T00:00:00Z")
+        plan = retention.plan(self.vault, now)
+        path = self.vault.control / "deletions" / (plan["id"] + ".json")
+        before = path.read_bytes()
+        _, discovered = self.export("new-during-inventory-error")
+        read = retention.read_json
+
+        def delayed_read(target, *args, **kwargs):
+            if target == path:
+                raise PermissionError("Fixture plan inventory temporarily unavailable")
+            return read(target, *args, **kwargs)
+
+        with patch("healdan.retention.read_json", side_effect=delayed_read), patch("healdan.retention.execute") as execute:
+            result = maintenance.daily(self.vault, now)
+        execute.assert_not_called()
+        self.assertEqual(result["status"], "pending", result)
+        self.assertEqual(result["plans"], [])
+        self.assertTrue(any(row.get("retention") == "inventory" and plan["id"] in row["reason"] and
+                            "temporarily unavailable" in row["reason"] for row in result["pending"]))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertTrue(original.is_file() and discovered.is_file())
+        self.assertEqual(result["backup_result"]["status"], "complete", result)
+        self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
+        retry = maintenance.daily(Vault(self.root, self.state), now + timedelta(hours=1))
+        self.assertEqual(retry["status"], "complete", retry)
+        self.assertFalse(original.exists() or discovered.exists())
+
+    def test_daily_unreadable_journal_directory_preserves_bytes_and_runs_due_backup(self):
+        self.configure_age(backup_interval_hours=24)
+        self.change_policy(backup="scheduled")
+        material, origin = self.capture()
+        cipher = self.state / "custody" / (material["id"] + ".age")
+        checkpoint = origin / "nested" / "b.jsonl"
+        data = checkpoint.read_bytes()
+        now = utc("2026-02-15T00:00:00Z")
+        retention.plan(self.vault, now)
+        scandir = os.scandir
+        for offset, name in enumerate(("deletions", "restorations")):
+            with self.subTest(journal=name):
+                directory = self.vault.control / name
+                directory.mkdir(exist_ok=True)
+
+                def unavailable(path):
+                    if Path(path) == directory:
+                        raise PermissionError("Fixture journal directory temporarily unavailable: " + name)
+                    return scandir(path)
+
+                with patch("os.scandir", side_effect=unavailable):
+                    if name == "deletions":
+                        with self.assertRaisesRegex(PermissionError, "temporarily unavailable"):
+                            retention.pending_deletion_paths(self.vault)
+                    else:
+                        with self.assertRaisesRegex(PermissionError, "temporarily unavailable"):
+                            custody.pending_restoration(self.vault, material["id"])
+                    result = maintenance.daily(self.vault, now + timedelta(days=offset))
+                self.assertEqual(result["status"], "pending", result)
+                self.assertTrue(any("Fixture journal directory temporarily unavailable" in row["reason"] for row in result["pending"]))
+                self.assertEqual(checkpoint.read_bytes(), data)
+                self.assertTrue(cipher.is_file())
+                self.assertEqual(result["backup_result"]["status"], "complete", result)
+                self.assertEqual(backups.verify_backup(self.vault, result["backup"])["status"], "complete")
+        done = maintenance.daily(Vault(self.root, self.state), now + timedelta(days=1, hours=1))
+        self.assertEqual(done["status"], "complete", done)
+        self.assertFalse(checkpoint.exists() or cipher.exists())
+
     def test_overlapping_rounds_reconcile_all_plans_and_discover_new_slots(self):
         self.change_policy()
         _, first = self.export("first")

@@ -7,7 +7,7 @@ import sys
 from uuid import uuid4
 
 from . import storage_policy
-from .core import Blocked, atomic, canonical, canonical_storage_path, decode, digest, executable, lock, read_json, require, run, safe_path, stamp, sync_directory
+from .core import Blocked, atomic, canonical, canonical_storage_path, decode, digest, executable, json_paths, lock, read_json, require, run, safe_path, stamp, sync_directory
 from .signing import trusted_signers, verify
 
 INACTIVE_COPIES = {"deleted", "moved"}
@@ -323,7 +323,7 @@ def native_guard(vault, material):
 
 def pending_restoration(vault, identifier=None, *, target=None):
     directory = safe_path(vault.control, "restorations")
-    for path in directory.glob("*.json"):
+    for path in json_paths(directory):
         journal = read_json(safe_path(directory, path.name, exists=True))
         status = journal.get("status")
         if (target is None and journal.get("material") == identifier and

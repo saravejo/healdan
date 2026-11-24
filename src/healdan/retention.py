@@ -4,7 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import storage_policy
-from .core import Blocked, atomic, canonical_storage_path, digest, read_json, require, safe_path, stamp, sync_directory, utc
+from .core import Blocked, atomic, canonical_storage_path, digest, json_paths, read_json, require, safe_path, stamp, sync_directory, utc
 from .custody import INACTIVE_COPIES, materials, native_guard, save_material, verified_capture
 from .inbox import pending_archive_paths
 from .tasks import all_tasks
@@ -184,7 +184,7 @@ def pending_deletion_paths(vault, *, target=None, exclude=None):
     root = safe_path(vault.control, "deletions")
     inventory = materials(vault)
     paths = {}
-    for path in root.glob("*.json"):
+    for path in json_paths(root):
         plan = read_json(safe_path(root, path.name, exists=True))
         for entry in plan["entries"]:
             if entry["status"] != "deleting" and not entry.get("awaiting_archive_reconciliation"):
@@ -314,7 +314,12 @@ def guard_ciphertext(vault, record):
 
 def pending_plans(vault):
     root = safe_path(vault.control, "deletions")
-    plans = [read_json(safe_path(root, path.name, exists=True)) for path in sorted(root.glob("*.json"))]
+    plans = []
+    for path in json_paths(root):
+        try:
+            plans.append(read_json(safe_path(root, path.name, exists=True)))
+        except (Blocked, OSError) as exc:
+            raise Blocked(f"Cannot read deletion plan {path.stem}: {exc}", 5) from exc
     return sorted((p for p in plans if p["status"] != "complete"),
                   key=lambda p: (not any(e["status"] == "deleting" for e in p["entries"]), p["created_at"], p["id"]))
 

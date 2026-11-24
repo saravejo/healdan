@@ -71,6 +71,15 @@ def read_json(path, default=None):
     return decode(Path(path).read_bytes()) if Path(path).exists() else default
 
 
+def json_paths(directory):
+    try:
+        scan = os.scandir(directory)
+    except FileNotFoundError:
+        return []
+    with scan:
+        return sorted(Path(entry.path) for entry in scan if os.path.normcase(entry.name).endswith(".json"))
+
+
 def parse_jsonl(data, path, *, include_bytes=False):
     if not data:
         return []

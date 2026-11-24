@@ -21,6 +21,13 @@ def daily(vault, now=None):
     now = utc(now)
     notices, pending, results = [], [], []
     legacy_backup_error = {}
+
+    def execute_plan(identifier):
+        try:
+            return retention.execute(vault, identifier, now)
+        except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
+            return {"id": identifier, "status": "pending", "pending": [{"reason": str(exc)}]}
+
     for task in all_tasks(vault):
         with vault.locked():
             task = get_task(vault, task["id"])
@@ -36,25 +43,24 @@ def daily(vault, now=None):
                     pending.append({"task": task["id"], "reason": str(exc)})
     with vault.locked():
         vault.no_transaction()
-        plans = retention.pending_plans(vault)
-        exclude = {retention.slot(entry) for plan in plans for entry in plan["entries"]
-                   if entry["status"] not in retention.RESOLVED}
         try:
-            discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans))
-            if discovered is not None:
-                plans.append(discovered)
+            plans = retention.pending_plans(vault)
+            exclude = {retention.slot(entry) for plan in plans for entry in plan["entries"]
+                       if entry["status"] not in retention.RESOLVED}
         except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
-            pending.append({"retention": "discovery", "reason": str(exc)})
-        for plan in plans:
+            pending.append({"retention": "inventory", "reason": str(exc)})
+        else:
             try:
-                result = retention.execute(vault, plan["id"], now)
-                results.append(result)
+                discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans))
+                if discovered is not None:
+                    plans.append(discovered)
             except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
-                results.append({"id": plan["id"], "status": "pending", "pending": [{"reason": str(exc)}]})
-        for index, result in enumerate(results):
-            if any(item.get("reason") in {retention.NATIVE_REPLICAS_PENDING, retention.CHECKPOINT_REPLICAS_PENDING}
-                   for item in result.get("pending", [])):
-                results[index] = retention.execute(vault, result["id"], now)
+                pending.append({"retention": "discovery", "reason": str(exc)})
+            results = [execute_plan(plan["id"]) for plan in plans]
+            for index, result in enumerate(results):
+                if any(item.get("reason") in {retention.NATIVE_REPLICAS_PENDING, retention.CHECKPOINT_REPLICAS_PENDING}
+                       for item in result.get("pending", [])):
+                    results[index] = execute_plan(result["id"])
         pending.extend({"plan": result["id"], **item} for result in results for item in result.get("pending", []))
         backup = backup_round(vault, now)
         if backup["status"] == "pending":
