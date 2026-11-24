@@ -3,7 +3,7 @@ from base64 import b64decode
 from pathlib import Path
 
 from .binding import Repository
-from .core import TRANSACTION_V2, Blocked, digest, read_json, require, safe_path
+from .core import TRANSACTION_V2, Blocked, digest, json_paths, read_json, require, safe_path
 from .lineage import package_pages, sha256
 from .migration import PACKAGE_FORMATS
 from .regression import CASE_REGISTRY, _compatible_case
@@ -126,8 +126,12 @@ def check(vault, capabilities):
 
     if storage_policy.history_path(vault).exists() or any(safe_path(vault.control, "backup-preservation").glob("*.json")):
         needs("journal", storage_policy.FORMAT)
-    if any(safe_path(vault.control, "restorations").glob("*.json")):
+    restorations = safe_path(vault.control, "restorations")
+    journals = json_paths(restorations)
+    if journals:
         needs("journal", "healdan-restore-v1")
+    if any("recovery_source" in read_json(safe_path(restorations, path.name, exists=True)) for path in journals):
+        needs("journal", "healdan-recovery-profile-v1")
     deletions = safe_path(vault.control, "deletions")
     for path in deletions.glob("*.json"):
         entries = read_json(safe_path(deletions, path.name, exists=True))["entries"]
@@ -137,3 +141,7 @@ def check(vault, capabilities):
             needs("journal", "healdan-shared-deletion-v1")
     if (vault.control / "materials.json").exists() or (vault.root / "control/repository.bundle").exists():
         needs("archive", "healdan-tree-v1")
+    from .custody import materials
+
+    if any(copy.get("status") == "absent" for record in materials(vault).values() for copy in record.get("copies", [])):
+        needs("journal", "healdan-backup-writing-absence-v1")

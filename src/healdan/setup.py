@@ -97,7 +97,7 @@ def _initialize(vault, interactive):
             "next": "Complete external config, authenticate dedicated profiles, then run doctor and recovery trials"}
 
 
-def doctor(vault):
+def doctor(vault, *, check_custody=True):
     checks = []
     def check(name, passed, detail):
         checks.append({"name": name, "passed": bool(passed), "detail": detail})
@@ -153,8 +153,9 @@ def doctor(vault):
         check("retention:policy", True, policy["retention"]["mode"])
     except (Blocked, OSError, TypeError, ValueError) as exc:
         check("storage:policy", False, str(exc))
-    for material, problem in custody.integrity_findings(vault):
-        check("custody:" + material, False, problem)
+    if check_custody:
+        for material, problem in custody.integrity_findings(vault):
+            check("custody:" + material, False, problem)
     if shutil.which("srt") and platform.system() == "Darwin":
         try:
             from .launcher import runtime_version

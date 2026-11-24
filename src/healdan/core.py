@@ -50,6 +50,11 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+def file_digest(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def _pairs(pairs):
     result = {}
     for key, value in pairs:

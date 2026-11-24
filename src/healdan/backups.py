@@ -1,12 +1,12 @@
 """Encrypted backup generations with immutable expiry and verified copies."""
 import base64
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 import re
 import tempfile
 
 from . import storage_policy
-from .core import Blocked, atomic, canonical, decode, digest, git, git_bytes, read_json, require, safe_path, stamp, utc
+from .core import Blocked, atomic, canonical, decode, digest, file_digest, git, git_bytes, json_paths, read_json, require, safe_path, stamp, utc
 from .custody import decrypt, encrypt, materials, restore_tree, save_material, validate_purpose, verified_capture
 from .signing import envelope, verify
 
@@ -140,17 +140,95 @@ def signed_manifest(vault, record):
             {k: v for k, v in signed.items() if k != "copies"} and
             [copy_identity(c) for c in record["copies"]] == [copy_identity(c) for c in signed["copies"]],
             "Signed backup manifest changed", 5)
-    require(all(c.get("status") in {"present", "deleted"} for c in record["copies"]),
+    require(all(c.get("status") in {"present", "deleted"} and not ({"absent_at", "absence_receipt"} & c.keys())
+                for c in record["copies"]),
             "Invalid backup replica state", 5)
     return signed
 
 
-def verified_replica(vault, record, copy):
+def writing_generation(record):
+    return record.get("status") == "writing" and "approval" not in record and "verified_at" not in record
+
+
+def check_writing_generation(vault, record):
+    from .lineage import sha256
+
+    identifier = record["id"]
+    require(isinstance(identifier, str) and str(UUID(identifier)) == identifier and record.get("generation") in {"long", "short"} and
+            sha256(record.get("cipher_sha256")) and isinstance(record.get("created_at"), str) and
+            isinstance(record.get("expires_at"), str) and utc(record["created_at"]) < utc(record["expires_at"]),
+            "Interrupted backup generation has an unproven identity or expiry", 5)
+    copies = record["copies"]
+    require(copies and all(copy.get("kind") == "ciphertext" and copy.get("path") == identifier + ".age" and
+            copy.get("sha256") == record["cipher_sha256"] and copy.get("status") in {"planned", "present", "deleted", "absent"}
+            for copy in copies), "Interrupted backup copy does not match its generation", 5)
+    receipts = safe_path(vault.control, "receipts")
+    for path in json_paths(receipts):
+        proof = read_json(safe_path(receipts, path.name, exists=True))
+        require(isinstance(proof, dict), "Invalid receipt while checking interrupted backups", 5)
+        if proof.get("kind") != "backup":
+            continue
+        payload = proof.get("payload", {})
+        require(isinstance(payload, dict), "Invalid backup completion receipt", 5)
+        if payload.get("id") == identifier and payload.get("status") == "complete" and digest(proof) == path.stem:
+            raise Blocked("Backup generation already has a completion receipt", 5)
+
+
+def interrupted_absence(plan, record, index, copy, root_identity):
+    from .retention import copy_identity
+
+    return {"plan": plan["id"], "plan_digest": plan["digest"], "material": record["id"],
+            "copy_index": index, "identity": digest(copy_identity(copy)), "root_identity": root_identity}
+
+
+def inspect_writing_generation(vault, record):
+    from .lineage import sha256
+    from .retention import authorized_target, copy_identity, plan_digest
+
+    check_writing_generation(vault, record)
+    verify_replica_deletions(vault, record)
+    unresolved = False
+    for index, copy in enumerate(record["copies"]):
+        if copy["status"] == "absent":
+            identifier = copy.get("absence_receipt")
+            require(sha256(identifier), "Interrupted backup has an unproven absent replica", 5)
+            proof = read_json(safe_path(vault.control, f"receipts/{identifier}.json"), {})
+            payload = proof.get("payload", {})
+            plan_id = payload.get("plan")
+            require(isinstance(plan_id, str) and plan_id and Path(plan_id).name == plan_id,
+                    "Interrupted backup has an unproven absent replica", 5)
+            plan = read_json(safe_path(vault.control, f"deletions/{plan_id}.json"), {})
+            root_identity = payload.get("root_identity")
+            require(proof.get("kind") == "backup-replica-absent" and proof.get("at") == copy.get("absent_at") and
+                    isinstance(proof.get("at"), str) and utc(proof["at"]) >= utc(record["expires_at"]) and
+                    digest(proof) == identifier and plan.get("id") == plan_id and plan_digest(plan) == plan["digest"] and
+                    isinstance(root_identity, list) and len(root_identity) == 2 and all(type(value) is int for value in root_identity) and
+                    payload == interrupted_absence(plan, record, index, copy, root_identity) and any(
+                        entry["material"] == record["id"] and entry["copy_index"] == index and
+                        copy_identity(entry["copy"]) == copy_identity(copy) for entry in plan["entries"]),
+                    "Interrupted backup has an unproven absent replica", 5)
+        if copy["status"] in {"deleted", "absent"}:
+            root = vault.relocated_path(copy["root"])
+            require(not root.is_dir() or not safe_path(root, copy["path"]).exists(),
+                    "Bytes reappeared at an inactive interrupted backup replica", 5)
+            continue
+        _, path = authorized_target(vault, record, copy)
+        if path.exists():
+            require(file_digest(replica_path(vault, copy)) == copy["sha256"], "Interrupted backup ciphertext mismatch", 5)
+        unresolved = True
+    require(not unresolved, "Interrupted backup generation has unresolved replicas", 5)
+
+
+def replica_path(vault, copy):
     root = vault.relocated_path(copy["root"])
     if root != Path(copy["root"]):
         require(root in map(Path, vault.config.get("backup_destinations", [])),
                 "Relocated backup destination is not authorized", 5)
-    cipher = safe_path(root, copy["path"], exists=True).read_bytes()
+    return safe_path(root, copy["path"], exists=True)
+
+
+def verified_replica(vault, record, copy):
+    cipher = replica_path(vault, copy).read_bytes()
     require(digest(cipher) == copy["sha256"] == record["cipher_sha256"], "Backup ciphertext mismatch")
     require(digest(decrypt(vault, cipher)) == record["plain_sha256"], "Backup plaintext mismatch")
     return cipher
@@ -201,12 +279,13 @@ def verify_replica_deletions(vault, record):
     from .retention import copy_identity, plan_digest, slot
 
     retired = []
+    writing = writing_generation(record)
     for index, copy in enumerate(record["copies"]):
         if copy["status"] != "deleted":
             continue
         reason = f"Backup replica {index} lacks a verified deletion receipt"
         if "deletion_receipt" not in copy:
-            legacy = legacy_replica_receipt(vault, record, copy, index)
+            legacy = None if writing else legacy_replica_receipt(vault, record, copy, index)
             require(legacy, reason, 5)
             retired.append({"copy_index": index, "root": str(vault.relocated_path(copy["root"])),
                             "receipt": legacy, "proof": "legacy-round"})
@@ -225,7 +304,7 @@ def verify_replica_deletions(vault, record):
                 receipt.get("at") == copy.get("deleted_at") and payload.get("material") == record["id"] and
                 payload.get("copy_index") == index and payload.get("sha256") == copy["sha256"] and
                 intent.get("at") == receipt["at"] and
-                (intent if primary else generation).get("generation_digest") == record["approval"]["digest"] and
+                (intent if primary else generation).get("generation_digest") == (None if writing else record["approval"]["digest"]) and
                 intent.get("path") and vault.relocated_path(intent["path"]) == vault.relocated_path(copy["root"]) / copy["path"],
                 reason, 5)
         directory = safe_path(vault.control, "deletions")
@@ -240,17 +319,26 @@ def verify_replica_deletions(vault, record):
     return retired
 
 
-def _verify_backup(vault, identifier, *, allow_retired=False):
-    record = materials(vault)[identifier]
+def inspect_backup(vault, record, *, allow_retired=False, decrypt_replicas=False):
     signed_manifest(vault, record)
     retired = verify_replica_deletions(vault, record)
     checks = []
     for copy in record["copies"]:
         if copy["status"] == "present":
-            verified_replica(vault, record, copy)
+            if decrypt_replicas:
+                verified_replica(vault, record, copy)
+            else:
+                require(file_digest(replica_path(vault, copy)) == copy["sha256"] == record["cipher_sha256"],
+                        "Backup ciphertext mismatch", 5)
             checks.append({"root": str(vault.relocated_path(copy["root"])), "verified": True})
     require(checks or allow_retired and retired, "Backup has no retained replicas", 5)
-    return {"id": identifier, "status": "complete", "copies": checks, "deleted_copies": retired}
+    return {"id": record["id"], "status": "complete", "copies": checks, "deleted_copies": retired}
+
+
+def _verify_backup(vault, identifier, *, allow_retired=False):
+    record = materials(vault)[identifier]
+    require(record["id"] == identifier, "Backup identity changed", 5)
+    return inspect_backup(vault, record, allow_retired=allow_retired, decrypt_replicas=True)
 
 
 def restore(vault, identifier, destination):

@@ -7,10 +7,10 @@ import sys
 from uuid import uuid4
 
 from . import storage_policy
-from .core import Blocked, atomic, canonical, canonical_storage_path, decode, digest, executable, json_paths, lock, read_json, require, run, safe_path, stamp, sync_directory
+from .core import Blocked, atomic, canonical, canonical_storage_path, decode, digest, executable, file_digest, json_paths, lock, read_json, require, run, safe_path, stamp, sync_directory
 from .signing import trusted_signers, verify
 
-INACTIVE_COPIES = {"deleted", "moved"}
+INACTIVE_COPIES = {"deleted", "moved", "absent"}
 
 
 def archive_tree(root):
@@ -91,8 +91,9 @@ def decrypt(vault, cipher, identity=None):
     return run([executable("age"), "--decrypt", "-i", key], data=cipher).stdout
 
 
-def capture_copy(vault, record):
+def capture_ciphertexts(vault, record, *, read_bytes):
     errors = []
+    found = False
     for copy in record.get("copies", []):
         if copy["kind"] != "ciphertext" or copy["status"] != "present":
             continue
@@ -100,12 +101,22 @@ def capture_copy(vault, record):
             root = vault.relocated_path(copy["root"])
             allowed = root == vault.state / "custody" or root in map(Path, vault.config.get("storage_roots", []))
             require(allowed, "Capture ciphertext root is not authorized", 5)
-            cipher = safe_path(root, copy["path"], exists=True).read_bytes()
-            require(digest(cipher) == copy["sha256"] == record.get("cipher_sha256"), "Ciphertext changed", 5)
-            return cipher
+            path = safe_path(root, copy["path"], exists=True)
+            cipher = path.read_bytes() if read_bytes else None
+            sha = digest(cipher) if read_bytes else file_digest(path)
+            require(sha == copy["sha256"] == record.get("cipher_sha256"), "Ciphertext changed", 5)
+            if read_bytes:
+                return cipher
+            found = True
         except (Blocked, OSError) as exc:
             errors.append(str(exc))
-    raise Blocked("No verified capture ciphertext is available" + (": " + "; ".join(errors) if errors else ""), 5)
+    if not found or errors:
+        message = "Capture ciphertext integrity check failed" if found else "No verified capture ciphertext is available"
+        raise Blocked(message + (": " + "; ".join(errors) if errors else ""), 5)
+
+
+def capture_copy(vault, record):
+    return capture_ciphertexts(vault, record, read_bytes=True)
 
 
 def verified_capture(vault, record, cipher=None):
@@ -128,29 +139,35 @@ def save_material(vault, record):
         atomic(vault.control / "materials.json", rows)
 
 
-def integrity_findings(vault):
-    from .backups import verify_backup
+def integrity_findings(vault, *, records=None):
+    from .backups import inspect_backup, inspect_writing_generation, writing_generation
 
     try:
-        records = materials(vault)
+        records = materials(vault) if records is None else records
+        require(isinstance(records, dict), "Invalid custody inventory", 5)
     except (Blocked, OSError) as exc:
         return [("inventory", str(exc))]
     findings = []
-    for record in records.values():
-        live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
-        if not live and record.get("kind") != "backup":
-            continue
+    for identifier, record in records.items():
         try:
+            require(isinstance(record, dict) and record.get("id") == identifier and record.get("kind"),
+                    "Invalid custody material identity", 5)
+            live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
+            if not live and record["kind"] != "backup":
+                continue
             if record["kind"] == "backup":
-                verify_backup(vault, record["id"], allow_retired=True)
+                if writing_generation(record):
+                    inspect_writing_generation(vault, record)
+                else:
+                    inspect_backup(vault, record, allow_retired=True)
             elif record.get("decryption_verified"):
                 if any(copy.get("kind") == "ciphertext" for copy in live):
-                    verified_capture(vault, record)
+                    capture_ciphertexts(vault, record, read_bytes=False)
                 else:
                     require(not any(copy.get("kind") in {"native", "checkpoint"} for copy in live),
                             "Native copies or checkpoints have lost their verified capture", 5)
-        except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
-            findings.append((record["id"], str(exc)))
+        except (Blocked, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            findings.append((identifier, str(exc)))
     try:
         directory = safe_path(vault.control, "restorations")
         journals = json_paths(directory)
@@ -310,6 +327,9 @@ def native_guard(vault, material):
             "Recovery proof does not match the captured archive", 5)
     from .tasks import get_session
     session = get_session(vault, material["session"])
+    require(session.get("state") not in {"running", "reconciliation_required"} or
+            (session.get("launch_intent") or {}).get("recovery_material") != material["id"],
+            "Native recovery profile is in use or awaiting launch reconciliation", 5)
     receipt = next((r for r in session["launches"] if r.get("id") == proof.get("launch_receipt")), None)
     reconstruction = session.get("reconstruction", {})
     require(reconstruction.get("material") == material["id"] and
@@ -345,8 +365,13 @@ class RestoreDestinationConflict(Blocked):
     pass
 
 
-def restore_destination(vault, destination):
+def restore_destination(vault, destination, *, controller_profile=False):
     prohibited = (*vault.repository.worktree_roots(), vault.common, vault.state / "custody")
+    profiles = vault.state / "recovery-profiles"
+    if controller_profile:
+        require(destination.parent == profiles, "Native recovery profile must stay in controller state", 5)
+    else:
+        prohibited = (*prohibited, profiles)
     if (destination == destination.parent or ".." in destination.parts or destination == vault.state or
             any(destination.is_relative_to(root) or root.is_relative_to(destination) for root in prohibited)):
         raise RestoreDestinationConflict("Restore destination must be canonical and external to Git and custody storage", 5)
@@ -372,11 +397,94 @@ def session_reconstruction(session):
     return {key: session.get(key) for key in ("recovery_profile", "reconstruction")}
 
 
+def restoration_id(vault, identifier, destination):
+    return digest([vault.identity, identifier, os.path.normcase(str(destination))])
+
+
+def recovery_inventory(vault, record, source_id, expected, reconstruction):
+    from .lineage import sha256
+
+    source = read_json(safe_path(vault.control, f"restorations/{source_id}.json"))
+    receipts = safe_path(vault.control, "receipts")
+    if source is None:
+        # Releases before restoration journals recorded the result as a receipt only.
+        for path in json_paths(receipts):
+            try:
+                proof = read_json(safe_path(receipts, path.name, exists=True))
+            except (Blocked, OSError):
+                continue
+            if (isinstance(proof, dict) and proof.get("kind") == "reconstruction" and
+                    isinstance(proof.get("at"), str) and proof.get("payload") == reconstruction and digest(proof) == path.stem):
+                if "artifact_inventory" in record:
+                    return record["artifact_inventory"]
+                _, plain = verified_capture(vault, record)
+                return reconstruction_inventory(decode(plain))
+        raise Blocked("Recovery restoration receipt is missing or changed", 5)
+
+    result = source.get("result", {})
+    receipt = result.get("receipt")
+    require(source.get("format") == "healdan-restore-v1" and source.get("status") == "complete" and
+            source.get("binding") == expected and sha256(receipt) and
+            result == {**reconstruction, "receipt": receipt}, "Recovery requires a completed restoration for this session", 5)
+    proof = {"kind": "reconstruction", "at": source["started_at"], "payload": reconstruction}
+    require(receipt == digest(proof) and read_json(safe_path(receipts, receipt + ".json")) == proof,
+            "Recovery restoration receipt is missing or changed", 5)
+    return source["inventory"]
+
+
+def recovery_profile(vault, session, identifier):
+    """Materialize an executable profile while the caller holds the vault lock."""
+    record = materials(vault)[identifier]
+    reconstruction = session["reconstruction"]
+    source = Path(reconstruction["destination"])
+    archive_sha = record.get("plain_sha256")
+    require(source.is_absolute() and record.get("id") == identifier and record.get("session") == session["operation"] and
+            reconstruction.get("status") == "complete" and reconstruction.get("material") == identifier and
+            reconstruction.get("archive_sha256") == archive_sha, "Recovery does not match the original session and archive", 5)
+    source_id = restoration_id(vault, identifier, source)
+    expected = {"vault": vault.identity, "material": identifier, "destination": str(source),
+                "cipher_sha256": record.get("cipher_sha256"), "plain_sha256": archive_sha, "session": session["operation"]}
+    inventory = recovery_inventory(vault, record, source_id, expected, reconstruction)
+
+    directory = safe_path(vault.state, "recovery-profiles")
+    require(directory.resolve() == directory and not directory.is_junction(), "Unsafe recovery profile directory", 5)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    native = safe_path(directory, source_id)
+    restore_destination(vault, native, controller_profile=True)
+    internal_id = digest(["recovery-profile", vault.identity, source_id])
+    path = safe_path(vault.control, f"restorations/{internal_id}.json")
+    journal = read_json(path)
+    if journal is None:
+        require(restored_directory(native) is None, "Recovery profile destination already exists", 5)
+        journal = {"format": "healdan-restore-v1", "binding": {**expected, "destination": str(native)},
+                   "material": identifier, "started_at": stamp(), "stage": ".healdan-restore-" + uuid4().hex,
+                   "status": "preparing", "recovery_source": source_id, "inventory": inventory}
+        atomic(path, journal)
+    binding = journal["binding"]
+    require(journal.get("format") == "healdan-restore-v1" and journal.get("recovery_source") == source_id and
+            vault.relocated_path(binding["destination"]) == native and {**binding, "destination": str(source)} == expected and
+            journal["inventory"] == inventory, "Recovery profile intention changed", 5)
+    if journal["status"] == "complete":
+        # A dedicated profile remains writable for authentication and its own native continuation.
+        check_restricted_directory(native, journal)
+    else:
+        try:
+            reconstruct_capture(vault, record, native, path, journal)
+        except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+            journal["error"] = str(exc)
+            atomic(path, journal)
+            raise
+    if session.get("recovery_profile") != str(native):
+        session["recovery_profile"] = str(native)
+        atomic(safe_path(vault.control, f"sessions/{session['operation']}.json"), session)
+    return native
+
+
 def restore_capture(vault, identifier, destination):
     from .tasks import get_session
 
     destination = Path(destination).absolute()
-    identity = digest([vault.identity, identifier, os.path.normcase(str(destination))])
+    identity = restoration_id(vault, identifier, destination)
     path = safe_path(vault.control, f"restorations/{identity}.json")
     with lock(safe_path(vault.control, f"restorations/{identity}.lock")):
         with vault.locked():
@@ -416,6 +524,12 @@ def check_reconstruction(root, journal):
     require(restored_directory(root) == journal["stage_identity"] and
             reconstruction_inventory(archive_tree(root)) == journal["inventory"],
             "Restore destination collides with existing or changed data", 5)
+
+
+def check_restricted_directory(node, journal):
+    require(restored_directory(node) == journal["stage_identity"] and
+            (os.name == "nt" or stat.S_IMODE(node.stat().st_mode) == 0o700),
+            "Reconstruction location changed or is not restricted", 5)
 
 
 def write_staged_member(target, data):
@@ -470,15 +584,13 @@ def reconstruct_capture(vault, record, destination, path, journal):
             sync_directory(stage.parent)
             journal["stage_identity"] = restored_directory(stage)
             atomic(path, journal)
-    require(restored_directory(stage) == journal["stage_identity"] and
-            (os.name == "nt" or stat.S_IMODE(stage.stat().st_mode) == 0o700),
-            "Reconstruction staging location changed or is not restricted", 5)
+    check_restricted_directory(stage, journal)
     for relative, data in checked.items():
         target = safe_path(stage, relative)
         if not target.exists() or target.read_bytes() != data:
             write_staged_member(target, data)
     with vault.locked():
-        restore_destination(vault, destination)
+        restore_destination(vault, destination, controller_profile="recovery_source" in journal)
         check_reconstruction(stage, journal)
         from .retention import pending_deletion_paths
         require(not any(pending_deletion_paths(vault, target=destination / relative) for relative in checked),
@@ -498,6 +610,8 @@ def finish_reconstruction(vault, destination, path, journal):
     from .tasks import get_session
 
     with vault.locked():
+        if "recovery_source" in journal:
+            check_restricted_directory(destination, journal)
         check_reconstruction(destination, journal)
         binding = journal["binding"]
         record = materials(vault)[binding["material"]]
@@ -520,7 +634,7 @@ def finish_reconstruction(vault, destination, path, journal):
         if additions:
             copies.extend(additions)
             save_material(vault, record)
-        if record.get("session"):
+        if record.get("session") and "recovery_source" not in journal:
             session = get_session(vault, record["session"])
             if session_reconstruction(session) == journal["prior_session"]:
                 session.update(recovery_profile=str(destination), reconstruction=result)

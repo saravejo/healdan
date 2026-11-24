@@ -82,7 +82,7 @@ def shares_path(vault, copy, target):
 
 def copy_identity(copy):
     state = {"status", "deleted_at", "moved_at", "move_receipt", "archive_copy_index", "verified_archive_sha256",
-             "deletion_receipt"}
+             "deletion_receipt", "absent_at", "absence_receipt"}
     return {key: value for key, value in copy.items() if key not in state}
 
 
@@ -97,7 +97,7 @@ def generation_locator(material, index, copy):
 
 def shared_generation(material, index, copy):
     locator = generation_locator(material, index, copy)
-    if material["kind"] == "backup":
+    if material["kind"] == "backup" and "approval" in material:
         locator["generation_digest"] = material["approval"]["digest"]
     return locator
 
@@ -245,14 +245,17 @@ def has_active_checkpoints(record):
 
 
 def material_guard(vault, record, now, policy):
-    from .backups import signed_manifest, verify_replica_deletions
+    from .backups import check_writing_generation, signed_manifest, verify_replica_deletions, writing_generation
     require(not preserved(vault, record, policy), "Retention policy preserves material", 5)
     require_expired(record, now, policy)
     if record.get("classification") == "secret":
         require_secret_decisions(vault, record)
     if record.get("kind") == "backup":
-        signed_manifest(vault, record)
-        verify_replica_deletions(vault, record)
+        if writing_generation(record):
+            check_writing_generation(vault, record)
+        else:
+            signed_manifest(vault, record)
+            verify_replica_deletions(vault, record)
     if any(c.get("kind") == "native" for c in record.get("copies", [])):
         from .custody import hold
 
@@ -273,6 +276,8 @@ def material_guard(vault, record, now, policy):
 
 
 def authorized_target(vault, record, copy):
+    from .backups import writing_generation
+
     roots = [Path(p).resolve() for p in vault.config.get("storage_roots", [])]
     roots.append((vault.state / "custody").resolve())
     if record.get("kind") == "export" and copy.get("kind") == "export":
@@ -282,6 +287,9 @@ def authorized_target(vault, record, copy):
         roots.append((vault.root / "archive").resolve())
     roots.extend(Path(p).resolve() for p in vault.config.get("backup_destinations", []))
     root = vault.relocated_path(copy["root"])
+    if record.get("kind") == "backup" and writing_generation(record):
+        require(root in map(Path, vault.config.get("backup_destinations", [])),
+                "Interrupted backup copy root is not a configured backup destination", 5)
     if copy.get("restoration"):
         journal = read_json(safe_path(vault.control, "restorations/" + copy["restoration"] + ".json"), {})
         binding = journal.get("binding", {})
@@ -462,9 +470,12 @@ def file_revision(path):
     return [info.st_ctime_ns, info.st_size]
 
 
-def apply_entry(vault, path, plan, entry, now):
+def apply_entry(vault, path, plan, entry, now, policy_snapshot):
+    from .backups import interrupted_absence, writing_generation
+
     inventory = materials(vault)
     material = inventory[entry["material"]]
+    require(material["id"] == entry["material"], "Material identity changed", 5)
     copy = material["copies"][entry["copy_index"]]
     require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
     at = stamp(now)
@@ -486,11 +497,12 @@ def apply_entry(vault, path, plan, entry, now):
             record_archive_deletion(vault, inventory, entry, at)
         status = copy["status"]
         entry.update(status=status, at=copy.get(f"{status}_at") or at)
-        if copy.get("deletion_receipt"):
-            entry["receipt"] = copy["deletion_receipt"]
+        receipt = copy.get("deletion_receipt") or copy.get("absence_receipt")
+        if receipt:
+            entry["receipt"] = receipt
         return
 
-    policy = storage_policy.effective(vault)
+    policy = policy_snapshot()
     if not intent and not entry.get("verified_archive_generations") and preserved(vault, material, policy):
         require(not storage_policy.preservation_authorization_pending(vault, material, policy, now),
                 PRESERVATION_AUTHORIZATION_PENDING, 5)
@@ -551,7 +563,7 @@ def apply_entry(vault, path, plan, entry, now):
             intent = {"path": str(target), "slot": list(slot(entry)), "root_identity": file_identity(root),
                       "file_identity": file_id, "file_revision": revision, "file_mtime_ns": mtime_ns,
                       "plan_digest": plan["digest"], "plan_id": plan["id"], "at": at}
-            if material["kind"] == "backup":
+            if material["kind"] == "backup" and "approval" in material:
                 intent["generation_digest"] = material["approval"]["digest"]
             if len(generations) > 1:
                 intent["generations"] = generations
@@ -568,6 +580,20 @@ def apply_entry(vault, path, plan, entry, now):
         target.unlink()
         sync_directory(target.parent)
     else:
+        if material["kind"] == "backup" and writing_generation(material) and not intent:
+            material_guard(vault, material, now, policy)
+            location = copy_path(vault, copy)
+            root_identity = file_identity(root)
+            require(not pending_deletion_paths(vault, target=location, exclude=(plan["id"], slot(entry))),
+                    "Another deletion plan is reconciling this copy", 5)
+            require(not target.exists() and root.is_dir() and file_identity(root) == root_identity,
+                    "Interrupted backup location changed", 5)
+            payload = interrupted_absence(plan, material, entry["copy_index"], copy, root_identity)
+            receipt = vault.receipt("backup-replica-absent", payload, at=at)
+            copy.update(status="absent", absent_at=at, absence_receipt=receipt)
+            save_material(vault, material)
+            entry.update(status="absent", at=at, receipt=receipt)
+            return
         if copy["kind"] == "archive" and not intent and not entry.get("verified_archive_generations"):
             entry["awaiting_archive_reconciliation"] = True
         require(entry["status"] == "deleting" and (intent and intent["plan_digest"] == plan["digest"] or
@@ -596,6 +622,20 @@ def execute(vault, identifier, now=None):
         require(plan_digest(record) == record["digest"], "Deletion plan changed after persistence")
         require(record["id"] == identifier, "Deletion plan identifier changed", 5)
         reconcile_inbox(vault, now)
+        policy = None
+        policy_error = None
+
+        def policy_snapshot():
+            nonlocal policy, policy_error
+            if policy is None and policy_error is None:
+                try:
+                    policy = storage_policy.effective(vault)
+                except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+                    policy_error = exc
+            if policy_error is not None:
+                raise policy_error
+            return policy
+
         for entry in sorted(record["entries"], key=lambda e: (e["status"] != "deleting", e["copy"]["kind"] == "ciphertext")):
             if entry["status"] in RESOLVED:
                 if entry["status"] == "preserved":
@@ -603,13 +643,13 @@ def execute(vault, identifier, now=None):
                         material = materials(vault)[entry["material"]]
                         copy = material["copies"][entry["copy_index"]]
                         if (copy["status"] not in INACTIVE_COPIES and
-                                storage_policy.preservation_authorization_pending(vault, material, storage_policy.effective(vault), now)):
+                                storage_policy.preservation_authorization_pending(vault, material, policy_snapshot(), now)):
                             entry.update(status="pending", error=PRESERVATION_AUTHORIZATION_PENDING, at=stamp(now))
                     except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
                         entry.update(status="pending", error=str(exc), at=stamp(now))
                 continue
             try:
-                apply_entry(vault, path, record, entry, now)
+                apply_entry(vault, path, record, entry, now, policy_snapshot)
                 entry.pop("error", None)
                 entry.pop("awaiting_archive_reconciliation", None)
             except (Blocked, OSError, ValueError, KeyError, IndexError, TypeError) as exc:
@@ -621,6 +661,8 @@ def execute(vault, identifier, now=None):
                              for e in record["entries"] if e["status"] not in RESOLVED]
         record["status"] = "pending" if record["pending"] else "complete"
         atomic(path, record)
+        latest_deletion = max((utc(entry["at"]) for entry in record["entries"] if entry["status"] == "deleted" and entry.get("at")),
+                              default=utc(record["created_at"]))
         vault.receipt("deletion-round", {"plan": identifier, "digest": record["digest"], "status": record["status"]},
-                      at=record["created_at"])
+                      at=max(utc(record["created_at"]), latest_deletion))
         return record

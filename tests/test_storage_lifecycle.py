@@ -5,11 +5,12 @@ from datetime import timedelta
 from io import BytesIO
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from support import VaultTest
-from healdan import backups, cli, compatibility, custody, inbox, linting, maintenance, retention, setup, storage_policy, tasks
-from healdan.core import Blocked, Vault, atomic, decode, digest, read_json, stamp, utc
+from healdan import backups, cli, compatibility, custody, inbox, launcher, linting, maintenance, retention, setup, storage_policy, tasks
+from healdan.core import Blocked, Vault, atomic, canonical, decode, digest, read_json, stamp, utc
 
 
 class StorageLifecycle(VaultTest):
@@ -255,7 +256,7 @@ class StorageLifecycle(VaultTest):
         identifier = original["id"]
         lost = second / (identifier + ".age")
         cipher = lost.read_bytes()
-        plan = retention.plan(self.vault, cutoff)
+        plan = retention.plan(self.vault, cutoff - timedelta(hours=2))
         path = self.vault.control / "deletions" / (plan["id"] + ".json")
         material = custody.materials(self.vault)[identifier]
         lost.unlink()
@@ -269,7 +270,17 @@ class StorageLifecycle(VaultTest):
         atomic(path, plan)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
             backups.verify_backup(self.vault, identifier)
-        receipt = self.vault.receipt("deletion-round", {"plan": plan["id"], "digest": plan["digest"], "status": "pending"})
+        offline = first.with_name("legacy primary offline")
+        first.rename(offline)
+        try:
+            retried = retention.execute(self.vault, plan["id"], cutoff)
+            self.assertEqual(retried["status"], "pending")
+        finally:
+            offline.rename(first)
+        proof = {"kind": "deletion-round", "at": stamp(cutoff),
+                 "payload": {"plan": plan["id"], "digest": plan["digest"], "status": "pending"}}
+        receipt = digest(proof)
+        self.assertEqual(read_json(self.vault.control / "receipts" / (receipt + ".json")), proof)
         self.assertEqual(retention.plan_digest(plan), plan["digest"])
         history = {p: p.read_bytes() for p in (path, self.vault.control / "materials.json",
                                                 self.vault.control / "receipts" / (receipt + ".json"))}
@@ -295,6 +306,82 @@ class StorageLifecycle(VaultTest):
         self.assertEqual((resumed["status"], resumed["digest"]), ("complete", plan["digest"]))
         retired = backups.verify_backup(self.vault, identifier, allow_retired=True)["deleted_copies"]
         self.assertEqual((retired[0]["copy_index"], retired[1]["proof"]), (0, "legacy-round"))
+
+    def test_interrupted_backup_retires_expired_verified_bytes_and_observes_absent_replicas(self):
+        first = self.configure_age()
+        second, third = (self.base / name for name in ("empty-replica", "offline-replica"))
+        second.mkdir()
+        third.mkdir()
+        self.vault.config["backup_destinations"].extend((str(second), str(third)))
+        atomic(self.vault.config_path, self.vault.config)
+        self.change_policy(backup="manual")
+        now = utc()
+        expiry = now + timedelta(hours=2)
+
+        def stop_at_second(path, data):
+            if path.parent == second:
+                raise OSError("Fixture interrupted the second replica write")
+            return atomic(path, data)
+
+        with patch("healdan.backups.atomic", side_effect=stop_at_second):
+            with self.assertRaisesRegex(OSError, "second replica write"):
+                backups.create(self.vault, "long", expiry, now=now)
+        original, = custody.materials(self.vault).values()
+        identifier = original["id"]
+        target = first / (identifier + ".age")
+        cipher = target.read_bytes()
+        self.assertEqual([copy["status"] for copy in original["copies"]], ["present", "planned", "planned"])
+        self.assertEqual(retention.plan(self.vault, now)["entries"], [])
+        self.assertEqual(target.read_bytes(), cipher)
+
+        offline = third.with_name("offline-away")
+        third.rename(offline)
+        plan = retention.plan(self.vault, expiry)
+        atomic(target, b"divergent disposable replica")
+        pending = retention.execute(self.vault, plan["id"], expiry)
+        self.assertEqual(pending["status"], "pending", pending)
+        self.assertTrue(any("Copy hash changed" in row["reason"] for row in pending["pending"]))
+        self.assertTrue(any("offline" in row["reason"] for row in pending["pending"]))
+        self.assertEqual(target.read_bytes(), b"divergent disposable replica")
+        observed = custody.materials(self.vault)[identifier]["copies"][1]
+        self.assertEqual(observed["status"], "absent")
+        self.assertNotIn("deletion_receipt", observed)
+
+        atomic(target, cipher)
+        offline.rename(third)
+        completed = retention.execute(self.vault, plan["id"], expiry)
+        updated = custody.materials(self.vault)[identifier]
+        self.assertEqual((completed["status"], updated["status"]), ("complete", "writing"), completed)
+        self.assertEqual(updated["cipher_sha256"], original["cipher_sha256"])
+        self.assertNotIn("approval", updated)
+        self.assertEqual([copy["status"] for copy in updated["copies"]], ["deleted", "absent", "absent"])
+        self.assertFalse(target.exists())
+        for index, copy in enumerate(updated["copies"]):
+            receipt = copy["deletion_receipt"] if index == 0 else copy["absence_receipt"]
+            evidence = read_json(self.vault.control / "receipts" / (receipt + ".json"))
+            self.assertEqual(evidence["kind"], "deletion-copy" if index == 0 else "backup-replica-absent")
+        self.assertFalse(any(check["name"] == "custody:" + identifier for check in setup.doctor(self.vault)["checks"]))
+        self.assertEqual(maintenance.daily(self.vault, expiry, report_custody=True)["status"], "complete")
+        capabilities = read_json(Path(compatibility.__file__).with_name("controller_formats.json"))
+        capabilities["journal"].remove("healdan-backup-writing-absence-v1")
+        with self.assertRaisesRegex(Blocked, "healdan-backup-writing-absence-v1"):
+            compatibility.check(self.vault, capabilities)
+        atomic(second / target.name, b"unrelated bytes placed after observation")
+        self.assertIn((identifier, "Bytes reappeared at an inactive interrupted backup replica"), custody.integrity_findings(self.vault))
+        self.assertEqual(retention.execute(self.vault, plan["id"], expiry)["status"], "complete")
+        self.assertEqual((second / target.name).read_bytes(), b"unrelated bytes placed after observation")
+
+        complete = backups.create(self.vault, "long", expiry, now=now)
+        unsigned = {key: value for key, value in complete.items() if key not in {"approval", "verified_at"}}
+        unsigned["status"] = "writing"
+        custody.save_material(self.vault, unsigned)
+        plan = retention.plan(self.vault, expiry)
+        result = retention.execute(self.vault, plan["id"], expiry)
+        self.assertEqual(result["status"], "pending")
+        self.assertTrue(all(row["reason"] == "Backup generation already has a completion receipt" for row in result["pending"]))
+        self.assertTrue(all((Path(copy["root"]) / copy["path"]).is_file() for copy in complete["copies"]))
+        custody.save_material(self.vault, complete)
+        self.assertEqual(backups.verify_backup(self.vault, complete["id"])["status"], "complete")
 
     def test_task_capacity_waits_for_custody_with_backup_off(self):
         keys = self.age()
@@ -404,7 +491,7 @@ class StorageLifecycle(VaultTest):
                     seen = []
 
                     def scan(path):
-                        if Path(path) == draft.parent:
+                        if path in (draft.parent, str(draft.parent)):
                             seen.append(path)
                             if unavailable_scan is None or len(seen) == unavailable_scan:
                                 raise PermissionError("Fixture temporarily unavailable ordinary directory")
@@ -1009,7 +1096,7 @@ class StorageLifecycle(VaultTest):
 
         def scan(path):
             entries = scandir(path)
-            return interrupted_scan(entries) if Path(path) == directory else entries
+            return interrupted_scan(entries) if path in (directory, str(directory)) else entries
 
         def failed_clock_write(path, payload):
             if path == task_file:
@@ -1091,7 +1178,7 @@ class StorageLifecycle(VaultTest):
                 directory.mkdir(exist_ok=True)
 
                 def unavailable(path):
-                    if Path(path) == directory:
+                    if path in (directory, str(directory)):
                         raise PermissionError("Fixture journal directory temporarily unavailable: " + name)
                     return scandir(path)
 
@@ -1235,6 +1322,29 @@ class StorageLifecycle(VaultTest):
         known = [read_json(self.vault.control / "deletions" / (p + ".json")) for p in plans]
         for left, right in zip(known[0]["entries"], known[1]["entries"]):
             self.assertEqual(left["receipt"], right["receipt"])
+
+    def test_retention_execution_verifies_the_current_policy_once_per_plan(self):
+        self.change_policy(backup="off")
+        self.change_policy(backup="manual")
+        now = utc()
+        retired = [self.export(f"eligible-{index}", stamp(now - timedelta(days=10)))[1] for index in range(3)]
+        first = retention.plan(self.vault, now)
+        with patch("healdan.storage_policy.authorization", wraps=storage_policy.authorization) as checked:
+            result = retention.execute(self.vault, first["id"], now)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(checked.call_count, 2)
+        self.assertFalse(any(target.exists() for target in retired))
+
+        protected = [self.export(f"protected-{index}", stamp(now - timedelta(days=10)))[1] for index in range(3)]
+        second = retention.plan(self.vault, now)
+        self.change_policy(backup="manual", retention_mode="keep_forever")
+        for _ in range(2):
+            with patch("healdan.storage_policy.authorization", wraps=storage_policy.authorization) as checked:
+                result = retention.execute(self.vault, second["id"], now)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(checked.call_count, 3)
+            self.assertTrue(all(entry["status"] == "preserved" for entry in result["entries"]))
+        self.assertTrue(all(target.exists() for target in protected))
 
     def test_uncertain_copy_paths_preserve_shared_bytes_and_isolate_other_effects(self):
         self.change_policy()
@@ -1394,6 +1504,110 @@ class StorageLifecycle(VaultTest):
         self.assertEqual((destination / "a.jsonl").read_bytes(), b"first synthetic conversation file")
         self.assertEqual(restore["status"], "complete")
 
+    def test_recovery_launch_materializes_private_profile_and_keeps_the_external_restore(self):
+        self.age()
+        record, origin = self.capture(native=True)
+        operation = record["session"]
+        session_path = self.vault.control / "sessions" / (operation + ".json")
+        session = tasks.get_session(self.vault, operation)
+        session["launches"].append({"id": "synthetic-prior-launch"})
+        atomic(session_path, session)
+        external = self.base / "operator export"
+        restoration = custody.restore_capture(self.vault, record["id"], external)
+        copies = {path.relative_to(external): path.read_bytes() for path in external.rglob("*.jsonl")}
+        receipt_path = self.vault.control / "receipts" / (restoration["receipt"] + ".json")
+        external_receipt = receipt_path.read_bytes()
+        profile = self.state / "recovery-profiles" / custody.restoration_id(self.vault, record["id"], external)
+        authentications = []
+        process_launches = []
+        active_plan = None
+        start_process = launcher.subprocess.Popen
+
+        def mocked_command(args, **kwargs):
+            if args[1:3] == ["auth", "status"]:
+                authentications.append(Path(kwargs["env"]["CLAUDE_CONFIG_DIR"]))
+                return SimpleNamespace(returncode=1 if len(authentications) == 1 else 0)
+            self.assertEqual(args[0], "ps")
+            return SimpleNamespace(stdout=b"synthetic fixture process identity")
+
+        def mocked_process(args, *extra, **kwargs):
+            if args[0] != str(self.base / "srt"):
+                return start_process(args, *extra, **kwargs)
+            process_launches.append(args)
+            self.assertEqual(Path(kwargs["env"]["CLAUDE_CONFIG_DIR"]), profile)
+            self.assertIn(str(profile / "settings.json"), args)
+            self.assertNotIn(str(external), " ".join(args))
+            def communicate(context, timeout):
+                self.assertIn(b"Recovery verification only", context)
+                if active_plan is not None:
+                    result = retention.execute(self.vault, active_plan["id"], "2026-02-15T00:00:00Z")
+                    self.assertTrue(any("in use or awaiting launch reconciliation" in row["reason"] for row in result["pending"]))
+                    self.assertTrue((profile / "a.jsonl").is_file())
+                kwargs["stdout"].write(canonical({"session_id": session["uuid"], "usage": {"input_tokens": 2}}))
+            return SimpleNamespace(pid=421, returncode=0, communicate=communicate)
+
+        write_member = custody.write_staged_member
+
+        def interrupted_write(path, body):
+            write_member(path, body)
+            raise SystemExit("Fixture interrupted before internal profile publication")
+
+        with patch("healdan.build.require_active"), patch("healdan.launcher._probe"), \
+                patch("healdan.launcher.executable", side_effect=lambda name: str(self.base / name)), \
+                patch("healdan.launcher.run", side_effect=mocked_command), \
+                patch("healdan.launcher.subprocess.Popen", side_effect=mocked_process):
+            with patch("healdan.custody.write_staged_member", side_effect=interrupted_write):
+                with self.assertRaises(SystemExit):
+                    launcher.launch(self.vault, operation, resume=True, recovery_material=record["id"])
+            self.assertFalse(profile.exists() or authentications or process_launches)
+            with self.assertRaises(Blocked) as auth_error:
+                launcher.launch(self.vault, operation, resume=True, recovery_material=record["id"])
+            self.assertIn(str(profile), str(auth_error.exception))
+            self.assertTrue(profile.is_dir())
+            launch = launcher.launch(self.vault, operation, resume=True, recovery_material=record["id"])
+            proof = {"material": record["id"], "cipher_sha256": record["cipher_sha256"], "plain_sha256": record["plain_sha256"],
+                     "reconstruction_sha256": record["plain_sha256"], "launch_receipt": launch["id"], "uuid": session["uuid"],
+                     "action": session["action"], "usage": launch["cumulative_usage"]}
+            material = custody.materials(self.vault)[record["id"]]
+            material["native_recovery"] = self.signed(proof, "recovery")
+            custody.save_material(self.vault, material)
+            active_plan = retention.plan(self.vault, "2026-02-15T00:00:00Z")
+            launcher.launch(self.vault, operation, resume=True, recovery_material=record["id"])
+
+        current = tasks.get_session(self.vault, operation)
+        self.assertEqual((current["recovery_profile"], current["reconstruction"]["destination"]), (str(profile), str(external)))
+        self.assertEqual(authentications, [profile] * 3)
+        self.assertEqual(len(process_launches), 2)
+        self.assertEqual({name: (external / name).read_bytes() for name in copies}, copies)
+        self.assertEqual(receipt_path.read_bytes(), external_receipt)
+        self.assertEqual((profile / "a.jsonl").read_bytes(), (origin / "a.jsonl").read_bytes())
+        self.assertTrue(any(copy.get("root") == str(profile) and copy["kind"] == "native"
+                            for copy in custody.materials(self.vault)[record["id"]]["copies"]))
+
+    def test_recovery_profile_accepts_a_legacy_reconstruction_receipt(self):
+        self.age()
+        record, _ = self.capture(native=True)
+        session = tasks.get_session(self.vault, record["session"])
+        original = self.state / "legacy-profile"
+        _, plain = custody.verified_capture(self.vault, record)
+        reconstruction = {**custody.restore_tree(decode(plain), original), "material": record["id"]}
+        session.update(recovery_profile=str(original), reconstruction=reconstruction)
+        atomic(self.vault.control / "sessions" / (session["operation"] + ".json"), session)
+        with self.vault.locked():
+            with self.assertRaisesRegex(Blocked, "receipt is missing or changed"):
+                custody.recovery_profile(self.vault, session, record["id"])
+        receipt = self.vault.receipt("reconstruction", reconstruction)
+        with self.vault.locked():
+            internal = custody.recovery_profile(self.vault, session, record["id"])
+        self.assertEqual(internal.parent, self.state / "recovery-profiles")
+        self.assertEqual((internal / "a.jsonl").read_bytes(), (original / "a.jsonl").read_bytes())
+        self.assertEqual(session["reconstruction"], reconstruction)
+        self.assertEqual(read_json(self.vault.control / "receipts" / (receipt + ".json"))["payload"], reconstruction)
+        capabilities = read_json(Path(compatibility.__file__).with_name("controller_formats.json"))
+        capabilities["journal"].remove("healdan-recovery-profile-v1")
+        with self.assertRaisesRegex(Blocked, "healdan-recovery-profile-v1"):
+            compatibility.check(self.vault, capabilities)
+
     def test_scheduled_daily_isolates_custody_findings_and_keeps_trial_gate(self):
         self.configure_age()
         record, _ = self.capture()
@@ -1412,3 +1626,68 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(result["backup_result"]["status"], "complete", result)
         self.assertTrue(backups.verify_backup(self.vault, result["backup"])["copies"])
         self.assertEqual((destination / "other.txt").read_bytes(), b"external fixture")
+
+    def test_scheduled_maintenance_reports_custody_once_without_routine_decryption(self):
+        first_root = self.configure_age(backup_interval_hours=24)
+        now = utc()
+        old = backups.create(self.vault, "long", now + timedelta(days=2), now=now - timedelta(days=2))
+        current_root = self.base / "current-backup"
+        current_root.mkdir()
+        self.vault.config["backup_destinations"] = [str(current_root)]
+        atomic(self.vault.config_path, self.vault.config)
+        self.change_policy(backup="scheduled")
+        old_cipher = first_root / (old["id"] + ".age")
+        record, _ = self.capture()
+        record["closed_at"] = stamp(now)
+        custody.save_material(self.vault, record)
+        capture = self.state / "custody" / (record["id"] + ".age")
+
+        with patch("healdan.backups.decrypt", side_effect=AssertionError("Routine backup check must not decrypt")), \
+                patch("healdan.custody.decrypt", side_effect=AssertionError("Routine capture check must not decrypt")):
+            self.assertEqual(custody.integrity_findings(self.vault), [])
+            self.assertTrue(old_cipher.is_file() and capture.is_file())
+        atomic(capture, b"corrupt disposable capture")
+        first_root.rename(first_root.with_name("historical backup offline"))
+        doctor = setup.doctor
+
+        def configured(vault, *, check_custody=True):
+            report = doctor(vault, check_custody=check_custody)
+            checks = [row for row in report["checks"] if row["name"].startswith("custody:")]
+            checks.append({"name": "trial:launchd", "passed": True})
+            return {"ready": all(row["passed"] for row in checks), "checks": checks}
+
+        def run_job(job):
+            output = BytesIO()
+            with patch("healdan.cli.sys.stdout") as stdout:
+                stdout.buffer = output
+                code = cli.main(["--vault", str(self.root), "--state", str(self.state), "--vault-id", self.vault.identity,
+                                 "maintenance", "run-scheduled", job])
+            return code, decode(output.getvalue())
+
+        with patch("healdan.setup.doctor", side_effect=configured), \
+                patch("healdan.custody.integrity_findings", wraps=custody.integrity_findings) as audit:
+            code, daily = run_job("daily")
+        self.assertEqual((code, daily["status"], daily["backup_result"]["status"]), (5, "pending", "complete"), daily)
+        audit.assert_called_once()
+        rows = {row["custody"]: row["reason"] for row in daily["pending"] if "custody" in row}
+        self.assertIn("Ciphertext changed", rows[record["id"]])
+        self.assertIn("Required regular file is missing", rows[old["id"]])
+        self.assertEqual(backups.verify_backup(self.vault, daily["backup"])["status"], "complete")
+        with patch("healdan.setup.doctor", side_effect=configured), \
+                patch("healdan.backups.decrypt", side_effect=AssertionError("Scheduled lint must not decrypt")), \
+                patch("healdan.custody.decrypt", side_effect=AssertionError("Scheduled lint must not decrypt")):
+            code, lint = run_job("lint")
+        self.assertEqual((code, lint["status"]), (5, "complete"), lint)
+        self.assertEqual({row["key"] for row in lint["findings"].values() if row["category"] == "custody"}, set(rows))
+
+        with patch("healdan.setup.doctor", side_effect=configured), \
+                patch("healdan.linting.materials", side_effect=PermissionError("Fixture custody inventory temporarily unavailable")):
+            code, lint = run_job("lint")
+        self.assertEqual((code, lint.get("status")), (5, "partial"), lint)
+        self.assertIn({"category": "custody", "error": "Fixture custody inventory temporarily unavailable"}, lint["errors"])
+        self.assertIn("query:coverage", lint["findings"])
+
+        with patch("healdan.maintenance.platform.system", return_value="Darwin"), \
+                patch("healdan.setup.doctor", side_effect=configured), \
+                patch("healdan.maintenance.schedule_definitions", return_value=[]):
+            self.assertTrue(maintenance.schedule(self.vault, activate=True)["activated"])

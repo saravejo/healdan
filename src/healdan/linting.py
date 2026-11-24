@@ -57,13 +57,18 @@ def collect(vault, now=None):
             add("tasks", task["id"], "Closure awaits preservation/reconciliation")
         if task.get("presented_at") and not task.get("answered_at") and utc(now) - utc(task["presented_at"]) >= timedelta(days=7):
             add("tasks", task["id"] + ":human", "Human waiting deadline reached")
-    records = materials(vault)
+    try:
+        records = materials(vault)
+        require(isinstance(records, dict), "Invalid custody inventory", 5)
+    except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+        records = {}
+        errors.append({"category": "custody", "error": str(exc)})
     try:
         policy = storage_policy.effective(vault)
     except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
         policy = None
         add("retention", "policy", str(exc))
-    for identifier, problem in integrity_findings(vault):
+    for identifier, problem in integrity_findings(vault, records=records):
         add("custody", identifier, problem)
     for material in records.values():
         if material["kind"] != "backup":

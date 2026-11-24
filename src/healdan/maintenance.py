@@ -28,8 +28,9 @@ def execute_plan(vault, identifier, now=None, *, automatic=False, previous=None)
         return {"id": identifier, "status": "pending", "pending": [{"reason": str(exc)}]}
 
 
-def daily(vault, now=None):
+def daily(vault, now=None, *, report_custody=False):
     from . import retention
+    from .custody import integrity_findings
     from .tasks import get_task, preserve_and_close, reconcile_clock, reconcile_expired, task_ids
 
     now = utc(now)
@@ -82,6 +83,10 @@ def daily(vault, now=None):
             if not pending and backup.get("legacy_error"):
                 legacy_backup_error = {"error": backup["legacy_error"], "code": 5}
             pending.append({"backup": backup["reason"]})
+        if report_custody:
+            reported = {(item.get("material"), item.get("reason")) for item in pending}
+            pending.extend({"custody": identifier, "reason": reason} for identifier, reason in integrity_findings(vault)
+                           if (identifier, reason) not in reported)
     legacy = pending[0] if pending and "task" in pending[0] else {}
     return {**legacy, **legacy_backup_error, "status": "pending" if pending else "complete", "notices": notices,
             "retention": results[0]["id"] if results else None, "plans": results, "pending": pending,
@@ -188,15 +193,15 @@ def _schedule_scope(vault, trial):
         _check_trial_settings(vault, workspace)
 
 
-def _check_readiness(vault, trial, operation, *, allow_custody_findings=False):
+def _check_readiness(vault, trial, operation):
     from .setup import doctor
 
-    report = doctor(vault)
+    report = doctor(vault, check_custody=False)
     ready = report["ready"]
     checks = report.get("checks", [])
-    if allow_custody_findings and checks:
+    if checks:
         checks = [row for row in checks if not row["name"].startswith("custody:")]
-        ready = all(row["passed"] for row in checks)
+        ready = bool(checks) and all(row["passed"] for row in checks)
     if trial:
         ready = (sum(row["name"] == "trial:launchd" for row in checks) == 1 and
                  all(row["passed"] for row in checks if row["name"] != "trial:launchd"))
@@ -217,8 +222,8 @@ def run_scheduled(vault, job, expected_vault, *, trial=False):
     with vault.locked():
         vault.refresh_settings()
         _schedule_scope(vault, trial)
-        _check_readiness(vault, trial, "running a scheduled job", allow_custody_findings=job == "daily")
-        return lint(vault) if job == "lint" else daily(vault)
+        _check_readiness(vault, trial, "running a scheduled job")
+        return lint(vault) if job == "lint" else daily(vault, report_custody=True)
 
 
 def schedule_definitions(vault, build=None, *, trial=False):
