@@ -100,12 +100,18 @@ def remapped_copies(remap, records, destination, state):
     return selected
 
 
-def origin_paths(path, copy, bindings):
+def origin_copy_path(copy):
     path_type = PureWindowsPath if PureWindowsPath(copy["root"]).drive else PurePosixPath
+    return path_type(copy["root"]) / copy["path"]
+
+
+def origin_paths(path, copy, bindings):
+    original = origin_copy_path(copy)
+    path_type = type(original)
     source, root = path_type(path), path_type(copy["root"])
     if not source.is_absolute() or ".." in source.parts:
         return
-    yield source, root / copy["path"]
+    yield source, original
     for origin in bindings:
         if snapshot.origin_path_type(origin["location"]) == path_type:
             yield (binding.relocated_path(source, origin, path_type=path_type),
@@ -194,6 +200,62 @@ def check_origin_move(record, index, copy, records, bindings):
             verified_export_move(record, index, copy, kind, payload, bindings), reason, 5)
 
 
+def legacy_archive_entry_matches(entry, expected, copy, bindings):
+    from .retention import generation_locator
+
+    frozen = entry["copy"]
+    generations = entry.get("verified_archive_generations")
+    if (entry.get("intent") is not None or not isinstance(generations, list) or
+            not isinstance(frozen, dict) or frozen.get("kind") != "archive" or frozen.get("sha256") != copy["sha256"] or
+            type(entry.get("copy_index")) is not int):
+        return False
+    locators = [locator for locator in generations if isinstance(locator, dict) and type(locator.get("copy_index")) is int]
+    primary = generation_locator({"id": entry["material"]}, entry["copy_index"], frozen)
+    if locators.count(expected) != 1 or locators.count(primary) != 1:
+        return False
+    try:
+        snapshot.check_material_copy(entry["material"], frozen)
+    except Blocked:
+        return False
+    return matches_origin_path(str(origin_copy_path(frozen)), copy, bindings)
+
+
+def verified_legacy_archive_deletion(record, index, copy, records, bindings):
+    from .retention import deletion_payload, generation_locator, plan_digest
+
+    at = copy.get("deleted_at")
+    if copy["kind"] != "archive" or copy.get("verified_archive_sha256") != copy["sha256"] or not isinstance(at, str):
+        return False
+    direct = "deletion_receipt" in copy
+    if direct:
+        # B04 may write a per-slot receipt while finishing a plan that predates deletion intents.
+        expected_receipt = {"kind": "deletion-copy", "at": at,
+                            "payload": deletion_payload({"copy": copy}, record["id"], index)}
+        identifier = copy["deletion_receipt"]
+        if digest(expected_receipt) != identifier or records.get(f"receipts/{identifier}.json") != expected_receipt:
+            return False
+
+    expected = generation_locator(record, index, copy)
+    for name, plan in records.items():
+        if (not name.startswith("deletions/") or name != f"deletions/{plan['id']}.json" or
+                plan.get("status") not in {"planned", "pending", "complete"} or plan_digest(plan) != plan["digest"]):
+            continue
+        if not any((entry.get("status") == "deleted" or
+                    entry.get("status") == "deleting" and plan.get("status") != "complete") and
+                   legacy_archive_entry_matches(entry, expected, copy, bindings) for entry in plan["entries"]):
+            continue
+        if direct:
+            return True
+        if plan["status"] == "planned":
+            continue
+        payloads = [{"plan": plan["id"], "digest": plan["digest"], "status": status} for status in ("pending", "complete")]
+        if any(receipt_name.startswith("receipts/") and receipt.get("kind") == "deletion-round" and
+               receipt.get("payload") in payloads and utc(receipt["at"]) >= utc(at) and
+               receipt_name == f"receipts/{digest(receipt)}.json" for receipt_name, receipt in records.items()):
+            return True
+    return False
+
+
 def check_inactive_origin(record, index, copy, records, bindings):
     from .backups import check_replica_absence_proof, legacy_replica_proof, writing_generation
     from .retention import check_deletion_proof
@@ -211,7 +273,7 @@ def check_inactive_origin(record, index, copy, records, bindings):
             plans = ((Path(name).stem, value) for name, value in records.items() if name.startswith("deletions/"))
             receipts = ((Path(name).stem, value) for name, value in records.items() if name.startswith("receipts/"))
             require(legacy_replica_proof(record, copy, index, plans, receipts), reason, 5)
-        else:
+        elif not verified_legacy_archive_deletion(record, index, copy, records, bindings):
             check_deletion_proof(record, index, copy, records.get,
                                  lambda path, claim: matches_origin_path(path, claim, bindings),
                                  generation_digest=record["approval"]["digest"] if backup and not writing_generation(record) else None,

@@ -556,6 +556,91 @@ class BackupPortable(VaultTest):
         self.assertTrue((new.control / "historical/materials.json").exists())
         self.assertTrue((new.control / "receipts" / (current[deleted["id"]]["copies"][0]["deletion_receipt"] + ".json")).exists())
 
+    def test_1_verified_archive_deletion_proofs_survive_portable_restore(self):
+        self.configure()
+        now = utc()
+        sha = digest(b"")
+        past = stamp(now - timedelta(days=40))
+        for key, relative in (("archive-a", "a/shared.txt"), ("archive-b", "b/shared.txt"),
+                              ("archive-unproved", "different.txt")):
+            atomic(self.root / "inbox" / relative, b"")
+            custody.save_material(self.vault, {
+                "id": key, "kind": "export", "classification": "common", "captured_at": past,
+                "holds": [], "dependencies": [], "copies": [{"root": str(self.root / "inbox"), "path": relative,
+                    "kind": "export", "sha256": sha, "status": "present"}],
+            })
+        inbox.inventory(self.vault)
+        inbox.decide(self.vault, sha, "archive", owner="human", classification="common", destination="archive")
+        inbox.archive_empty(self.vault, sha)
+        records = custody.materials(self.vault)
+        primary, sibling = records["archive-a"], records["archive-b"]
+        unproved = records["archive-unproved"]
+        archive = self.root / "archive" / sha / "shared.txt"
+        self.assertEqual(digest(archive.read_bytes()), sha)
+        exclusions = [retention.slot({"material": record["id"], "copy_index": 1, "copy": record["copies"][1]})
+                      for record in (sibling, unproved)]
+        plan = retention.plan(self.vault, now, exclude=exclusions)
+        entry, = plan["entries"]
+        self.assertEqual((entry["material"], entry["copy_index"]), (primary["id"], 1))
+
+        # Persist the B03 state after the shared unlink and before recording the second slot.
+        entry.update(status="deleting", at=stamp(now), verified_archive_generations=[
+            retention.generation_locator(record, 1, record["copies"][1]) for record in (primary, sibling)
+        ])
+        plan["status"] = "pending"
+        relative_plan = f"deletions/{plan['id']}.json"
+        plan_path = self.vault.control / relative_plan
+        atomic(plan_path, plan)
+        archive.unlink()
+        for record in (primary, unproved):
+            record["copies"][1].update(status="deleted", deleted_at=stamp(now), verified_archive_sha256=sha)
+            custody.save_material(self.vault, record)
+        old_round = self.vault.receipt("deletion-round", {"plan": plan["id"], "digest": plan["digest"], "status": "pending"}, at=now)
+        relative_round = f"receipts/{old_round}.json"
+        history = (self.vault.control / "materials.json").read_bytes()
+        first = self.restore(self.create(), self.base / "b03-restored", self.base / "b03-state")
+        from_b03 = Vault(first["destination"], first["state"])
+        self.assertEqual((from_b03.control / "historical/materials.json").read_bytes(), history)
+        self.assertEqual((from_b03.control / relative_plan).read_bytes(), plan_path.read_bytes())
+        self.assertEqual((from_b03.control / relative_round).read_bytes(), (self.vault.control / relative_round).read_bytes())
+        with self.subTest(proof="B03 round"):
+            restored = custody.materials(from_b03)
+            self.assertEqual(restored[primary["id"]]["copies"][1], {**primary["copies"][1], "origin_status": "deleted"})
+            self.assertEqual(restored[sibling["id"]]["copies"][1]["status"], "unavailable")
+        self.assertEqual(custody.materials(from_b03)[unproved["id"]]["copies"][1]["status"], "unavailable")
+
+        completed = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(completed["status"], "complete")
+        copy = custody.materials(self.vault)[sibling["id"]]["copies"][1]
+        self.assertEqual(copy["status"], "deleted")
+        relative_receipt = f"receipts/{copy['deletion_receipt']}.json"
+        receipt_path = self.vault.control / relative_receipt
+        self.assertEqual(read_json(receipt_path)["payload"], {"material": sibling["id"], "copy_index": 1,
+                                                              "sha256": sha, "intent": None})
+        for path in (self.vault.control / "receipts").glob("*.json"):
+            receipt = read_json(path)
+            if receipt["kind"] == "deletion-round" and receipt["payload"]["plan"] == plan["id"]:
+                path.unlink()
+        # The sibling's otherwise valid receipt cannot prove the primary material's slot.
+        primary["copies"][1]["deletion_receipt"] = copy["deletion_receipt"]
+        custody.save_material(self.vault, primary)
+
+        history = (self.vault.control / "materials.json").read_bytes()
+        second = self.restore(self.create(), self.base / "b04-restored", self.base / "b04-state")
+        from_b04 = Vault(second["destination"], second["state"])
+        self.assertEqual((from_b04.control / "historical/materials.json").read_bytes(), history)
+        self.assertEqual((from_b04.control / relative_plan).read_bytes(), plan_path.read_bytes())
+        self.assertEqual((from_b04.control / relative_receipt).read_bytes(), receipt_path.read_bytes())
+        restored = custody.materials(from_b04)
+        with self.subTest(proof="B04 resumed slot"):
+            self.assertEqual(restored[sibling["id"]]["copies"][1], {**copy, "origin_status": "deleted"})
+        for record in (primary, unproved):
+            pending = restored[record["id"]]["copies"][1]
+            self.assertEqual(pending["status"], "unavailable")
+            self.assertFalse({"root", "path", "sha256"} & pending.keys())
+            self.assertTrue(any(row["material"] == record["id"] and row["copy_index"] == 1 and row["status"] == "invalid"
+                                for row in second["pending_copies"]))
+
     def test_1_process_and_origin_paths_are_inactive(self):
         self.configure()
         task = tasks.create(self.vault, "Origin task with supervised process")
