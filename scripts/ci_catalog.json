@@ -33,6 +33,7 @@
     "scripts.test_sprint_gate.SprintGateTests.test_untrusted_publisher_is_blocked",
     "test_backup_portable.BackupPortable.test_1_controller_and_moved_replica",
     "test_backup_portable.BackupPortable.test_1_custody_retention_and_authorized_remap",
+    "test_backup_portable.BackupPortable.test_1_deleted_replica_proof_after_origin_rebind",
     "test_backup_portable.BackupPortable.test_1_destination_retry_and_verified_bytes",
     "test_backup_portable.BackupPortable.test_1_invalid_replica_or_manifest",
     "test_backup_portable.BackupPortable.test_1_legacy_envelope_with_backup_off",

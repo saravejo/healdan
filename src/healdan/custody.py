@@ -362,12 +362,13 @@ def native_guard(vault, material):
 
 
 def origin_restorations(vault):
-    directory = safe_path(vault.control, "historical/restorations")
-    for path in json_paths(directory):
-        journal = read_json(safe_path(directory, path.name, exists=True))
+    from .backup_snapshot import historical_paths
+
+    for name in historical_paths(vault.control, folders=("restorations",)):
+        journal = read_json(safe_path(vault.control, name, exists=True))
         status = journal.get("status")
         if status in {"staging", "publishing"} or status == "preparing" and not journal.get("terminal"):
-            yield journal["material"], path.stem
+            yield journal["material"], Path(name).stem
 
 
 def pending_restoration(vault, identifier=None, *, target=None):

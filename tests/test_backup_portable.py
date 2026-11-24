@@ -6,7 +6,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest, controller_environment
-from healdan import admission, backup_recovery, backup_snapshot, backups, binding, custody, inbox, retention, storage_policy, tasks
+from healdan import admission, backup_recovery, backup_snapshot, backups, binding, compatibility, custody, inbox, retention, storage_policy, tasks
 from healdan.core import Blocked, Vault, atomic, canonical, decode, digest, git, read_json, run, stamp, utc
 from healdan.signing import envelope
 
@@ -91,6 +91,9 @@ class BackupPortable(VaultTest):
         task = tasks.create(self.vault, "Preserved task")
         session = tasks.new_session(self.vault, task["id"], "Review", "reviewer", "Disposable")
         atomic(self.vault.control / "csp.json", {"streak": 11})
+        transaction = {"status": "complete", "package_id": "fixture", "base": commit,
+                       "files": {}, "before": {}, "written": []}
+        atomic(self.vault.control / "transaction.json", transaction)
         record = self.create()
         manifest, replica = self.paths(record, 1)
         self.destinations[0].rename(self.base / "offline-first")
@@ -125,6 +128,45 @@ class BackupPortable(VaultTest):
         self.assertEqual(tasks.get_session(restored, session["operation"])["uuid"], session["uuid"])
         classifier = admission.Classification(restored, admission.source_rows(restored))
         self.assertEqual(classifier.current(source_hash), ("common", event["receipt"]))
+
+        history = restored.control / "historical"
+        evidence = {
+            f"historical/{record['id']}.manifest.json": pair[0].read_bytes(),
+            "historical/materials.json": (history / "materials.json").read_bytes(),
+            f"historical/tasks/{task['id']}.json": (history / "tasks" / (task["id"] + ".json")).read_bytes(),
+            f"historical/sessions/{session['operation']}.json": (history / "sessions" / (session["operation"] + ".json")).read_bytes(),
+            "historical/transaction.json": (history / "transaction.json").read_bytes(),
+            f"receipts/{report['receipt']}.json": (restored.control / "receipts" / (report["receipt"] + ".json")).read_bytes(),
+        }
+        atomic(history / "incidental.json", {"credential": "excluded disposable fixture"})
+        second_root = self.base / "second-generation-replica"
+        second_root.mkdir()
+        restored.config.update({key: self.vault.config[key] for key in ("age_recipients", "offline_recipients",
+                                "backup_signing_key", "backup_signing_identity")})
+        restored.config["backup_destinations"] = [str(second_root)]
+        atomic(restored.config_path, restored.config)
+        prior_versions = {name: (restored.control / name).read_bytes() for name in (
+            "materials.json", f"tasks/{task['id']}.json", f"sessions/{session['operation']}.json")}
+        second = backups.create(restored, "long", utc() + timedelta(days=2))
+        second_pair = tuple(second_root / second["copies"][0][name] for name in ("manifest", "path"))
+        second_result = self.restore(second, self.base / "second-vault", self.base / "second-state", paths=second_pair)
+        twice = Vault(second_result["destination"], second_result["state"])
+        for name, body in evidence.items():
+            self.assertEqual((twice.control / name).read_bytes(), body, name)
+        self.assertFalse((twice.control / "historical/incidental.json").exists())
+        self.assertEqual((twice.control / "historical" / (second["id"] + ".manifest.json")).read_bytes(), second_pair[0].read_bytes())
+        self.assertEqual(tasks.get_task(twice, task["id"])["state"], "reconciliation_required")
+        self.assertEqual(tasks.get_session(twice, session["operation"])["state"], "reconciliation_required")
+        self.assertFalse((twice.control / "transaction.json").exists())
+        self.assertEqual(read_json(twice.control / "historical/transaction.json"), transaction)
+        latest_history = twice.control / "historical/generations" / second["id"]
+        for name, body in prior_versions.items():
+            self.assertEqual((latest_history / name).read_bytes(), body, name)
+        capabilities = read_json(Path(compatibility.__file__).with_name("controller_formats.json"))
+        compatibility.check(twice, capabilities)
+        capabilities["journal"].remove(backup_snapshot.RECOVERY_HISTORY)
+        with self.assertRaisesRegex(Blocked, backup_snapshot.RECOVERY_HISTORY):
+            compatibility.check(twice, capabilities)
 
     def test_1_invalid_replica_or_manifest(self):
         self.configure(2)
@@ -166,6 +208,16 @@ class BackupPortable(VaultTest):
         replica.unlink()
         self.assertEqual([entry["status"] for entry in backups.verify_backup(self.vault, record["id"])["replicas"]],
                          ["unavailable", "verified"])
+        atomic(replica, cipher)
+        receipt = self.vault.control / "receipts" / (record["copies"][0]["publication_receipt"] + ".json")
+        atomic(receipt, {"kind": "changed first publication receipt"})
+        report = backups.verify_backup(self.vault, record["id"])
+        self.assertEqual([entry["status"] for entry in report["replicas"]], ["invalid", "verified"])
+        self.assertIn("publication receipt changed", report["replicas"][0]["reason"])
+        with self.assertRaisesRegex(Blocked, "publication receipt changed"):
+            backups.signed_manifest(self.vault, record)
+        result = backups.restore(self.vault, record["id"], self.base / "fallback-after-invalid-receipt")
+        self.assertEqual(result["replica"], str(self.paths(record, 1)[1]))
 
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
@@ -256,6 +308,45 @@ class BackupPortable(VaultTest):
         self.assertFalse(any((restored.state / name).exists() for name in ("authentication", "launchd", "tasks")))
         self.assertFalse(git(restored.root, "remote"))
 
+    def test_1_deleted_replica_proof_after_origin_rebind(self):
+        self.configure()
+        original_destination = self.state / "backup-inside-state"
+        original_destination.mkdir()
+        self.vault.config["backup_destinations"] = [str(original_destination)]
+        atomic(self.vault.config_path, self.vault.config)
+        now = utc()
+        expired = backups.create(self.vault, "long", now - timedelta(days=1), now=now - timedelta(days=2))
+        moved_state = self.state.rename(self.base / "relocated-origin-state")
+        preview = binding.rebind(self.root, moved_state)
+        binding.rebind(self.root, moved_state, preview["confirmation"])
+        moved = Vault(self.root, moved_state)
+        plan = retention.plan(moved, now)
+        self.assertEqual(retention.execute(moved, plan["id"], now)["status"], "complete")
+        retired = custody.materials(moved)[expired["id"]]
+        receipt_id = retired["copies"][0]["deletion_receipt"]
+        receipt_path = f"receipts/{receipt_id}.json"
+        receipt = read_json(moved.control / receipt_path)
+        self.assertEqual(Path(receipt["payload"]["intent"]["path"]).parent, moved_state / original_destination.name)
+        self.assertEqual(retired["copies"][0]["root"], str(original_destination))
+        self.assertEqual(len(backups.verify_replica_deletions(moved, retired)), 1)
+
+        generation = backups.create(moved, "long", now + timedelta(days=2), now=now)
+        replica = moved_state / original_destination.name
+        pair = tuple(replica / generation["copies"][0][name] for name in ("manifest", "path"))
+        result = self.restore(generation, paths=pair)
+        restored = Vault(result["destination"], result["state"])
+        restored_retired = custody.materials(restored)[expired["id"]]
+        self.assertEqual(restored.binding["previous"], [])
+        self.assertEqual(restored_retired["copies"][0]["status"], "deleted")
+        self.assertEqual(read_json(restored.control / receipt_path), receipt)
+        self.assertEqual(len(backups.verify_replica_deletions(restored, restored_retired)), 1)
+        historical_binding = restored.control / "historical/generations" / generation["id"] / "binding.json"
+        altered = read_json(historical_binding)
+        altered["previous"].append(altered["location"])
+        atomic(historical_binding, altered)
+        with self.assertRaisesRegex(Blocked, "Historical storage relocation differs"):
+            backups.verify_replica_deletions(restored, restored_retired)
+
     def test_1_legacy_envelope_with_backup_off(self):
         self.configure()
         self.policy("off")
@@ -263,8 +354,15 @@ class BackupPortable(VaultTest):
         expiry = stamp(utc() + timedelta(days=2))
         bundle = self.base / "legacy.bundle"
         git(self.root, "bundle", "create", str(bundle), "--all")
+        member = self.conversation("legacy-short", closed_at=utc())
+        member_name = "custody/" + member["id"] + ".age"
+        member_copy = member["copies"][0]
+        member_cipher = (Path(member_copy["root"]) / member_copy["path"]).read_bytes()
         files = {name: backup_snapshot.file_entry("knowledge", (self.root / name).read_bytes()) for name in self.vault.inputs()}
         files[backup_snapshot.BUNDLE] = backup_snapshot.file_entry("git", bundle.read_bytes())
+        files[backup_snapshot.MATERIALS] = backup_snapshot.file_entry("custody-manifests", canonical({
+            member["id"]: {key: value for key, value in member.items() if key != "copies"}}))
+        files[member_name] = backup_snapshot.file_entry("conversation", member_cipher)
         for entry in files.values():
             entry.pop("kind")
         archive = {"format": "healdan-tree-v1", "files": files}
@@ -272,8 +370,8 @@ class BackupPortable(VaultTest):
         cipher = custody.encrypt(self.vault, plain)
         replica = self.destinations[0] / (identifier + ".age")
         atomic(replica, cipher)
-        record = {"id": identifier, "kind": "backup", "generation": "long", "created_at": stamp(), "expires_at": expiry,
-                  "members": [], "commit": self.vault.head(), "plain_sha256": digest(plain), "cipher_sha256": digest(cipher),
+        record = {"id": identifier, "kind": "backup", "generation": "short", "created_at": stamp(), "expires_at": expiry,
+                  "members": [member["id"]], "commit": self.vault.head(), "plain_sha256": digest(plain), "cipher_sha256": digest(cipher),
                   "holds": [], "dependencies": [], "copies": [
                       {"root": str(replica.parent), "path": replica.name, "sha256": digest(cipher), "kind": "ciphertext", "status": "present"},
                       {"root": str(self.base / "lost"), "path": replica.name, "sha256": digest(cipher), "kind": "ciphertext", "status": "present"}],
@@ -286,6 +384,7 @@ class BackupPortable(VaultTest):
         self.assertEqual(backups.verify_backup(self.vault, identifier)["pending_replicas"][0]["status"], "unavailable")
         result = backups.restore(self.vault, identifier, self.base / "restored-legacy")
         self.assertIn("Legacy backup omitted", result["pending_copies"][0])
+        self.assertEqual((Path(result["destination"]) / member_name).read_bytes(), member_cipher)
         legacy_state = self.base / "legacy-adopted-state"
         adoption = binding.adopt(result["destination"], legacy_state)
         self.assertEqual(adoption["provenance"][0]["kind"], "restored-backup")
@@ -359,6 +458,35 @@ class BackupPortable(VaultTest):
         with self.assertRaisesRegex(Blocked, "destination changed before completion"):
             self.restore(record, other, other_state)
         self.assertEqual((other / "wiki/claims.jsonl").read_bytes(), b"changed before completion")
+
+        remapped = self.base / "remapped-copy"
+        remapped_bytes = b"verified remapped recovery evidence"
+        atomic(remapped, remapped_bytes)
+        material = {"id": "remap-ready-test", "kind": "export", "classification": "common", "captured_at": stamp(),
+                    "copies": [{"root": str(remapped.parent), "path": remapped.name, "sha256": digest(remapped_bytes),
+                                "kind": "export", "status": "present"}],
+                    "holds": [], "dependencies": []}
+        custody.save_material(self.vault, material)
+        with_remap = self.create()
+        destination = self.base / "ready-with-remap"
+        external = self.base / "ready-with-remap-state"
+        mapping = {material["id"]: {"0": str(remapped)}}
+        destination.mkdir()
+        with patch("healdan.backup_recovery.publish", side_effect=RuntimeError("fixture before publication")), \
+                self.assertRaisesRegex(RuntimeError, "before publication"):
+            self.restore(with_remap, destination, external, remap=mapping)
+        staged_copy = external / "recovered-copies" / material["id"] / "0" / remapped.name
+        self.assertEqual(staged_copy.read_bytes(), remapped_bytes)
+        atomic(staged_copy, b"changed while ready")
+        with self.assertRaisesRegex(Blocked, "External recovery state changed before publication"):
+            self.restore(with_remap, destination, external, remap=mapping)
+        self.assertEqual(staged_copy.read_bytes(), b"changed while ready")
+        self.assertFalse(any(destination.iterdir()))
+        self.assertEqual(read_json(external / backup_recovery.JOURNAL_FILE)["phase"], "ready")
+        atomic(staged_copy, remapped_bytes)
+        completed = self.restore(with_remap, destination, external, remap=mapping)
+        atomic(staged_copy, b"normal post-recovery change")
+        self.assertEqual(self.restore(with_remap, destination, external, remap=mapping)["receipt"], completed["receipt"])
 
     def test_2_positive_snapshot_selection(self):
         self.configure()
@@ -474,6 +602,17 @@ class BackupPortable(VaultTest):
         with self.assertRaisesRegex(Blocked, "Historical custody/secret paths"):
             self.create()
         self.assertFalse(any(self.destinations[0].iterdir()))
+        git(self.root, "branch", "-D", "separate-branch")
+        git(self.root, "tag", "-a", "ordinary-tag", "-m", "Ordinary annotation")
+        self.assertEqual(self.create()["status"], "complete")
+        old = self.vault.head()
+        git(self.root, "commit", "--allow-empty", "-m", 'Disposable {"sessionId":"tag-or-commit","type":"assistant"}')
+        with self.assertRaisesRegex(Blocked, "Native conversation object detected in Git commit"):
+            self.create()
+        git(self.root, "reset", "--mixed", old)
+        git(self.root, "tag", "-a", "private-annotation", "-m", "-----BEGIN OPENSSH PRIVATE KEY-----")
+        with self.assertRaisesRegex(Blocked, "Private key material detected in Git tag"):
+            self.create()
 
     def test_2_short_eligibility_pending_and_permanent(self):
         self.configure()

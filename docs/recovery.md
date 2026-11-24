@@ -14,7 +14,9 @@ Point restore at a new or empty vault directory. The new controller gets a
 reciprocal binding that preserves the backed-up vault identity. The restore
 journal in the external state identifies the verified snapshot, any staged
 reconstruction, and the completion receipt. Repeat the same restore after an
-interruption. For a restore by ID from a working controller, use
+interruption. Before completing a resumed restore, the controller verifies the
+staged vault and recovered files in the external state. A changed file is
+preserved and reported as a pending recovery. For a restore by ID from a working controller, use
 `restore ID DESTINATION --recovery-state NEW_STATE`.
 
 Each recovered task or session that needs attention reports reconciliation
@@ -26,9 +28,16 @@ material ID and original zero-based copy index, for example
 `{"inbox-MATERIAL":{"0":"/path/to/preserved-file"}}`. Restored copies are
 inventoried in the new state under the original material ID.
 
+Backups created on a recovered controller carry forward the historical
+manifests, receipts and origin records. A new recovery keeps distinct versions
+of those records by generation. Earlier storage relocation evidence can
+verify deletion receipts while the origin paths remain inactive.
+
 A legacy generation can still be verified or restored by ID with its original
 catalog and signing policy. Its restore reports which operational records
-the old format omitted. To adopt a legacy vault restored without
+the old format omitted. Eligible encrypted bodies from a legacy short backup
+are recovered under `custody/` in the destination or explicit recovery state.
+To adopt a legacy vault restored without
 `--recovery-state`, use `healdan --vault RESTORED --state NEW_STATE state adopt`
 and confirm the recovery provenance with `--confirm DIGEST`.
 

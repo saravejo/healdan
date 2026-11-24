@@ -249,15 +249,15 @@ def stage_recovered_binding(staging, destination, state, vault_id):
     return value
 
 
-def relocated_path(path, binding):
-    original = Path(path)
+def relocated_path(path, binding, *, path_type=Path):
+    original = path_type(path)
     if not original.is_absolute():
         return original
-    current = {name: Path(value) for name, value in binding["location"].items()}
+    current = {name: path_type(value) for name, value in binding["location"].items()}
     if any(original.is_relative_to(location) for location in current.values()):
         return original
-    candidates = [(name, Path(value)) for locations in binding["previous"] for name, value in locations.items()
-                  if original.is_relative_to(Path(value))]
+    candidates = [(name, path_type(value)) for locations in binding["previous"] for name, value in locations.items()
+                  if original.is_relative_to(path_type(value))]
     if not candidates:
         return original
     name, location = max(candidates, key=lambda entry: len(entry[1].parts))

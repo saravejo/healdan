@@ -1,6 +1,7 @@
 """Git and operational snapshots for authenticated portable backups."""
 import base64
-from pathlib import Path
+from io import BytesIO
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import tempfile
 from types import SimpleNamespace
@@ -15,19 +16,23 @@ from .signing import verify
 
 FORMAT = "healdan-backup-snapshot-v1"
 MANIFEST = "healdan-backup-manifest-v1"
+RECOVERY_HISTORY = "healdan-backup-history-v1"
 BUNDLE = "control/repository.bundle"
 MATERIALS = "control/custody-manifests.json"
 STATE = "control/backup-state/"
 RESERVED = (BUNDLE, MATERIALS, "control/controller-checkpoints.json", STATE.rstrip("/"), "custody")
 KNOWLEDGE = ("wiki/", "resources/sources/", "templates/", "config/", "control/approvals/")
 SOURCE_AUTHORITIES = "source_classification_authorities"
+SOURCE_BINDING = "source_binding"
 ROOT_FILES = {".gitattributes", ".gitignore", "inbox/.gitkeep", "archive/.gitkeep", "projects/.gitkeep", "control/tasks/.gitkeep"}
 STATE_FILES = {"csp.json", "followups.json", "inbox.json", "lint-state.json", "materials.json",
-               "reservations.json", "source-classification.json", "source-ingest.json", "storage-policy.json",
+               "reservations.json", "restored-from.json", "source-classification.json", "source-ingest.json", "storage-policy.json",
                "transaction.json", "zero-byte-archive.json"}
 STATE_FOLDERS = {"backup-preservation", "deletions", "lint", "packages", "receipts", "restorations",
                  "reviews", "sessions", "tasks"}
-HISTORICAL_FOLDERS = {"historical/restorations"}
+HISTORICAL_STATE = {"transaction.json", "source-ingest.json", "zero-byte-archive.json", "restored-from.json"}
+HISTORICAL_FOLDERS = {"restorations", "sessions", "tasks"}
+RESTORE_JOURNAL = "healdan-backup-restore-v1"
 SIGNATURE_FIELDS = {"payload", "digest", "namespace", "identity", "signature"}
 HUMAN_DOMAINS = {"package", "case", "alias", "trial", "decision", "recovery"}
 FORBIDDEN_NAMES = re.compile(
@@ -147,6 +152,21 @@ def install_refs(root, identity):
 
 
 def history_guard(root, identity):
+    reachable = git_bytes(root, "--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--all", "HEAD")
+    kinds = git_bytes(root, "--no-replace-objects", "cat-file", "--batch-check=%(objectname) %(objecttype)", data=reachable)
+    textual = [(oid, kind) for oid, kind in (row.split() for row in kinds.splitlines()) if kind in {b"commit", b"tag"}]
+    if textual:
+        batch = b"".join(oid + b"\n" for oid, _ in textual)
+        stream = BytesIO(git_bytes(root, "--no-replace-objects", "cat-file", "--batch", data=batch))
+        for oid, kind in textual:
+            header = stream.readline().split()
+            require(len(header) == 3 and header[:2] == [oid, kind] and header[2].isdigit(),
+                    "Git returned an invalid historical object", 5)
+            size = int(header[2])
+            body = stream.read(size)
+            require(len(body) == size and stream.read(1) == b"\n", "Incomplete historical Git object", 5)
+            guard_content("Git " + kind.decode("ascii") + " " + oid.decode("ascii"), body)
+        require(not stream.read(1), "Unexpected historical Git objects", 5)
     commits = git(root, "--no-replace-objects", "log", "--all", "--format=%T", "HEAD").splitlines()
     trees, inspected, direct_blobs = set(commits), set(), []
     for name, oid in identity["refs"].items():
@@ -206,20 +226,68 @@ def open_bundle(root, path, identity):
     git(root, "read-tree", identity["head"])
 
 
+def historical_record(name):
+    parts = name.split("/")
+    if parts[0] != "historical" or len(parts) < 2:
+        return None
+    generation = None
+    if parts[1] == "generations" and len(parts) >= 4 and identifier(parts[2]):
+        generation, parts = parts[2], parts[3:]
+    else:
+        parts = parts[1:]
+    if len(parts) == 1:
+        filename = parts[0]
+        if filename in HISTORICAL_STATE | {"materials.json"}:
+            return generation, filename
+        if generation is not None and filename == "binding.json":
+            return generation, filename
+        if generation is None and filename.endswith(".manifest.json") and identifier(filename.removesuffix(".manifest.json")):
+            return None, "manifest"
+    if len(parts) == 2 and parts[0] in HISTORICAL_FOLDERS and parts[1].endswith(".json"):
+        stem = parts[1].removesuffix(".json")
+        valid = sha256(stem) if parts[0] == "restorations" else identifier(stem)
+        if valid:
+            return generation, "/".join(parts)
+    return None
+
+
 def state_path(name):
     parts = portable_path(name).split("/")
     if len(parts) == 1:
         return name in STATE_FILES
-    return "/".join(parts[:-1]) in STATE_FOLDERS | HISTORICAL_FOLDERS and parts[-1].endswith(".json")
+    return (len(parts) == 2 and parts[0] in STATE_FOLDERS and parts[-1].endswith(".json") or
+            historical_record(name) is not None)
+
+
+def historical_paths(control, *, folders=None):
+    generations = safe_path(control, "historical/generations")
+    require(not generations.is_junction(), "Unsafe backup history directory", 5)
+    prefixes = ["historical"]
+    if generations.exists():
+        require(generations.is_dir(), "Invalid backup history directory", 5)
+        prefixes.extend("historical/generations/" + child.name for child in generations.iterdir() if identifier(child.name))
+    selected = ("", *sorted(HISTORICAL_FOLDERS)) if folders is None else folders
+    for prefix in prefixes:
+        root = safe_path(control, prefix)
+        require(not root.is_junction(), "Unsafe backup history directory", 5)
+        for folder in selected:
+            directory = safe_path(root, folder) if folder else root
+            require(not directory.is_junction(), "Unsafe backup history directory", 5)
+            stem = f"{prefix}/{folder}" if folder else prefix
+            for path in json_paths(directory):
+                name = f"{stem}/{path.name}"
+                if historical_record(name) is not None:
+                    yield name
 
 
 def control_records(vault):
     try:
         names = [name for name in sorted(STATE_FILES) if safe_path(vault.control, name).exists()]
-        for folder in sorted(STATE_FOLDERS | HISTORICAL_FOLDERS):
+        for folder in sorted(STATE_FOLDERS):
             root = safe_path(vault.control, folder)
             require(not root.is_junction(), "Unsafe controller record directory: " + folder, 5)
             names.extend(f"{folder}/{path.name}" for path in json_paths(root))
+        names.extend(historical_paths(vault.control))
         paths_compatible(names)
         return {name: safe_path(vault.control, name, exists=True).read_bytes() for name in names}
     except OSError as exc:
@@ -277,20 +345,43 @@ def assemble(vault, identity, records, members, bundle):
     files = {name: file_entry("knowledge", body, mode)
              for name, (mode, body) in canonical_tree(vault.root, identity["head"]).items()}
     files[BUNDLE] = file_entry("git", bundle)
-    files.update({STATE + name: file_entry("operational", data) for name, data in records.items() if name != "materials.json"})
+    files.update({STATE + name: file_entry("recovery-history" if historical_record(name) else "operational", data)
+                  for name, data in records.items() if name != "materials.json"})
     files[MATERIALS] = file_entry("custody-manifests", records.get("materials.json", b"{}"))
     files.update({f"custody/{member}.age": file_entry("conversation", data) for member, data in members.items()})
     authorities = vault.config.get(SOURCE_AUTHORITIES, [])
     require(isinstance(authorities, list) and all(isinstance(actor, str) and actor.strip() for actor in authorities),
             "Invalid source classification authorities", 5)
     return {"format": FORMAT, "source_vault": vault.identity, "git": identity, "files": files,
-            SOURCE_AUTHORITIES: sorted(set(authorities))}
+            SOURCE_AUTHORITIES: sorted(set(authorities)), SOURCE_BINDING: vault.binding}
+
+
+def origin_path_type(location):
+    return PureWindowsPath if PureWindowsPath(location["state"]).drive else PurePosixPath
+
+
+def check_origin_binding(value, source_vault):
+    from .binding import FORMAT as BINDING_FORMAT
+
+    require(isinstance(value, dict) and set(value) == {"format", "vault_id", "location", "previous"} and
+            value["format"] == BINDING_FORMAT and value["vault_id"] == source_vault and
+            isinstance(value["previous"], list), "Invalid historical vault binding", 5)
+    for location in [value["location"], *value["previous"]]:
+        require(isinstance(location, dict) and set(location) == {"root", "common", "state"} and
+                all(isinstance(path, str) for path in location.values()), "Invalid historical binding location", 5)
+        path_type = origin_path_type(location)
+        require(all(path_type(path).is_absolute() for path in location.values()), "Invalid historical binding paths", 5)
 
 
 def check_entries(archive, manifest):
-    require(isinstance(archive, dict) and set(archive) == {"format", "source_vault", "git", "files", SOURCE_AUTHORITIES} and
+    fields = {"format", "source_vault", "git", "files", SOURCE_AUTHORITIES}
+    require(isinstance(archive, dict) and fields <= archive.keys() <= fields | {SOURCE_BINDING} and
             archive["format"] == FORMAT and archive["source_vault"] == manifest["source_vault"] and
             isinstance(archive["files"], dict), "Unknown or mismatched portable snapshot", 5)
+    if SOURCE_BINDING in archive or "origin_binding_sha256" in manifest:
+        origin = archive.get(SOURCE_BINDING)
+        check_origin_binding(origin, archive["source_vault"])
+        require(digest(origin) == manifest.get("origin_binding_sha256"), "Origin vault binding differs from its manifest", 5)
     authorities = archive[SOURCE_AUTHORITIES]
     require(isinstance(authorities, list) and all(isinstance(actor, str) and actor.strip() for actor in authorities) and
             authorities == sorted(set(authorities)), "Invalid backed-up source classification authorities", 5)
@@ -307,7 +398,10 @@ def check_entries(archive, manifest):
         if name in {BUNDLE, MATERIALS}:
             expected = "git" if name == BUNDLE else "custody-manifests"
         elif name.startswith(STATE) and state_path(name.removeprefix(STATE)) and name != STATE + "materials.json":
-            expected = "operational"
+            relative = name.removeprefix(STATE)
+            expected = "recovery-history" if historical_record(relative) else "operational"
+            if relative.startswith("historical/restorations/") and entry["kind"] == "operational":
+                expected = "operational"
         elif name in selected:
             expected = "conversation"
         else:
@@ -324,7 +418,7 @@ def check_entries(archive, manifest):
         except (TypeError, ValueError) as exc:
             raise Blocked("Invalid member encoding: " + name, 5) from exc
         require(len(data) == entry["size"] and digest(data) == entry["sha256"], "Backup member mismatch: " + name, 5)
-        if expected in {"knowledge", "operational", "custody-manifests"}:
+        if expected in {"knowledge", "operational", "recovery-history", "custody-manifests"}:
             guard_content(name, data)
         contents[name] = data
     require({BUNDLE, MATERIALS, *REQUIRED_REGISTRIES, *selected} <= contents.keys() and
@@ -354,6 +448,97 @@ def check_signatures(value, signers, backup_signers, proven):
             check_signatures(item, signers, backup_signers, proven)
 
 
+def check_materials(inventory):
+    for key, record in inventory.items():
+        require(isinstance(key, str) and "/" not in portable_path(key) and isinstance(record, dict) and record.get("id") == key and
+                record.get("kind") in {"conversation", "export", "backup"} and isinstance(record.get("copies"), list) and
+                isinstance(record.get("holds"), list) and isinstance(record.get("dependencies"), list),
+                "Invalid backed-up custody record: " + key, 5)
+        require(record["kind"] == "export" or identifier(key), "Invalid backup or conversation identity: " + key, 5)
+        for copy in record["copies"]:
+            require(isinstance(copy, dict) and isinstance(copy.get("root"), str) and
+                    sha256(copy.get("sha256")) and isinstance(copy.get("kind"), str) and
+                    copy.get("status") in {"present", "planned", "deleted", "moved", "absent", "unavailable"},
+                    "Invalid backed-up custody copy: " + key, 5)
+            portable_path(copy.get("path"), historical=True)
+
+
+def check_recovery_history(archive, contents, records, backup_signers):
+    from .backups import verify_portable_manifest
+
+    receipts = [record["payload"] for name, record in records.items()
+                if name.startswith("receipts/") and record["kind"] == "backup-restored"]
+    require(all(isinstance(receipt, dict) for receipt in receipts), "Invalid backup recovery receipt", 5)
+    manifests = {}
+    for name, value in records.items():
+        entry = historical_record(name)
+        if entry and entry[1] == "manifest":
+            backup_id = Path(name).name.removesuffix(".manifest.json")
+            manifest = verify_portable_manifest(backup_id, value, backup_signers)
+            manifests[backup_id] = manifest
+            expected = {"format": RESTORE_JOURNAL, "backup": backup_id, "vault": manifest["source_vault"],
+                        "commit": manifest["commit"], "plain_sha256": manifest["plain_sha256"],
+                        "manifest_sha256": digest(contents[STATE + name])}
+            require(manifest["source_vault"] == archive["source_vault"] and
+                    any(all(receipt.get(key) == value for key, value in expected.items()) for receipt in receipts),
+                    "Historical backup manifest has no matching recovery receipt: " + backup_id, 5)
+    for receipt in receipts:
+        if receipt.get("backup_format") == MANIFEST:
+            require(receipt.get("backup") in manifests, "A recovery receipt is missing its historical backup manifest", 5)
+    for name, value in records.items():
+        entry = historical_record(name)
+        if entry and entry[0]:
+            require(entry[0] in manifests, "Historical recovery record has no generation manifest: " + name, 5)
+            if entry[1] == "binding.json":
+                check_origin_binding(value, archive["source_vault"])
+                require(digest(value) == manifests[entry[0]].get("origin_binding_sha256"),
+                        "Historical binding differs from its generation manifest", 5)
+        if name == "restored-from.json" or entry and entry[1] == "restored-from.json":
+            if value.get("format") == RESTORE_JOURNAL:
+                require(value in receipts, "Recovered vault provenance has no matching receipt", 5)
+            else:
+                require(value.get("format") == "healdan-restored-vault-v1" and identifier(value.get("backup")) and
+                        identifier(value.get("source_vault")) and isinstance(value.get("commit"), str) and
+                        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value["commit"]),
+                        "Invalid legacy recovered vault provenance", 5)
+
+
+def check_historical_journal(name, value, source_vault):
+    if name == "transaction.json" and value:
+        from .compatibility import _journal_format
+
+        _journal_format(value)
+        for field in ("files", "before_files"):
+            files = value.get(field, {})
+            require(isinstance(files, dict), "Invalid historical integration entries", 5)
+            paths_compatible(files)
+            for path, body in files.items():
+                require(knowledge_name(path) and not reserved(path) and not FORBIDDEN_NAMES.search(path),
+                        "Unsafe historical integration entry: " + path, 5)
+                try:
+                    data = base64.b64decode(body, validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise Blocked("Invalid historical integration entry: " + path, 5) from exc
+                guard_content(path, data)
+    elif name == "source-ingest.json" and value:
+        require(value.get("status") in {"complete", "aborted"} and isinstance(value.get("record"), dict) and
+                originals.source_path(value["record"].get("path")) and identifier(value.get("operation")),
+                "Invalid historical source ingestion journal", 5)
+    elif name == "zero-byte-archive.json":
+        for source, move in value.items():
+            require(isinstance(move, dict) and isinstance(move.get("payload"), dict), "Invalid historical archive move", 5)
+            payload = move["payload"]
+            require(payload.get("source") == source and portable_path(source).startswith("inbox/") and
+                    portable_path(payload.get("destination")).startswith("archive/") and payload.get("sha256") == digest(b"") and
+                    payload.get("size") == 0, "Invalid historical archive move", 5)
+    elif name.startswith("restorations/"):
+        binding = value.get("binding")
+        require(value.get("format") == "healdan-restore-v1" and value.get("status") in {"preparing", "staging", "publishing", "complete"} and
+                isinstance(binding, dict) and binding.get("vault") == source_vault and
+                identifier(value.get("material")) and binding.get("material") == value["material"] and
+                isinstance(binding.get("destination"), str), "Invalid historical conversation restoration journal", 5)
+
+
 def check_records(archive, contents, signers, backup_signers):
     from .ids import identity as id_identity
     from .retention import plan_digest
@@ -366,8 +551,14 @@ def check_records(archive, contents, signers, backup_signers):
                 "Invalid controller backup record: " + name, 5)
         check_signatures(value, signers, backup_signers, proven)
         records[name] = value
-        parent, _, filename = name.partition("/")
+        history = historical_record(name)
+        logical_name = history[1] if history else name
+        parent, _, filename = logical_name.partition("/")
         stem = filename.removesuffix(".json")
+        if history:
+            check_historical_journal(logical_name, value, archive["source_vault"])
+        if logical_name == "materials.json":
+            check_materials(value)
         if parent == "receipts":
             require(digest(value) == stem and {"kind", "at", "payload"} == value.keys() and
                     value["at"] == stamp(value["at"]), "Backup receipt identity mismatch", 5)
@@ -392,18 +583,7 @@ def check_records(archive, contents, signers, backup_signers):
         require(identifier(operation) and isinstance(reservation, dict) and isinstance(reservation.get("ids"), list) and
                 all(id_identity(value)[0] == reservation.get("prefix") for value in reservation["ids"]),
                 "Invalid backed-up ID reservation", 5)
-    for key, record in records["materials.json"].items():
-        require(isinstance(key, str) and "/" not in portable_path(key) and isinstance(record, dict) and record.get("id") == key and
-                record.get("kind") in {"conversation", "export", "backup"} and isinstance(record.get("copies"), list) and
-                isinstance(record.get("holds"), list) and isinstance(record.get("dependencies"), list),
-                "Invalid backed-up custody record: " + key, 5)
-        require(record["kind"] == "export" or identifier(key), "Invalid backup or conversation identity: " + key, 5)
-        for copy in record["copies"]:
-            require(isinstance(copy, dict) and isinstance(copy.get("root"), str) and
-                    sha256(copy.get("sha256")) and isinstance(copy.get("kind"), str) and
-                    copy.get("status") in {"present", "planned", "deleted", "moved", "absent", "unavailable"},
-                    "Invalid backed-up custody copy: " + key, 5)
-            portable_path(copy.get("path"), historical=True)
+    check_recovery_history(archive, contents, records, backup_signers)
     for name, entry in archive["files"].items():
         if entry["kind"] == "knowledge" and name.endswith(".jsonl"):
             rows = parse_jsonl(contents[name], name)

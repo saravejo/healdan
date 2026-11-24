@@ -143,12 +143,16 @@ def check(vault, capabilities):
         needs("archive", "healdan-tree-v1")
     from .custody import materials
     from .backup_snapshot import FORMAT as BACKUP_ARCHIVE, MANIFEST as BACKUP_MANIFEST
+    from .backup_snapshot import RECOVERY_HISTORY, historical_paths
     from .backup_recovery import JOURNAL as BACKUP_RESTORE
 
     records = materials(vault)
     if any(record.get("format") == BACKUP_MANIFEST for record in records.values()):
         needs("archive", BACKUP_ARCHIVE)
         needs("journal", BACKUP_MANIFEST)
+    if any("origin_binding_sha256" in record for record in records.values()) or any(
+            name.endswith(".manifest.json") for name in historical_paths(vault.control, folders=("",))):
+        needs("journal", RECOVERY_HISTORY)
     restored = read_json(safe_path(vault.control, "restored-from.json"), {})
     if restored.get("format") == BACKUP_RESTORE:
         needs("journal", BACKUP_RESTORE)

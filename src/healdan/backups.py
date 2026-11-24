@@ -1,5 +1,5 @@
 """Encrypted backup generations with immutable expiry and verified copies."""
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID, uuid4
 import re
 
@@ -72,7 +72,8 @@ def create(vault, kind, expires_at, member_ids=(), *, now=None, scheduled=False)
         manifest = {"format": snapshot.MANIFEST, "id": identifier, "source_vault": vault.identity,
                     "generation": kind, "created_at": now, "expires_at": None if expires_at == "permanent" else stamp(expires_at),
                     "members": list(member_ids), "commit": git_state["head"], "git_sha256": digest(git_state),
-                    "inventory_sha256": digest(snapshot.inventory(archive)), "plain_sha256": digest(plain)}
+                    "inventory_sha256": digest(snapshot.inventory(archive)), "plain_sha256": digest(plain),
+                    "origin_binding_sha256": digest(archive[snapshot.SOURCE_BINDING])}
         if expires_at == "permanent":
             manifest["expiry"] = "permanent"
         human_signers = vault.config.get("allowed_signers") or ""
@@ -119,7 +120,8 @@ def verify_portable_manifest(identifier, approval, signers):
     fields = {"format", "id", "source_vault", "generation", "created_at", "expires_at", "members", "commit",
               "git_sha256", "inventory_sha256", "plain_sha256", "cipher_sha256"}
     require(isinstance(manifest, dict) and manifest.get("format") == snapshot.MANIFEST and
-            set(manifest) in (fields, fields | {"expiry"}) and manifest["id"] == identifier and
+            fields <= manifest.keys() <= fields | {"expiry", "origin_binding_sha256"} and
+            ("origin_binding_sha256" not in manifest or sha256(manifest["origin_binding_sha256"])) and manifest["id"] == identifier and
             snapshot.identifier(identifier) and snapshot.identifier(manifest["source_vault"]) and
             manifest["generation"] in {"long", "short"} and isinstance(manifest["members"], list) and
             all(snapshot.identifier(member) for member in manifest["members"]) and
@@ -210,7 +212,7 @@ def verify_backup(vault, identifier, *, allow_retired=False):
         return _verify_backup(vault, identifier, allow_retired=allow_retired)
 
 
-def check_portable_record(vault, record, manifest):
+def check_portable_record(vault, record, manifest, *, check_publications=True):
     require(all(record.get(key) == value for key, value in manifest.items()) and
             {key for key in record if key in {"expiry"}} == {key for key in manifest if key in {"expiry"}} and
             record.get("holds") == [] and record.get("dependencies") == [], "Signed backup manifest changed", 5)
@@ -223,24 +225,30 @@ def check_portable_record(vault, record, manifest):
         copy.get("manifest_sha256") == raw_digest and isinstance(copy.get("root"), str) and
         copy["status"] in {"planned", "present", "deleted", "absent", "unavailable"} for copy in copies),
         "Portable replica inventory changed", 5)
-    for index, copy in enumerate(copies):
-        if copy["status"] in {"present", "deleted"}:
-            receipt = copy.get("publication_receipt")
-            require(sha256(receipt), "Backup replica lacks a publication receipt", 5)
-            proof = read_json(safe_path(vault.control, f"receipts/{receipt}.json"), {})
-            expected = published_copy(record, index, copy, copy.get("published_at"))
-            require(digest(proof) == receipt and proof.get("kind") == "backup-replica-published" and
-                    proof.get("at") == copy.get("published_at") and proof.get("payload") == expected,
-                    "Backup replica publication receipt changed", 5)
+    if check_publications:
+        for index, copy in enumerate(copies):
+            check_replica_publication(vault, record, index, copy)
 
 
-def signed_manifest(vault, record):
+def check_replica_publication(vault, record, index, copy):
+    if copy["status"] not in {"present", "deleted"}:
+        return
+    receipt = copy.get("publication_receipt")
+    require(sha256(receipt), "Backup replica lacks a publication receipt", 5)
+    proof = read_json(safe_path(vault.control, f"receipts/{receipt}.json"), {})
+    expected = published_copy(record, index, copy, copy.get("published_at"))
+    require(digest(proof) == receipt and proof.get("kind") == "backup-replica-published" and
+            proof.get("at") == copy.get("published_at") and proof.get("payload") == expected,
+            "Backup replica publication receipt changed", 5)
+
+
+def signed_manifest(vault, record, *, check_publications=True):
     require(record["kind"] == "backup", "Not a backup", 2)
     signers = vault.config.get("backup_allowed_signers") or ""
     if record.get("format") == snapshot.MANIFEST:
         require(record.get("status") == "complete", "Backup publication is incomplete", 5)
         signed = verify_portable_manifest(record["id"], record.get("approval"), signers)
-        check_portable_record(vault, record, signed)
+        check_portable_record(vault, record, signed, check_publications=check_publications)
         return signed
     signed = verify(record.get("approval"), "backup", signers)
     from .retention import copy_identity
@@ -431,9 +439,35 @@ def verify_replica_deletions(vault, record):
 
 def deletion_location(vault, path, copy):
     if "origin_status" in copy:
-        path_type = PureWindowsPath if PureWindowsPath(copy["root"]).drive else Path
-        return path_type(path) == path_type(copy["root"]) / copy["path"]
+        path_type = PureWindowsPath if PureWindowsPath(copy["root"]).drive else PurePosixPath
+        original = path_type(copy["root"]) / copy["path"]
+        if path_type(path) == original:
+            return True
+        return historical_deletion_location(vault, path, copy)
     return vault.relocated_path(path) == vault.relocated_path(copy["root"]) / copy["path"]
+
+
+def historical_deletion_location(vault, path, copy):
+    from .binding import relocated_path
+
+    signers = vault.config.get("backup_allowed_signers") or ""
+    for name in snapshot.historical_paths(vault.control, folders=("",)):
+        backup_id, logical = snapshot.historical_record(name)
+        if logical != "binding.json":
+            continue
+        origin = read_json(safe_path(vault.control, name, exists=True))
+        snapshot.check_origin_binding(origin, vault.identity)
+        path_type = snapshot.origin_path_type(origin["location"])
+        if not all(path_type(value).is_absolute() for value in (path, copy["root"])):
+            continue
+        if relocated_path(path, origin, path_type=path_type) != relocated_path(copy["root"], origin, path_type=path_type) / copy["path"]:
+            continue
+        envelope_path = safe_path(vault.control, f"historical/{backup_id}.manifest.json", exists=True)
+        signed = verify_portable_manifest(backup_id, read_json(envelope_path), signers)
+        require(signed["source_vault"] == vault.identity and signed.get("origin_binding_sha256") == digest(origin),
+                "Historical storage relocation differs from its signed backup", 5)
+        return True
+    return False
 
 
 def load_replica(vault, record, copy, *, decrypt_replica):
@@ -466,32 +500,33 @@ def replica_availability(vault, copy):
 
 
 def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allow_partial=True):
-    manifest = signed_manifest(vault, record)
+    manifest = signed_manifest(vault, record, check_publications=not allow_partial)
     retired = verify_replica_deletions(vault, record)
     checks, replicas, selected = [], [], None
     for index, copy in enumerate(record["copies"]):
         root = str(vault.relocated_path(copy["root"]))
         entry = {"copy_index": index, "root": root, "path": copy["path"]}
-        if copy["status"] == "deleted":
-            entry["status"] = "deleted"
-        else:
-            try:
-                if replica_availability(vault, copy) == "unavailable":
-                    entry.update(status="unavailable", reason="Required regular file is missing: backup replica is unavailable")
-                else:
-                    candidate = load_replica(vault, record, copy, decrypt_replica=decrypt_replicas)
-                    if candidate and selected is None:
-                        path, raw_manifest, plain = candidate
-                        if raw_manifest is not None:
-                            verified = snapshot.check_snapshot(plain, manifest, vault.config.get("allowed_signers") or "",
-                                                               vault.config.get("backup_allowed_signers") or "")
-                        else:
-                            verified = decode(plain)
-                        selected = (path, raw_manifest, plain, manifest, verified)
-                    entry["status"] = "verified"
-                    checks.append({"root": root, "verified": True})
-            except (Blocked, OSError, KeyError, TypeError, ValueError) as exc:
-                entry.update(status="invalid", reason=str(exc))
+        try:
+            if allow_partial and record.get("format") == snapshot.MANIFEST:
+                check_replica_publication(vault, record, index, copy)
+            if copy["status"] == "deleted":
+                entry["status"] = "deleted"
+            elif replica_availability(vault, copy) == "unavailable":
+                entry.update(status="unavailable", reason="Required regular file is missing: backup replica is unavailable")
+            else:
+                candidate = load_replica(vault, record, copy, decrypt_replica=decrypt_replicas)
+                if candidate and selected is None:
+                    path, raw_manifest, plain = candidate
+                    if raw_manifest is not None:
+                        verified = snapshot.check_snapshot(plain, manifest, vault.config.get("allowed_signers") or "",
+                                                           vault.config.get("backup_allowed_signers") or "")
+                    else:
+                        verified = decode(plain)
+                    selected = (path, raw_manifest, plain, manifest, verified)
+                entry["status"] = "verified"
+                checks.append({"root": root, "verified": True})
+        except (Blocked, OSError, KeyError, TypeError, ValueError) as exc:
+            entry.update(status="invalid", reason=str(exc))
         replicas.append(entry)
     pending = [entry for entry in replicas if entry["status"] in {"unavailable", "invalid"}]
     require(allow_partial or not pending, "; ".join(entry["reason"] for entry in pending), 5)

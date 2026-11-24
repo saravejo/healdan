@@ -10,10 +10,9 @@ from .core import (atomic, decode, digest, file_digest, git, git_bytes, lock, re
                    require, safe_path, stamp, sync_directory)
 from .custody import INACTIVE_COPIES, archive_members
 
-JOURNAL = "healdan-backup-restore-v1"
+JOURNAL = snapshot.RESTORE_JOURNAL
 JOURNAL_FILE = "backup-restore.json"
 LOCK = "backup-restore.lock"
-HISTORICAL_STATE = {"transaction.json", "source-ingest.json", "zero-byte-archive.json"}
 
 
 def location(path):
@@ -165,36 +164,58 @@ def build_portable(staging, state, journal, verified, raw_manifest, remaps):
         git_bytes(staging, "update-index", "--skip-worktree", "-z", "--stdin",
                   data=b"".join(name.encode("utf-8") + b"\0" for name in sorted(omitted)))
     control = staging / ".git/healdan"
-    for name, data in snapshot.records_from(contents).items():
-        if name == "materials.json":
-            atomic(safe_path(control, "historical/materials.json"), data)
-        elif name.startswith(("tasks/", "sessions/")):
-            atomic(safe_path(control, "historical/" + name), data)
+    generation = journal["origin"]["backup"]
+    raw_records = snapshot.records_from(contents)
+    prior = {name: data for name, data in raw_records.items() if snapshot.historical_record(name)}
+    for name, data in prior.items():
+        atomic(safe_path(control, name), data)
+    for name, data in raw_records.items():
+        if name in prior:
+            continue
+        is_task = name.startswith(("tasks/", "sessions/"))
+        if name in snapshot.HISTORICAL_STATE | {"materials.json"} or name.startswith("restorations/") or is_task:
+            historical = "historical/" + name
+            if historical in prior:
+                historical = f"historical/generations/{generation}/{name}"
+            require(historical not in prior, "Recovery would overwrite historical evidence: " + historical, 5)
+            atomic(safe_path(control, historical), data)
+        if is_task:
             reconcile = reconcile_task if name.startswith("tasks/") else reconcile_session
-            atomic(safe_path(control, name), reconcile(records[name], journal["origin"]["backup"]))
-        elif name in HISTORICAL_STATE or name.startswith("restorations/"):
-            atomic(safe_path(control, "historical/" + name), data)
-        else:
+            atomic(safe_path(control, name), reconcile(records[name], generation))
+        elif name not in snapshot.HISTORICAL_STATE | {"materials.json"} and not name.startswith("restorations/"):
             atomic(safe_path(control, name), data)
-    atomic(safe_path(control, "historical/" + journal["origin"]["backup"] + ".manifest.json"), raw_manifest)
+    manifest_path = f"historical/{generation}.manifest.json"
+    require(manifest_path not in prior, "Recovery would overwrite an earlier generation manifest", 5)
+    atomic(safe_path(control, manifest_path), raw_manifest)
+    if snapshot.SOURCE_BINDING in archive:
+        proof = f"historical/generations/{generation}/binding.json"
+        require(proof not in prior, "Recovery would overwrite earlier binding evidence", 5)
+        atomic(safe_path(control, proof), archive[snapshot.SOURCE_BINDING])
     pending = reconcile_copies(archive, contents, records["materials.json"], state, control, journal, remaps)
     return len(knowledge), pending
 
 
-def build_legacy(staging, archive, signed, signers, backup_signers):
+def build_legacy(staging, archive, signed, signers, backup_signers, *, external_state=None):
+    from .custody import validate_purpose
+    from .lineage import sha256
+
     require(isinstance(archive, dict) and archive.get("format") == "healdan-tree-v1" and isinstance(archive.get("files"), dict),
             "Unknown legacy backup archive", 5)
     snapshot.paths_compatible(archive["files"])
     members = archive_members(archive, staging)
     prepared = {}
     proven = set()
+    selected = signed["members"]
+    require(signed["generation"] in {"short", "long"} and isinstance(selected, list) and all(snapshot.identifier(member) for member in selected) and
+            len(set(selected)) == len(selected) and (signed["generation"] == "short" or not selected),
+            "Invalid legacy backup member selection", 5)
+    expected_members = {Path(f"custody/{member}.age"): member for member in selected}
     for relative, body in members.items():
         name = relative.as_posix()
         if name == snapshot.BUNDLE:
             continue
         if name.startswith("custody/"):
-            require(name.endswith(".age") and snapshot.identifier(relative.stem) and relative.stem in signed["members"],
-                    "Unexpected legacy backup custody member", 5)
+            require(relative in expected_members, "Unexpected legacy backup custody member", 5)
             continue
         require(not snapshot.FORBIDDEN_NAMES.search(name), "Forbidden legacy backup path: " + name, 5)
         snapshot.guard_content(name, body)
@@ -205,6 +226,16 @@ def build_legacy(staging, archive, signed, signers, backup_signers):
             from .core import parse_jsonl
             snapshot.check_signatures(parse_jsonl(body, name), signers, backup_signers, proven)
     root = Path(staging)
+    custody_records = prepared.get(snapshot.MATERIALS, {})
+    require(isinstance(custody_records, dict), "Invalid legacy custody manifests", 5)
+    for relative, identifier in expected_members.items():
+        record, cipher = custody_records.get(identifier), members.get(relative)
+        require(isinstance(record, dict) and record.get("id") == identifier and record.get("kind") == "conversation" and
+                record.get("classification") != "secret" and record.get("decryption_verified") is True and
+                sha256(record.get("plain_sha256")) and cipher is not None and cipher.startswith(b"age-encryption.org/v1") and
+                len(cipher) == record.get("size") and digest(cipher) == record.get("cipher_sha256"),
+                "Legacy conversation body does not match its custody manifest", 5)
+        validate_purpose(record)
     bundle = safe_path(root, snapshot.BUNDLE)
     require(Path(snapshot.BUNDLE) in members, "Legacy backup lacks a verified Git bundle", 5)
     atomic(bundle, members[Path(snapshot.BUNDLE)])
@@ -223,6 +254,15 @@ def build_legacy(staging, archive, signed, signers, backup_signers):
     for relative, body in members.items():
         if relative != Path(snapshot.BUNDLE) and relative.parts[0] != "custody":
             atomic(safe_path(root, relative), body)
+    for relative in expected_members:
+        target = safe_path(external_state if external_state is not None else root, relative)
+        if target.exists():
+            require(safe_path(target.parent, target.name, exists=True).read_bytes() == members[relative],
+                    "Staged legacy custody copy differs from verified bytes", 5)
+        else:
+            atomic(target, members[relative])
+    if expected_members and external_state is None:
+        atomic(root / ".git/info/exclude", b"/custody/\n")
     control = root / ".git/healdan"
     checkpoints = prepared.get("control/controller-checkpoints.json", {})
     for name in ("reservations", "csp"):
@@ -251,7 +291,7 @@ def allocated(journal, journal_path, stage):
     atomic(journal_path, journal)
 
 
-def staging_digest(stage):
+def directory_inventory(stage):
     inventory = {}
 
     def unreadable(error):
@@ -266,6 +306,20 @@ def staging_digest(stage):
         for name in files:
             file = safe_path(root, name, exists=True)
             inventory[file.relative_to(stage).as_posix()] = file_digest(file)
+    return inventory
+
+
+def staging_digest(stage):
+    return digest(directory_inventory(stage))
+
+
+def recovered_state_digest(state):
+    inventory = {}
+    for name in ("binding.json", "config.json", "custody", "recovered-copies"):
+        path = safe_path(state, name)
+        require(not path.is_junction(), "Unsafe external recovery state: " + name, 5)
+        if path.exists():
+            inventory[name] = directory_inventory(path) if path.is_dir() else file_digest(safe_path(state, name, exists=True))
     return digest(inventory)
 
 
@@ -349,11 +403,14 @@ def recover(verified, destination, state, report, *, allowed_signers, backup_sig
             empty_destination(destination)
             allocated(journal, journal_path, stage)
             if raw_manifest is None:
-                count, pending = build_legacy(stage, checked, signed, allowed_signers or "", backup_signers or "")
+                count, pending = build_legacy(stage, checked, signed, allowed_signers or "", backup_signers or "",
+                                              external_state=state if bind else None)
             else:
                 count, pending = build_portable(stage, state, journal, checked, raw_manifest, remaps)
             control = stage / ".git/healdan"
             provenance = {"format": JOURNAL, **origin, "destination": str(destination), "state": str(state)}
+            if raw_manifest is not None:
+                provenance["backup_format"] = snapshot.MANIFEST
             if bind:
                 config = dict(request["trust"])
                 if raw_manifest is not None and checked[0][snapshot.SOURCE_AUTHORITIES]:
@@ -365,9 +422,16 @@ def recover(verified, destination, state, report, *, allowed_signers, backup_sig
                 atomic(control / "restored-from.json", {"format": "healdan-restored-vault-v1", "source_vault": source_id,
                                                          "backup": origin["backup"], "commit": origin["commit"]})
             receipt = proof_receipt(control, "backup-restored", provenance, journal["at"])
-            journal.update(phase="ready", files=count, pending_copies=pending, receipt=receipt, stage_sha256=staging_digest(stage))
+            journal.update(phase="ready", files=count, pending_copies=pending, receipt=receipt, stage_sha256=staging_digest(stage),
+                           state_sha256=recovered_state_digest(state))
             atomic(journal_path, journal)
+        if journal["phase"] == "ready":
+            require(recovered_state_digest(state) == journal.get("state_sha256"),
+                    "External recovery state changed before publication", 5)
         publish(stage, destination, empty, journal)
+        if journal["phase"] == "ready":
+            require(recovered_state_digest(state) == journal.get("state_sha256"),
+                    "External recovery state changed before completion", 5)
         repository = binding.Repository.open(destination)
         if bind:
             require(binding.bound(repository, state)["vault_id"] == source_id,

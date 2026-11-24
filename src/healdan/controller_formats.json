@@ -5,6 +5,6 @@
   "case": [null, "healdan-query-case-v2"],
   "package": ["healdan-claim-digests-v1", "healdan-approval-package-v1", "healdan-approval-package-v2", "healdan-approval-package-v3"],
   "csp": [null, "CSP-1/i111/f0.1/numeric-v1"],
-  "journal": ["healdan-transaction-legacy-v1", "healdan-transaction-v2", "healdan-storage-policy-v1", "healdan-restore-v1", "healdan-recovery-profile-v1", "healdan-deletion-intent-v1", "healdan-shared-deletion-v1", "healdan-backup-writing-absence-v1", "healdan-backup-manifest-v1", "healdan-backup-restore-v1"],
+  "journal": ["healdan-transaction-legacy-v1", "healdan-transaction-v2", "healdan-storage-policy-v1", "healdan-restore-v1", "healdan-recovery-profile-v1", "healdan-deletion-intent-v1", "healdan-shared-deletion-v1", "healdan-backup-writing-absence-v1", "healdan-backup-manifest-v1", "healdan-backup-restore-v1", "healdan-backup-history-v1"],
   "archive": ["healdan-tree-v1", "healdan-backup-snapshot-v1"]
 }
