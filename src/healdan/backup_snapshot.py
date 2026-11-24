@@ -263,6 +263,14 @@ def state_path(name):
             name in trials.RECEIPTS or historical_record(name) is not None)
 
 
+def trial_paths(control):
+    for folder in trials.RECEIPT_FOLDERS:
+        root = safe_path(control, folder)
+        require(not root.is_junction() and (not root.exists() or root.is_dir()),
+                "Unsafe trial receipt directory: " + folder, 5)
+    return (name for name in trials.RECEIPTS if safe_path(control, name).exists())
+
+
 def historical_paths(control, *, folders=None):
     generations = safe_path(control, "historical/generations")
     require(not generations.is_junction(), "Unsafe backup history directory", 5)
@@ -270,10 +278,12 @@ def historical_paths(control, *, folders=None):
     if generations.exists():
         require(generations.is_dir(), "Invalid backup history directory", 5)
         prefixes.extend("historical/generations/" + child.name for child in generations.iterdir() if identifier(child.name))
-    selected = ("", *sorted(HISTORICAL_FOLDERS), *trials.RECEIPT_FOLDERS) if folders is None else folders
+    selected = ("", *sorted(HISTORICAL_FOLDERS)) if folders is None else folders
     for prefix in prefixes:
         root = safe_path(control, prefix)
         require(not root.is_junction(), "Unsafe backup history directory", 5)
+        if folders is None:
+            yield from (f"{prefix}/{name}" for name in trial_paths(root))
         for folder in selected:
             directory = safe_path(root, folder) if folder else root
             require(not directory.is_junction(), "Unsafe backup history directory", 5)
@@ -287,11 +297,11 @@ def historical_paths(control, *, folders=None):
 def control_records(vault):
     try:
         names = [name for name in sorted(STATE_FILES) if safe_path(vault.control, name).exists()]
-        for folder in (*sorted(STATE_FOLDERS), *trials.RECEIPT_FOLDERS):
+        for folder in sorted(STATE_FOLDERS):
             root = safe_path(vault.control, folder)
             require(not root.is_junction(), "Unsafe controller record directory: " + folder, 5)
-            paths = [f"{folder}/{path.name}" for path in json_paths(root)]
-            names.extend(paths if folder in STATE_FOLDERS else (name for name in paths if name in trials.RECEIPTS))
+            names.extend(f"{folder}/{path.name}" for path in json_paths(root))
+        names.extend(trial_paths(vault.control))
         names.extend(historical_paths(vault.control))
         paths_compatible(names)
         return {name: safe_path(vault.control, name, exists=True).read_bytes() for name in names}
@@ -577,13 +587,18 @@ def check_historical_journal(name, value, source_vault):
                 isinstance(binding.get("destination"), str), "Invalid historical conversation restoration journal", 5)
 
 
-def check_trial_receipt(name, logical_name, receipt, source_vault):
+def check_trial_receipt(name, receipt, source_vault, expected=None):
     require(isinstance(receipt, dict) and SIGNATURE_FIELDS == receipt.keys() and receipt["namespace"] == "trial" and
             sha256(receipt["digest"]) and all(isinstance(receipt[key], str) and receipt[key] for key in ("signature", "identity")),
             "Invalid signed trial receipt: " + name, 5)
     payload = receipt["payload"]
     require(isinstance(payload, dict), "Invalid signed trial payload: " + name, 5)
-    trial, versioned = trials.RECEIPTS.get(logical_name, (payload.get("name"), "format" in payload))
+    if expected is None:
+        # The unversioned audit wrapper is shared by both producers.
+        measured = payload.get("environment")
+        versioned = payload.get("format") == trials.TRIAL_FORMAT and isinstance(measured, dict) and "vault_id" in measured
+        expected = payload.get("name"), versioned
+    trial, versioned = expected
     try:
         trials.check_preserved_evidence(payload, trial, source_vault, versioned=versioned)
     except (Blocked, ValueError, OverflowError) as exc:
@@ -596,6 +611,7 @@ def check_records(archive, contents, signers, backup_signers):
     from .review import csp_state_streak
 
     proven, records = set(), {}
+    trial_versions, trial_mirrors = {}, {}
     for name, data in records_from(contents).items():
         value = decode(data)
         require(isinstance(value, list if name == "storage-policy.json" else dict),
@@ -606,10 +622,13 @@ def check_records(archive, contents, signers, backup_signers):
         parent, _, filename = logical_name.partition("/")
         stem = filename.removesuffix(".json")
         if logical_name in trials.RECEIPTS:
-            check_trial_receipt(name, logical_name, value, archive["source_vault"])
-        elif parent == "receipts" and value.get("kind") == "trial-signature":
-            check_trial_receipt(name, logical_name, value.get("payload"), archive["source_vault"])
-        check_signatures(value, signers, backup_signers, proven)
+            expected = trials.RECEIPTS[logical_name]
+            check_trial_receipt(name, value, archive["source_vault"], expected)
+            trial_versions[digest(value)] = expected
+        if parent == "receipts" and value.get("kind") == "trial-signature":
+            trial_mirrors[name] = value.get("payload")
+        else:
+            check_signatures(value, signers, backup_signers, proven)
         if history:
             check_historical_journal(logical_name, value, archive["source_vault"])
         if logical_name == "materials.json":
@@ -633,6 +652,9 @@ def check_records(archive, contents, signers, backup_signers):
                     isinstance(value.get("action"), str) and isinstance(value.get("state"), str) and
                     isinstance(usage, dict) and all(type(amount) is int and amount >= 0 for amount in usage.values()) and
                     id_identity(value.get("id"))[0] == "S", "Invalid backed-up session record: " + stem, 5)
+    for name, receipt in trial_mirrors.items():
+        check_trial_receipt(name, receipt, archive["source_vault"], trial_versions.get(digest(receipt)))
+        check_signatures(receipt, signers, backup_signers, proven)
     csp_state_streak(records.get("csp.json", {"streak": 0}))
     for operation, reservation in records.get("reservations.json", {}).items():
         require(identifier(operation) and isinstance(reservation, dict) and isinstance(reservation.get("ids"), list) and

@@ -155,10 +155,22 @@ def _validate_evidence(evidence):
 
 
 def check_preserved_evidence(payload, name, vault_id, *, versioned):
-    require(isinstance(payload, dict) and name in TRIALS and payload.get("name") == name and
-            all(isinstance(payload.get(key), str) for key in ("started_at", "completed_at")),
-            "Trial evidence has an invalid name or timestamps", 5)
-    _validate_evidence(payload)
+    require(isinstance(payload, dict) and name in TRIALS and payload.get("name") == name,
+            "Trial evidence has an invalid name", 5)
+    if not versioned:
+        commit = payload.get("commit")
+        require(payload.get("passed") is True and isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit),
+                "Invalid legacy trial result or commit", 5)
+        if payload.keys() == {"name", "passed", "commit"}:
+            return
+    require(all(isinstance(payload.get(key), str) for key in ("started_at", "completed_at")),
+            "Trial evidence has invalid timestamps", 5)
+    if versioned:
+        _validate_evidence(payload)
+    else:
+        require(payload.get("platform") == "Darwin" and payload.get("procedure") and payload.get("versions"),
+                "Invalid legacy trial platform, procedure or dependency versions", 5)
+        require(utc(payload["completed_at"]) >= utc(payload["started_at"]), "Invalid trial times", 5)
     artifacts = payload.get("artifacts")
     require(isinstance(artifacts, list) and artifacts and all(
         isinstance(artifact, dict) and isinstance(artifact.get("path"), str) and artifact["path"] and
@@ -176,10 +188,6 @@ def check_preserved_evidence(payload, name, vault_id, *, versioned):
         paths = [artifact["path"] for artifact in artifacts]
         require(len(set(paths)) == len(paths) and all(PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
                                                      for path in paths), "Invalid measured trial artifact paths", 5)
-    else:
-        commit = payload.get("commit")
-        require("format" not in payload and isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) and
-                payload.get("versions"), "Invalid legacy trial commit or dependency versions", 5)
 
 
 def attest(vault, name, evidence):

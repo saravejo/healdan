@@ -11,7 +11,7 @@ from uuid import uuid4
 from support import VaultTest, controller_environment
 from healdan import admission, backup_recovery, backup_snapshot, backups, binding, compatibility, custody, inbox, maintenance, retention, storage_policy, tasks, trials
 from healdan.core import Blocked, Vault, atomic, canonical, decode, digest, git, read_json, run, stamp, utc
-from healdan.signing import envelope
+from healdan.signing import envelope, human_sign
 
 
 class BackupPortable(VaultTest):
@@ -1138,6 +1138,34 @@ class BackupPortable(VaultTest):
         old = self.signed({**evidence, "name": name, "commit": "c" * 40, "versions": {"age": "fixture"}}, "trial")
         old_bytes = b"\n" + canonical(old) + b"\r\n"
         atomic(self.vault.control / legacy, old_bytes)
+        extra_legacy = {}
+        legacy_evidence = {**evidence, "commit": self.vault.head(), "versions": {"age": "fixture"}}
+        minimal = {"name": "claude-auth", "passed": True, "commit": self.vault.head()}
+        for payload, nominal in (
+            ({**legacy_evidence, "name": "native-resume", "procedure": {"steps": ["Resume the disposable session"]},
+              "format": "personal-evidence-v1"}, True),
+            ({**legacy_evidence, "name": "native-cleanup", "procedure": " \t\n", "format": trials.TRIAL_FORMAT,
+              "environment": {"vault_id": "legacy-extra-field"}}, True),
+            ({**legacy_evidence, "name": "launchd", "format": trials.TRIAL_FORMAT,
+              "environment": {"description": "Additional legacy audit details"}}, False),
+            (minimal, True),
+            ({**minimal, "name": "offline-recovery"}, False),
+        ):
+            signed = human_sign(self.vault, payload, "trial")
+            if nominal:
+                body = b"\n" + canonical(signed) + b"\r\n"
+                path = f"trials/{payload['name']}.json"
+                atomic(self.vault.control / path, body)
+                extra_legacy[path] = body
+            mirrors = [receipt for receipt in (self.vault.control / "receipts").glob("*.json")
+                       if read_json(receipt).get("payload") == signed]
+            self.assertEqual(len(mirrors), 1)
+            extra_legacy[f"receipts/{mirrors[0].name}"] = mirrors[0].read_bytes()
+        audit_only = human_sign(self.vault, {**evidence, "name": "launchd", "commit": self.vault.head(),
+                                             "versions": {"age": "fixture"}, "format": trials.TRIAL_FORMAT}, "trial")
+        orphan = next(path for path in (self.vault.control / "receipts").glob("*.json")
+                      if read_json(path).get("payload") == audit_only)
+        extra_legacy[f"receipts/{orphan.name}"] = orphan.read_bytes()
         with patch("healdan.trials.environment", return_value=measurements):
             approval = trials.attest(self.vault, name, {**evidence, "environment": measurements})
         current_bytes = b"  " + canonical(approval) + b"\r\n"
@@ -1149,7 +1177,7 @@ class BackupPortable(VaultTest):
         backup = self.create()
         plain = custody.decrypt(self.vault, self.paths(backup)[1].read_bytes())
         contents = backup_snapshot.check_entries(decode(plain), backup["approval"]["payload"])
-        expected = {current: current_bytes, legacy: old_bytes}
+        expected = {current: current_bytes, legacy: old_bytes, **extra_legacy}
         for path, body in expected.items():
             self.assertEqual(contents[backup_snapshot.STATE + path], body)
         self.assertFalse(any(b"INCIDENTAL_TRIAL_CONTENT" in body or b"ORIGIN_ONLY_AUTHENTICATION" in body or
@@ -1159,6 +1187,9 @@ class BackupPortable(VaultTest):
         restored = Vault(result["destination"], result["state"])
         self.assertEqual(restored.identity, self.vault.identity)
         for path, body in expected.items():
+            if path.startswith("receipts/"):
+                self.assertEqual((restored.control / path).read_bytes(), body)
+                continue
             self.assertFalse((restored.control / path).exists())
             self.assertEqual((restored.control / "historical" / path).read_bytes(), body)
         with patch("healdan.trials.environment", return_value=measurements) as measure:
@@ -1194,9 +1225,45 @@ class BackupPortable(VaultTest):
                               paths=next_paths)
         again = Vault(result["destination"], result["state"])
         for path, body in expected.items():
-            self.assertEqual((again.control / "historical" / path).read_bytes(), body)
+            folder = again.control if path.startswith("receipts/") else again.control / "historical"
+            self.assertEqual((folder / path).read_bytes(), body)
         self.assertEqual((again.control / "historical/generations" / next_backup["id"] / current).read_bytes(), fresh_bytes)
         self.assertFalse(any(row["passed"] for row in trials.status(again)))
+
+    def test_1_native_trial_case_matches_local_reader(self):
+        self.configure()
+        name = "offline-recovery"
+        relative = f"trials/v2/{name}.json"
+        path = self.vault.control / relative
+        _, evidence, measured = self.trial_evidence(name)
+        with patch("healdan.trials.environment", return_value=measured):
+            trials.attest(self.vault, name, {**evidence, "environment": measured})
+        original = b"\n" + path.read_bytes() + b"\r\n"
+        atomic(path, original)
+        alias = path.with_name(path.name.upper())
+        case_insensitive = alias.exists()
+        path.rename(path.with_name("rename.json")).rename(alias)
+        with patch("healdan.trials.environment", return_value=measured):
+            status = next(row for row in trials.status(self.vault) if row["name"] == name)
+        self.assertEqual(status["passed"], case_insensitive)
+
+        record = self.create()
+        plain = custody.decrypt(self.vault, self.paths(record)[1].read_bytes())
+        contents = backup_snapshot.check_entries(decode(plain), record["approval"]["payload"])
+        self.assertNotIn(backup_snapshot.STATE + f"trials/v2/{alias.name}", contents)
+        result = self.restore(record)
+        recovered = Vault(result["destination"], result["state"])
+        history = recovered.control / "historical" / relative
+        if case_insensitive:
+            self.assertEqual(contents[backup_snapshot.STATE + relative], original)
+            self.assertEqual(history.read_bytes(), original)
+            history.rename(history.with_name("rename.json")).rename(history.with_name(alias.name))
+            self.assertEqual(backup_snapshot.control_records(recovered)["historical/" + relative], original)
+        else:
+            self.assertNotIn(backup_snapshot.STATE + relative, contents)
+            self.assertFalse(history.exists())
+        self.assertFalse((recovered.control / relative).exists())
+        self.assertEqual(alias.read_bytes(), original)
 
     def test_1_invalid_native_trial_evidence_blocks_backup_publication(self):
         self.configure()
@@ -1209,6 +1276,8 @@ class BackupPortable(VaultTest):
             ({"payload": payload}, "Invalid signed trial receipt"),
             (self.signed({**payload, "name": "launchd"}, "trial"), "invalid name"),
             (self.signed({**payload, "environment": {**measured, "vault_id": str(uuid4())}}, "trial"), "source vault"),
+            (self.signed({**payload, "procedure": {"steps": ["Disposable"]}}, "trial"), "a procedure"),
+            (self.signed({**payload, "procedure": " \t"}, "trial"), "a procedure"),
             (self.signed({**payload, "artifacts": [{"path": "/origin/fixture", "sha256": "invalid"}]}, "trial"), "artifact inventory"),
             (self.signed({**payload, "completed_at": "2026-01-01T00:00:00Z"}, "trial"), "Invalid trial times"),
             ({**approved, "payload": {**payload, "procedure": "Changed evidence"}}, "Signed payload was changed"),
@@ -1219,6 +1288,30 @@ class BackupPortable(VaultTest):
                     self.create()
                 self.assertEqual(list(self.destinations[0].iterdir()), [])
                 self.assertEqual(custody.materials(self.vault), {})
+        path.unlink()
+        path.mkdir()
+        with self.assertRaisesRegex(Blocked, "Required regular file is missing"):
+            self.create()
+        path.rmdir()
+        foreign = self.signed({**payload, "environment": {**measured, "vault_id": str(uuid4())}}, "trial")
+        proof = self.vault.receipt("trial-signature", foreign)
+        try:
+            with self.assertRaisesRegex(Blocked, "source vault"):
+                self.create()
+        finally:
+            (self.vault.control / "receipts" / (proof + ".json")).unlink()
+        legacy = self.vault.control / "trials" / f"{name}.json"
+        minimal = {"name": name, "passed": True, "commit": self.vault.head()}
+        for value, reason in (
+            (self.signed({**minimal, "format": "truncated"}, "trial"), "invalid timestamps"),
+            ({**self.signed(minimal, "trial"), "signature": "invalid"}, "Invalid human SSH signature"),
+            (self.signed({**minimal, "commit": "abc"}, "trial"), "Invalid legacy trial result or commit"),
+        ):
+            with self.subTest(reason=reason):
+                atomic(legacy, value)
+                with self.assertRaisesRegex(Blocked, reason):
+                    self.create()
+                self.assertEqual(list(self.destinations[0].iterdir()), [])
 
     def test_1_deleted_replica_proof_after_origin_rebind(self):
         self.configure()

@@ -41,6 +41,7 @@
     "test_backup_portable.BackupPortable.test_1_invalid_replica_inventory_does_not_block_fallback",
     "test_backup_portable.BackupPortable.test_1_invalid_replica_or_manifest",
     "test_backup_portable.BackupPortable.test_1_legacy_envelope_with_backup_off",
+    "test_backup_portable.BackupPortable.test_1_native_trial_case_matches_local_reader",
     "test_backup_portable.BackupPortable.test_1_native_trial_receipts_survive_as_inactive_history",
     "test_backup_portable.BackupPortable.test_1_portable_manifest_without_signed_publication_plan",
     "test_backup_portable.BackupPortable.test_1_portable_restores_regular_and_executable_git_modes",
