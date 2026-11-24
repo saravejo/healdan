@@ -3,7 +3,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, utc
-from .custody import materials, native_guard, retention_deadline, save_material
+from .custody import INACTIVE_COPIES, materials, native_guard, retention_deadline, save_material
 from .tasks import all_tasks
 
 
@@ -16,11 +16,15 @@ def reconcile_closures(vault):
             save_material(vault, record)
 
 
-def guard(vault, record, copy, now):
+def require_expired(record, now):
     deadline = retention_deadline(record)
     require(deadline and utc(now) >= deadline, "Retention has not expired", 5)
     require(not record.get("dependencies"), "Evidence dependencies prevent deletion", 5)
     require(not any(not h.get("ended_at") for h in record.get("holds", [])), "Active hold prevents deletion", 5)
+
+
+def guard(vault, record, copy, now):
+    require_expired(record, now)
     if record.get("classification") == "secret":
         require(record.get("quarantine_receipt") and record.get("rotation_receipt") and
                 record.get("deletion_decision"), "Secret incident steps are incomplete", 5)
@@ -30,6 +34,15 @@ def guard(vault, record, copy, now):
     roots.append((vault.state / "custody").resolve())
     if record.get("kind") == "export" and copy.get("kind") == "export":
         roots.append((vault.root / "inbox").resolve())
+    if record.get("kind") == "export" and copy.get("kind") == "archive":
+        require(Path(copy["path"]).parts[:1] == (copy["sha256"],), "Archived custody path does not match its digest", 5)
+        archive = (vault.root / "archive").resolve()
+        roots.append(archive)
+        for other in materials(vault).values():
+            if other["id"] != record["id"] and any(c.get("kind") == "archive" and
+                    c.get("status") == "present" and Path(c["path"]) == Path(copy["path"]) and
+                    vault.relocated_path(c["root"]).resolve() == archive for c in other["copies"]):
+                require_expired(other, now)
     roots.extend(Path(p).resolve() for p in vault.config.get("backup_destinations", []))
     root = vault.relocated_path(copy["root"])
     controller_copy = root.resolve().is_relative_to(vault.state.resolve()) and root.resolve() != vault.state.resolve()
@@ -47,7 +60,7 @@ def plan(vault, now=None):
         if not deadline or utc(now) < deadline:
             continue
         for index, copy in enumerate(record.get("copies", [])):
-            if copy.get("status") != "deleted":
+            if copy.get("status") not in INACTIVE_COPIES:
                 entries.append({"material": record["id"], "copy_index": index, "copy": copy,
                                 "status": "planned"})
     result = {"id": str(uuid4()), "created_at": now, "entries": entries, "status": "planned"}
@@ -65,13 +78,19 @@ def execute(vault, identifier, now=None):
                               for e in record["entries"]]}
         require(digest(frozen) == record["digest"], "Deletion plan changed after persistence")
         for entry in record["entries"]:
-            if entry["status"] == "deleted":
+            if entry["status"] in INACTIVE_COPIES:
                 continue
             try:
                 material = materials(vault)[entry["material"]]
                 copy = material["copies"][entry["copy_index"]]
-                require({k: v for k, v in copy.items() if k not in {"status", "deleted_at"}} ==
-                        {k: v for k, v in entry["copy"].items() if k not in {"status", "deleted_at"}}, "Copy inventory changed", 5)
+                state = {"status", "deleted_at", "moved_at", "move_receipt"}
+                require({k: v for k, v in copy.items() if k not in state} ==
+                        {k: v for k, v in entry["copy"].items() if k not in state}, "Copy inventory changed", 5)
+                if copy["status"] == "moved":
+                    entry.update(status="moved", at=copy["moved_at"])
+                    entry.pop("error", None)
+                    atomic(path, record)
+                    continue
                 target = guard(vault, material, copy, now)
                 if target.exists():
                     require(digest(target.read_bytes()) == copy["sha256"], "Copy hash changed; deletion stopped", 5)
@@ -94,7 +113,7 @@ def execute(vault, identifier, now=None):
                                for h in current.get("holds", [])):
                         hold(vault, entry["material"], "Native recovery unproven", "controller")
             atomic(path, record)
-        record["status"] = "complete" if all(e["status"] == "deleted" for e in record["entries"]) else "pending"
+        record["status"] = "complete" if all(e["status"] in INACTIVE_COPIES for e in record["entries"]) else "pending"
         atomic(path, record)
         vault.receipt("deletion-round", {"plan": identifier, "digest": record["digest"], "status": record["status"]})
         return record

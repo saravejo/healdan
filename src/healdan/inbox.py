@@ -3,8 +3,8 @@ from datetime import timedelta
 import os
 from pathlib import Path
 
-from . import admission
-from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, utc
+from . import admission, custody
+from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, sync_directory, utc
 
 EXCLUDED = {"inbox/agent-activities-today.md", "inbox/manual-activities-today.md", "inbox/agent-dashboard.html"}
 
@@ -130,7 +130,8 @@ def archive_empty(vault, sha256):
         items = read_json(path, {})
         require(sha256 in items, "Inventory the Inbox item first", 2)
         item = items[sha256]
-        current, _ = admission.Classification(vault, admission.published_rows(vault)).current(sha256)
+        classification = admission.Classification(vault, admission.published_rows(vault))
+        current, _ = classification.current(sha256)
         require(sha256 == digest(b"") and item["size"] == 0 and current == "common",
                 "Only zero-byte ordinary material may auto-archive", 5)
         journal_path = vault.control / "zero-byte-archive.json"
@@ -160,13 +161,17 @@ def archive_empty(vault, sha256):
             if receipt_id not in item["receipts"]:
                 # An existing destination may have appeared after the preflight.
                 create_empty_archive(vault, relative, target_name)
+                target = empty_archive_target(vault, relative, target_name)
+                require(target.is_file(), f"Archive destination missing for {relative}: {target_name}", 5)
                 if source.exists():
                     require(safe_path(vault.root, relative, exists=True).read_bytes() == b"",
                             "Inbox item changed: " + relative, 5)
                     source.unlink()
+                    sync_directory(source.parent)
+                custody.record_archive_move(vault, classification.links.get(sha256, []), move, receipt_id)
                 receipt = vault.receipt("zero-byte-archive", payload, at=move["at"])
                 item["receipts"].append(receipt)
-                item.update(decision="archive", decided_at=move["at"])
+                item.setdefault("archive_moves", []).append({**move, "receipt": receipt})
                 atomic(path, items)
             del pending[relative]
             atomic(journal_path, pending)
@@ -191,3 +196,5 @@ def create_empty_archive(vault, source, destination):
             os.fsync(stream.fileno())
     except FileExistsError:
         empty_archive_target(vault, source, destination)
+    else:
+        sync_directory(target.parent)

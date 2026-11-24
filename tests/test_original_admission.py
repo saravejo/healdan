@@ -6,7 +6,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest
-from healdan import backups, inbox, originals, setup, tasks, transactions
+from healdan import admission, backups, custody, inbox, originals, retention, setup, tasks, transactions
 from healdan.core import Blocked, atomic, digest, git, git_bytes, jsonl, read_json, stamp, utc
 from healdan.ids import reserve
 from healdan.knowledge import query
@@ -121,6 +121,72 @@ class OriginalAdmission(VaultTest):
         inbox.archive_empty(self.vault, key)
         self.assertFalse((self.root / name).exists())
         self.assertEqual(len(self.archive_receipts()), 1)
+
+    def test_reclassified_empty_copies_keep_signed_decision_and_custody_on_resume(self):
+        first, second = "inbox/a/nota.txt", "inbox/b/nota.txt"
+        sha = digest(b"")
+        material_id = "inbox-" + sha
+        atomic(self.root / first, b"")
+        inbox.inventory(self.vault)
+        decided = inbox.decide(self.vault, sha, "resource", owner="human", classification="sensitive",
+            entered_at="2026-04-01T00:00:00Z", entry_origin="Fixture receipt", destination="Fixture custody",
+            purpose={"purpose": "Review capture", "necessity": "Verify empty bytes", "owner": "human", "link": material_id})
+        hold = custody.hold(self.vault, material_id, "Keep the capture", "human")
+        original = custody.materials(self.vault)[material_id]
+        now = "2026-04-15T00:00:00Z"
+        original_plan = retention.plan(self.vault, now)
+        self.vault.config["source_classification_authorities"] = ["human"]
+        atomic(self.vault.config_path, self.vault.config)
+        signed = admission.sign_reclassification(self.vault, sha,
+            {"classification": "common", "reason": "Verified empty synthetic capture"})
+        event = admission.reclassify(self.vault, signed)
+        decision_path = self.vault.control / admission.DECISIONS
+        decisions = decision_path.read_bytes()
+        receipt_folder = self.vault.control / "receipts"
+        existing_receipts = {path: path.read_bytes() for path in receipt_folder.glob("*.json")}
+
+        code, result = self.cli("inbox", "archive-empty", sha)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["decided_at"], decided["decided_at"])
+        self.assertEqual(result["decision"], "resource")
+        atomic(self.root / second, b"")
+        inbox.inventory(self.vault)
+        save = custody.save_material
+
+        def interrupt(vault, record):
+            save(vault, record)
+            raise OSError("interrupted after custody recorded the move")
+
+        with patch("healdan.custody.save_material", side_effect=interrupt), self.assertRaisesRegex(OSError, "interrupted"):
+            inbox.archive_empty(self.vault, sha)
+        self.assertFalse((self.root / second).exists())
+        completed = inbox.archive_empty(self.vault, sha)
+        self.assertEqual(self.cli("inbox", "archive-empty", sha), (0, completed))
+        decision_fields = ("classification", "decided_at", "decision", "decision_receipt")
+        self.assertEqual({k: completed[k] for k in decision_fields}, {k: decided[k] for k in decision_fields})
+        self.assertEqual(admission.Classification(self.vault, {}).current(sha), ("common", event["receipt"]))
+        self.assertEqual(decision_path.read_bytes(), decisions)
+        self.assertEqual({path: path.read_bytes() for path in existing_receipts}, existing_receipts)
+        self.assertCountEqual([motion["payload"]["source"] for motion in completed["archive_moves"]], [first, second])
+        self.assertCountEqual([receipt["source"] for receipt in self.archive_receipts()], [first, second])
+
+        recorded = custody.materials(self.vault)[material_id]
+        self.assertEqual(recorded["holds"], [hold])
+        self.assertEqual(recorded["purpose"], original["purpose"])
+        self.assertEqual(custody.retention_deadline(recorded), custody.retention_deadline(original))
+        self.assertCountEqual([(copy["path"], copy["status"]) for copy in recorded["copies"]],
+                              [("a/nota.txt", "moved"), ("b/nota.txt", "moved"), (f"{sha}/nota.txt", "present")])
+        original_plan_path = self.root / first
+        atomic(original_plan_path, b"A separate new arrival")
+        result = retention.execute(self.vault, original_plan["id"], now)
+        self.assertEqual(result["entries"][0]["status"], "moved")
+        self.assertEqual(original_plan_path.read_bytes(), b"A separate new arrival")
+        archive = self.root / f"archive/{sha}/nota.txt"
+        plan = retention.plan(self.vault, now)
+        self.assertEqual([entry["copy"]["kind"] for entry in plan["entries"]], ["archive"])
+        result = retention.execute(self.vault, plan["id"], now)
+        self.assertIn("Active hold", result["entries"][0]["error"])
+        self.assertEqual(archive.read_bytes(), b"")
 
     def test_original_bytes_survive_stage_commit_checkout_and_locators(self):
         git(self.root, "config", "core.autocrlf", "true")

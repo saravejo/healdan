@@ -4,7 +4,7 @@ from uuid import uuid4
 import re
 
 from .core import Blocked, atomic, digest, read_json, require, stamp, utc
-from .custody import materials, retention_deadline, validate_purpose
+from .custody import INACTIVE_COPIES, materials, retention_deadline, validate_purpose
 from .ids import inventory as id_inventory
 from .inbox import findings as inbox_findings, ordinary
 from .knowledge import Knowledge
@@ -65,7 +65,7 @@ def collect(vault, now=None):
                 add("retention", material["id"] + ":purpose", str(exc))
         deadline = retention_deadline(material)
         if not deadline or utc(now) >= deadline:
-            if any(c.get("status") != "deleted" for c in material.get("copies", [])):
+            if any(c.get("status") not in INACTIVE_COPIES for c in material.get("copies", [])):
                 add("retention", material["id"], "No proven deadline" if not deadline else "Deletion overdue or held")
         for h in material.get("holds", []):
             if not h.get("ended_at"):

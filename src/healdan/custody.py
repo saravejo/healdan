@@ -7,6 +7,8 @@ from uuid import uuid4
 from .core import atomic, canonical, decode, digest, executable, read_json, require, run, safe_path, stamp, utc
 from .signing import trusted_signers, verify
 
+INACTIVE_COPIES = {"deleted", "moved"}
+
 
 def archive_tree(root):
     root = Path(root).resolve()
@@ -67,6 +69,31 @@ def save_material(vault, record):
         rows = materials(vault)
         rows[record["id"]] = record
         atomic(vault.control / "materials.json", rows)
+
+
+def record_archive_move(vault, records, move, receipt):
+    payload = move["payload"]
+    source, destination, sha = payload["source"], payload["destination"], payload["sha256"]
+    origin_path = safe_path(vault.root, source)
+    archived = safe_path(vault.root, destination, exists=True)
+    require(digest(archived.read_bytes()) == sha, "Archived custody copy changed: " + destination, 5)
+    for record in records:
+        copies = record["copies"]
+        origins = [copy for copy in copies if copy["kind"] == "export" and copy["sha256"] == sha and
+                   vault.relocated_path(copy["root"]) / copy["path"] == origin_path]
+        if not any(copy.get("move_receipt") == receipt for copy in origins):
+            active = [copy for copy in origins if copy["status"] not in INACTIVE_COPIES]
+            if not active:
+                active = [{"root": str(vault.root / "inbox"), "path": source.removeprefix("inbox/"),
+                           "sha256": sha, "kind": "export"}]
+                copies.extend(active)
+            for copy in active:
+                copy.update(status="moved", moved_at=move["at"], move_receipt=receipt)
+        if not any(copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] == "present" and
+                   vault.relocated_path(copy["root"]) / copy["path"] == archived for copy in copies):
+            copies.append({"root": str(vault.root / "archive"), "path": destination.removeprefix("archive/"),
+                           "sha256": sha, "kind": "archive", "status": "present"})
+        save_material(vault, record)
 
 
 def capture_tree(vault, root, *, task, classification, session=None, purpose=None):
