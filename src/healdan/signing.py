@@ -7,7 +7,7 @@ from .core import canonical, digest, executable, require, run
 
 
 def envelope(payload, namespace, identity, key):
-    require(namespace in {"package", "case", "alias", "trial", "decision", "recovery", "backup"},
+    require(namespace in {"package", "case", "alias", "trial", "decision", "recovery", "backup", "integration-origin"},
             "Unknown signing namespace", 2)
     signed = run([executable("ssh-keygen"), "-Y", "sign", "-f", key,
                   "-n", "healdan-" + namespace], data=canonical(payload)).stdout

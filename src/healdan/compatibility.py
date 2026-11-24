@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .binding import Repository
 from .core import TRANSACTION_V2, Blocked, digest, json_paths, read_json, require, safe_path
+from . import integration_journal
 from .lineage import package_pages, sha256
 from .migration import PACKAGE_FORMATS
 from .regression import CASE_REGISTRY, _compatible_case
@@ -16,6 +17,8 @@ LEGACY_JOURNAL = "healdan-transaction-legacy-v1"
 
 
 def _journal_format(journal):
+    if isinstance(journal, dict) and journal.get("format") == integration_journal.FORMAT:
+        return integration_journal.validate(journal)
     require(isinstance(journal, dict) and JOURNAL_FIELDS <= journal.keys() and isinstance(journal["status"], str),
             "Unsupported integration journal format", 5)
     fields = journal.keys() - {"format"}
@@ -31,10 +34,11 @@ def _journal_format(journal):
 
 
 def _journal(vault):
-    path = safe_path(vault.control, "transaction.json")
-    if not path.exists():
-        return None
-    journal = read_json(path)
+    journal = integration_journal.read(vault.control)
+    return _journal_format(journal) if journal is not None else None
+
+
+def validate_legacy_journal(journal):
     version = _journal_format(journal)
     require(isinstance(journal["package_id"], str) and isinstance(journal["base"], str) and
             isinstance(journal["files"], dict) and isinstance(journal["before"], dict) and
@@ -42,7 +46,7 @@ def _journal(vault):
             all(isinstance(name, str) and name in journal["files"] for name in journal["written"]),
             "Unsupported integration journal entries", 5)
     for name, body in journal["files"].items():
-        safe_path(vault.repository.primary, name)
+        require(integration_journal.name_safe(name), "Unsafe integration journal path", 5)
         _journal_bytes(body)
     if version == TRANSACTION_V2:
         before_files = journal.get("before_files", {})
@@ -145,6 +149,12 @@ def check(vault, capabilities):
     from .backup_snapshot import FORMAT as BACKUP_ARCHIVE, MANIFEST as BACKUP_MANIFEST
     from .backup_snapshot import RECOVERY_HISTORY, historical_paths
     from .backup_recovery import JOURNAL as BACKUP_RESTORE
+
+    for name in historical_paths(vault.control):
+        if name.endswith("/transaction.json") or "/integration-history/" in name:
+            needs("journal", _journal_format(read_json(safe_path(vault.control, name, exists=True))))
+    for path in json_paths(safe_path(vault.control, "integration-history")):
+        needs("journal", _journal_format(read_json(safe_path(vault.control, "integration-history/" + path.name, exists=True))))
 
     records = materials(vault)
     if any(record.get("format") == BACKUP_MANIFEST for record in records.values()):

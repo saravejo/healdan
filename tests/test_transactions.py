@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from support import VaultTest
 from healdan import ids, review, tasks, transactions
+from healdan import integration_effects, integration_journal
 from healdan.core import Blocked, REQUIRED_REGISTRIES, atomic, canonical, digest, git, jsonl, read_json
 from healdan.knowledge import query
 from healdan.signing import verify
@@ -82,14 +83,12 @@ class Transactions(VaultTest):
         task, package = self.prepare_fixture()
         transactions.inspect_package(self.vault, package["id"], {"C-0001": "conform"})
         transactions.approve(self.vault, package["id"])
-        failed = False
-        def fail_once(path, data):
-            nonlocal failed
-            if Path(path) == self.root / "wiki/control/selectors.jsonl" and not failed:
-                failed = True
+        def fail_once(source, target):
+            if target == self.root / "wiki/control/selectors.jsonl":
                 raise OSError("Injected disk failure after journal persistence")
-            return atomic(path, data)
-        with patch("healdan.transactions.atomic", side_effect=fail_once), self.assertRaises(OSError):
+            return rename(source, target)
+        rename = integration_effects.rename_exclusive
+        with patch("healdan.integration_effects.rename_exclusive", side_effect=fail_once), self.assertRaises(OSError):
             transactions.apply(self.vault, package["id"])
         journal_path = self.vault.control / "transaction.json"
         original = journal_path.read_bytes()
@@ -98,8 +97,8 @@ class Transactions(VaultTest):
         with self.assertRaises(Blocked):
             ids.reserve(self.vault, "S", 1, str(uuid4()))
         journal["files"]["wiki/claims.jsonl"] = base64.b64encode(jsonl([{"id": "D-0001"}])).decode("ascii")
-        atomic(journal_path, journal)
-        with self.assertRaisesRegex(Blocked, "Recovery journal files differ from the signed package"):
+        integration_journal.persist(journal_path, journal)
+        with self.assertRaisesRegex(Blocked, "journal blobs or derived ledger differ"):
             transactions.apply(self.vault, recover=True)
         atomic(journal_path, original)
         recovered = transactions.apply(self.vault, recover=True)
@@ -300,7 +299,7 @@ class Transactions(VaultTest):
                 raise OSError("Injected disconnection after the inspection state was written")
             return atomic(path, data)
 
-        with patch("healdan.transactions.atomic", side_effect=interrupt_before_completion), self.assertRaises(OSError):
+        with patch("healdan.integration_journal.atomic", side_effect=interrupt_before_completion), self.assertRaises(OSError):
             transactions.apply(self.vault, package["id"])
         head = self.vault.head()
         self.assertNotEqual(head, task["base"])
@@ -429,8 +428,10 @@ class Transactions(VaultTest):
         record, path = self.legacy_package(package, registry, jsonl([{"id": "D-1"}, {"id": "D-0001"}]))
         record["approval"] = self.signed(transactions.approval_payload(record), "package")
         atomic(path, record)
-        with patch("healdan.transactions.validate_candidate"):
-            journal = self.interrupt_apply(record, self.root / registry)
+        with patch("healdan.transactions.validate_candidate"), patch("healdan.transactions.isolated_validation",
+                  side_effect=OSError("Injected integration interruption")), self.assertRaises(OSError):
+            transactions.apply(self.vault, record["id"])
+        journal = self.vault.control / "transaction.json"
         before = journal.read_bytes()
         with self.assertRaisesRegex(Blocked, "Numeric identity collision"):
             transactions.apply(self.vault, recover=True)
@@ -451,7 +452,7 @@ class Transactions(VaultTest):
         git(self.root, "commit", "-am", f"Divergent fixture\n\nHealdan-Package: {package['id']}")
         divergent = self.vault.head()
 
-        with self.assertRaisesRegex(Blocked, "Committed identities differ from the signed candidate"):
+        with self.assertRaisesRegex(Blocked, "destination ref differs"):
             transactions.apply(self.vault, recover=True)
         self.assertEqual(journal.read_bytes(), before)
         self.assertEqual(self.vault.head(), divergent)

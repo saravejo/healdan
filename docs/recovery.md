@@ -1,5 +1,29 @@
 # Recovery
 
+## Approved package integration
+
+Run `apply --recover` with the original vault worktree and external state.
+The journal identifies the original branch or the worktree's detached HEAD.
+If the published ref moves, restore the recorded commit explicitly before
+retrying. A file conflict reports the affected path. When the controller
+displaced a conflicting file, the journal's `reconciliation` entry identifies
+the retained copy under `healdan-integration/<operation>` in the worktree's Git
+directory. On separate volumes it uses `.healdan-integration/<operation>` in
+the worktree. Reconcile the affected file or index entry before retrying.
+
+For a pending integration from before transaction V3, retain the original
+journal and the contemporaneous observer's SSH envelope. Put the envelope in
+`integration-origins/<SHA-256 of the original journal bytes>.json` under the
+bound external state. The observer must be authorized by the allowed-signers
+policy. The envelope uses `healdan-integration-origin` as its SSH namespace.
+Its payload carries `format` (`healdan-integration-origin-v1`), `journal` (the
+original journal digest), `destination` (the observed binding, worktree, Git
+directory and HEAD identities), `package` (the package ID), `approval` (the
+approval envelope digest), `base` (the full parent OID) and `commit` (the
+observed published OID, or null if publication had not occurred). The original
+journal and signed observation are retained when recovery associates them
+with V3. A terminal legacy journal remains historical evidence.
+
 Keep the `.age` file and its `.manifest.json` sidecar together. The same pair
 can be moved to another location. Use an external SSH allowed-signers file for
 the backup signer, an external age identity for either recipient, and the

@@ -1,12 +1,15 @@
 """Validated candidate snapshots and recoverable human-approved integration."""
 import base64
 import copy
+import os
 from pathlib import Path
+from secrets import token_hex
 import tempfile
 
-from .core import REGISTRIES, TRANSACTION_V2, atomic, digest, extend_jsonl, git, git_bytes, read_json, require, safe_path, stamp, utc
-from . import admission, originals
-from .ids import aliases, committed_registries, identity, registry_records
+from .core import REQUIRED_REGISTRIES, REGISTRIES, atomic, decode, digest, extend_jsonl, git, parse_jsonl, read_json, require, safe_path, stamp, utc
+from . import admission, integration_git as git_tx, integration_journal as journal_store, originals
+from .ids import aliases, identity, registry_records
+from .integration_effects import WorktreeEffects, reconcile_index, secure_target, snapshot
 from .knowledge import Knowledge
 from .lineage import CLAIMS, PageHistory, page_revision
 from .pages import generated_pages, validate_pages
@@ -80,7 +83,7 @@ def preserve_contracts(vault, candidate):
                 require(f'id="{anchor}"' in after, "Migration removed an old explicit anchor")
 
 
-def validate_candidate(vault, candidate, cutoff):
+def validate_candidate(vault, candidate, cutoff, *, check_admission=True):
     reservations = read_json(vault.control / "reservations.json", {})
     reserved = {i for r in reservations.values() for i in r["ids"]}
     for registry in REGISTRIES:
@@ -93,7 +96,8 @@ def validate_candidate(vault, candidate, cutoff):
     aliases(candidate)
     changes = proposed_digests(vault, candidate)
     preserve_contracts(vault, candidate)
-    admission.plan(vault, candidate, admission.source_rows(vault), reviewed=True)
+    if check_admission:
+        admission.plan(vault, candidate, admission.source_rows(vault), reviewed=True)
     knowledge = Knowledge(candidate, proposed=changes.values())
     for key in changes:
         claim = knowledge.claims[key]
@@ -105,52 +109,6 @@ def validate_candidate(vault, candidate, cutoff):
                if c["id"] in changes and c["state"] == "accepted"]
     regression = require_suite(candidate, proposed=changes.values(), cutoff=cutoff, factual_ids=factual)
     return changes, regression
-
-
-def validate_recovery_identities(vault, signed_files, commit=None):
-    committed = dict(committed_registries(vault, commit)) if commit else {}
-    with Candidate(vault, signed_files) as candidate:
-        for registry in REGISTRIES:
-            expected = registry_records(registry, candidate.rows(registry))
-            if commit:
-                require(registry in committed, "Committed registry is missing: " + registry)
-                actual = registry_records(registry, committed[registry])
-                require(actual.keys() == expected.keys(), "Committed identities differ from the signed candidate: " + registry)
-
-
-def withdraw_publication(vault, journal_path, journal, failure):
-    restored = {}
-    for name, encoded in journal["files"].items():
-        target = safe_path(vault.root, name)
-        current = digest(target.read_bytes()) if target.exists() else None
-        before = journal["before"][name]
-        proposed = digest(base64.b64decode(encoded, validate=True))
-        require(current in {before, proposed}, "Concurrent edit prevents withdrawing integration: " + name, 5)
-        if current != before:
-            body = None
-            if before is not None:
-                frozen = journal.get("before_files", {}).get(name)
-                body = (base64.b64decode(frozen, validate=True) if frozen is not None else
-                        originals.git_blob(vault.root, journal["base"], name))
-                require(digest(body) == before, "Original bytes unavailable for withdrawal: " + name, 5)
-            restored[target] = body
-        stage = git(vault.root, "rev-parse", "--verify", f":{name}", check=False)
-        if stage:
-            staged = digest(originals.git_blob(vault.root, "", name))
-            original_stage = git(vault.root, "rev-parse", "--verify", f"{journal['base']}:{name}", check=False)
-            require(stage == original_stage or staged == proposed,
-                    "Concurrent staged edit prevents withdrawing integration: " + name, 5)
-    for target, body in restored.items():
-        if body is None:
-            target.unlink()
-        else:
-            atomic(target, body)
-    git(vault.root, "--literal-pathspecs", "reset", journal["base"], "--", *journal["files"])
-    at = journal.get("publication_at") or stamp()
-    admission.publication(vault, journal.get("admissions", []), "withdrawn", at=at)
-    journal.update(status="aborted", aborted_at=stamp(), reason=str(failure))
-    atomic(journal_path, journal)
-    vault.receipt("integration-withdrawn", {"package": journal["package_id"], "reason": str(failure)}, at=at)
 
 
 def package_path(vault, identifier):
@@ -293,126 +251,340 @@ def approve(vault, identifier):
         return record["approval"]
 
 
+def approved_package(vault, identifier, *, recover):
+    require(journal_store.sha(identifier), "Invalid package identifier")
+    record = read_json(package_path(vault, identifier))
+    require(record, "Unknown package", 4 if recover else 2)
+    require(isinstance(record, dict) and {"id", "payload", "csp", "approval"} <= record.keys() and
+            isinstance(record["payload"], dict) and valid_envelope(record["approval"]) and
+            record["id"] == identifier == digest(record["payload"]), "Frozen package content changed")
+    signed = verify(record.get("approval"), "package", trusted_signers(vault))
+    require(signed == approval_payload(record), "Package changed after approval")
+    require(git_tx.oid(signed.get("base")) and isinstance(signed.get("files"), dict) and signed["files"] and
+            isinstance(signed.get("input_hashes"), dict) and
+            all(journal_store.name_safe(name) and allowed(name) for name in signed["files"]),
+            "Invalid signed integration paths or base")
+    return record["approval"], signed
+
+
+def valid_envelope(value):
+    return (isinstance(value, dict) and value.keys() == {"namespace", "payload", "digest", "identity", "signature"} and
+            all(isinstance(value[key], str) and value[key].isascii() for key in ("signature", "digest")) and
+            isinstance(value["identity"], str) and isinstance(value["payload"], dict))
+
+
+def exact_files(vault, approval, signed):
+    bodies = {name: journal_store.decode_bytes(encoded) for name, encoded in signed["files"].items()}
+    modes = git_tx.overlay_modes(vault.root, signed["base"], [*bodies, LEDGER])
+    require(modes[LEDGER], "Required approval ledger is missing from the Git base")
+    ledger = git_tx.blob(vault.root, modes[LEDGER][1])
+    require(not any(row == approval or row.get("payload", {}).get("package_id") == signed["package_id"]
+                    for row in parse_jsonl(ledger, LEDGER)), "Package is already in the approval ledger", 5)
+    bodies[LEDGER] = extend_jsonl(ledger, [approval])
+    return bodies, modes
+
+
+def staged_before(modes):
+    return {name: [[*entry, 0, 0]] if entry is not None else [] for name, entry in modes.items()}
+
+
+def starting_journal(vault, signed, approval, bodies, modes):
+    binding = git_tx.destination(vault)
+    base = signed["base"]
+    require(git_tx.ref_value(vault, binding) == base, "Approval base differs from its destination", 5)
+    before, originals, worktree_modes = {}, {}, {}
+    for name in bodies:
+        path = secure_target(vault.root, name)
+        observed = snapshot(path)
+        expected = signed["input_hashes"].get(name)
+        require((observed[0] if observed else None) == expected,
+                "Integration pre-image changed: " + name, 5)
+        before[name] = expected
+        worktree_modes[name] = observed[1] if observed else None
+        if observed:
+            body = path.read_bytes()
+            require(digest(body) == expected, "Integration pre-image changed: " + name, 5)
+            originals[name] = journal_store.encode(body)
+    index_before = staged_before(modes)
+    require(git_tx.index_entries(vault.root, bodies) == index_before,
+            "An affected Git index entry differs from the base", 5)
+    return {"format": journal_store.FORMAT, "package_id": signed["package_id"], "base": base,
+            "destination": binding, "approval": digest(approval), "operation": token_hex(32),
+            "git_identity": git_tx.commit_identity(vault.root), "phase": "intent", "status": "writing",
+            "files": {name: journal_store.encode(body) for name, body in bodies.items()}, "before": before,
+            "before_files": originals, "worktree_modes": worktree_modes, "index_before": index_before,
+            "written": dict.fromkeys(bodies, "pending"), "reconciliation": {}}
+
+
+def validate_intent(vault, journal, signed, approval, bodies, modes):
+    git_tx.verify_destination(vault, journal["destination"])
+    require(journal["base"] == signed["base"] and journal["approval"] == digest(approval),
+            "Integration journal base or signed approval differs")
+    require(all(journal_store.decode_bytes(value) == bodies.get(name) for name, value in journal["files"].items()) and
+            bodies.keys() == journal["files"].keys(), "Integration journal blobs or derived ledger differ")
+    require(journal["before"] == {name: signed["input_hashes"].get(name) for name in bodies} and
+            journal["index_before"] == staged_before(modes), "Integration journal pre-images differ")
+    if "legacy" in journal:
+        value = journal["legacy"]
+        source = journal_store.decode_bytes(value["original"])
+        validate_legacy_origin(vault, source, value["proof"], signed, approval, expected=journal["destination"])
+
+
+def validate_legacy_origin(vault, source, proof, signed, approval, *, expected=None):
+    require(valid_envelope(proof),
+            "Legacy integration has no valid contemporaneous destination evidence", 5)
+    attestation = verify(proof, "integration-origin", trusted_signers(vault))
+    require(isinstance(attestation, dict) and attestation.keys() == {
+            "format", "journal", "destination", "package", "approval", "base", "commit"} and
+            attestation["format"] == "healdan-integration-origin-v1" and attestation["journal"] == digest(source) and
+            attestation["package"] == signed["package_id"] and attestation["approval"] == digest(approval) and
+            attestation["base"] == signed["base"] and journal_store.valid_destination(attestation["destination"]) and
+            (attestation["commit"] is None or git_tx.oid(attestation["commit"])),
+            "Legacy integration origin evidence differs", 5)
+    if expected is not None:
+        require(attestation["destination"] == expected, "Legacy integration destination proof changed", 5)
+    git_tx.verify_destination(vault, attestation["destination"])
+    return attestation
+
+
+def legacy_csp(commit, state, result):
+    return bool(commit) and state in (result, {key: value for key, value in result.items() if key != "rule"})
+
+
+def migrate_legacy(vault, path, old, signed, approval, bodies, modes, next_csp):
+    source = path.read_bytes()
+    require(decode(source) == old, "Legacy integration journal changed", 5)
+    proof = read_json(safe_path(vault.state, "integration-origins/" + digest(source) + ".json"))
+    attestation = validate_legacy_origin(vault, source, proof, signed, approval)
+    base, destination = signed["base"], attestation["destination"]
+    current = git_tx.ref_value(vault, destination)
+    require(current == (attestation["commit"] or base), "Legacy integration ref differs from origin evidence", 5)
+    before = {name: signed["input_hashes"].get(name) for name in bodies}
+    require(old["base"] == base and old["before"] == before and old["files"] ==
+            {name: journal_store.encode(body) for name, body in bodies.items()},
+            "Legacy integration files, pre-images or ledger differ")
+    originals, worktree_modes = {}, {}
+    for name, body_hash in before.items():
+        if body_hash is None:
+            worktree_modes[name] = None
+            continue
+        frozen = old.get("before_files", {}).get(name)
+        if frozen is None:
+            require(modes[name], "Legacy integration lacks pre-image proof: " + name, 5)
+            frozen = journal_store.encode(git_tx.blob(vault.root, modes[name][1]))
+        require(digest(journal_store.decode_bytes(frozen)) == body_hash,
+                "Legacy integration pre-image bytes differ: " + name)
+        originals[name] = frozen
+        worktree_modes[name] = 0o755 if os.name != "nt" and modes[name] and modes[name][0] == "100755" else 0o644
+    csp = read_csp_state(vault)
+    if not legacy_csp(attestation["commit"], csp, next_csp):
+        require_csp_state(signed["csp"], csp)
+    identity = git_tx.commit_identity(vault.root)
+    if old.get("publication_at"):
+        identity["at"] = stamp(old["publication_at"])
+    result = {"format": journal_store.FORMAT, "package_id": signed["package_id"], "base": base,
+              "destination": destination, "approval": digest(approval), "operation": token_hex(32),
+              "git_identity": identity, "phase": "intent", "status": "writing", "files": old["files"],
+              "before": before, "before_files": originals, "worktree_modes": worktree_modes,
+              "index_before": staged_before(modes), "written": dict.fromkeys(bodies, "pending"),
+              "reconciliation": {}, "legacy": {"original": journal_store.encode(source), "proof": proof}}
+    tree, overlay = git_tx.prepare_tree(vault, base, modes, bodies)
+    expected = attestation["commit"] or git_tx.make_commit(vault.root, base, tree, signed["package_id"], identity)
+    git_tx.verify_commit(vault.root, expected, base, tree, overlay, bodies)
+    admissions = isolated_validation(vault, result, tree, signed)
+    if old.get("admissions") is not None:
+        result.update(admissions=old["admissions"], phase="indexed" if attestation["commit"] else "prepared")
+        check_admission(vault, result, admissions)
+        admissions = old["admissions"]
+    result.update(phase="published" if attestation["commit"] else "prepared", tree=tree,
+                  expected_commit=expected, receipt=digest(integration_receipt(result, expected)), admissions=admissions)
+    WorktreeEffects(vault, path, result, bodies, overlay).verify()
+    journal_store.persist(path, result)
+    return result
+
+
+def isolated_validation(vault, journal, tree, signed):
+    base = journal["base"]
+    with tempfile.TemporaryDirectory(prefix="integration-validation-", dir=vault.state) as directory:
+        prior, result = copy.copy(vault), copy.copy(vault)
+        prior.root = Path(directory) / "base"
+        result.root = Path(directory) / "result"
+        prior.head = result.head = lambda: base
+        result.proposed_paths = signed["files"].keys()
+        git_tx.materialize_inputs(vault.root, base, prior.root)
+        git_tx.materialize_inputs(vault.root, tree, result.root)
+        prior.check_registries()
+        result.check_registries()
+        changes, _ = validate_candidate(prior, result, signed["cutoff"], check_admission=False)
+        require(changes == signed["claim_digests"], "Signed claim digests differ from the Git candidate")
+        validate_pages(result)
+        require_suite(result, cutoff=signed["cutoff"])
+        return admission.plan(vault, result, admission.source_rows(prior), reviewed=True)
+
+
+def integration_receipt(journal, commit):
+    return {"kind": "integration", "at": journal["git_identity"]["at"],
+            "payload": {"package": journal["package_id"], "commit": commit}}
+
+
+def record_receipt(vault, journal, commit):
+    receipt = integration_receipt(journal, commit)
+    identifier = journal["receipt"]
+    path = safe_path(vault.control, f"receipts/{identifier}.json")
+    previous = read_json(path)
+    require(previous in (None, receipt), "Integration receipt bytes differ")
+    if previous is None:
+        require(vault.receipt(receipt["kind"], receipt["payload"], at=receipt["at"]) == identifier,
+                "Integration receipt identity differs")
+    require(read_json(path) == receipt, "Integration receipt was not persisted", 5)
+
+
+def check_admission(vault, journal, current):
+    before = journal["admissions"]
+    if before == current:
+        return
+    # A retry may see the initial B03 decision written by this admission.
+    if journal["phase"] in ("indexed", "admitted", "csp", "receipt") and len(before) == len(current):
+        for recorded, observed in zip(before, current):
+            if recorded == observed:
+                continue
+            at = journal["git_identity"]["at"]
+            receipt = digest({"kind": "source-admission", "at": at, "payload": recorded})
+            item = read_json(vault.control / "inbox.json", {}).get(recorded["sha256"], {})
+            if (recorded["state"] != "initial" or dict(recorded, state="confirmed") != observed or
+                    item.get("decision_receipt") != receipt or
+                    admission.receipt(vault, receipt, "source-admission") != recorded):
+                break
+        else:
+            return
+    raise admission.AdmissionBlocked("Source admission changed during integration", 5)
+
+
 def apply(vault, identifier=None, *, recover=False):
     with vault.locked():
-        journal_path = vault.control / "transaction.json"
-        journal = read_json(journal_path)
+        path = safe_path(vault.control, journal_store.JOURNAL)
+        journal = None
         if recover:
-            require(journal and journal["status"] not in {"complete", "aborted"}, "No pending transaction", 2)
+            journal = journal_store.read(vault.control)
+            require(journal and journal["status"] not in ("complete", "aborted"), "No pending transaction", 2)
             identifier = journal["package_id"]
+            if journal.get("format") == journal_store.FORMAT:
+                git_tx.verify_destination(vault, journal["destination"])
         else:
-            vault.no_transaction()
-        record = read_json(package_path(vault, identifier))
-        require(record, "Unknown package", 2)
-        require(record["id"] == digest(record["payload"]), "Frozen package content changed")
-        signed = verify(record["approval"], "package", trusted_signers(vault))
-        require(signed == approval_payload(record), "Package changed after approval")
-        csp_state = read_csp_state(vault)
-        plan = signed["csp"]
-        status = csp_status(plan)
-        require(status["complete"] and not status["defect"], "CSP inspection incomplete or defective", 5)
-        next_csp_state = {"rule": plan["rule"], "streak": status["streak"], "package": identifier}
+            terminal = vault.no_transaction()
+        approval, signed = approved_package(vault, identifier, recover=recover)
         if not recover:
-            require_csp_state(plan, csp_state)
+            require(vault.head() == signed["base"], "Approval invalidated by changed Git base", 5)
+        elif journal.get("format") == journal_store.FORMAT:
+            require(journal["base"] == signed["base"] and journal["approval"] == digest(approval),
+                    "Integration journal base or signed approval differs")
+        bodies, modes = exact_files(vault, approval, signed)
+        plan = signed["csp"]
+        result = csp_status(plan)
+        require(result["complete"] and not result["defect"], "CSP inspection incomplete or defective", 5)
+        next_csp = {"rule": plan["rule"], "streak": result["streak"], "package": identifier}
+        if not recover:
+            require_csp_state(plan, read_csp_state(vault))
             require_active(get_task(vault, signed["task"]))
             require(vault.fingerprint() == signed["fingerprint"], "Approval invalidated by changed base/content", 5)
             require(not git(vault.root, "diff", "--cached", "--name-only"), "Index contains unrelated staged work", 5)
             with Candidate(vault, signed["files"]) as candidate:
                 validate_candidate(vault, candidate, signed["cutoff"])
-            files = dict(signed["files"])
-            ledger = safe_path(vault.root, LEDGER, exists=True).read_bytes()
-            files[LEDGER] = base64.b64encode(extend_jsonl(ledger, [record["approval"]])).decode("ascii")
-            before_files = {name: safe_path(vault.root, name).read_bytes() for name in files
-                            if safe_path(vault.root, name).exists()}
-            journal = {"format": TRANSACTION_V2, "package_id": identifier, "status": "writing", "base": vault.head(), "files": files,
-                       "before": {p: digest(before_files[p]) if p in before_files else None for p in files},
-                       "before_files": {p: base64.b64encode(body).decode("ascii") for p, body in before_files.items()},
-                       "publication_at": stamp(), "written": []}
-            atomic(journal_path, journal)
-        else:
-            require(journal["base"] == signed["base"], "Recovery journal base differs from the signed package")
-            require(LEDGER in journal["files"] and
-                    {name: data for name, data in journal["files"].items() if name != LEDGER} == signed["files"],
-                    "Recovery journal files differ from the signed package")
-            require(journal["before"] == {name: signed["input_hashes"].get(name) for name in journal["files"]},
-                    "Recovery journal originals differ from the signed base")
-        head = vault.head()
-        require(head == journal["base"] or
-                f"Healdan-Package: {identifier}" in git(vault.root, "log", "-1", "--format=%B"),
-                "Git changed during recovery", 5)
-        current_inputs = vault.inputs()
-        untouched = set(current_inputs) | set(signed["input_hashes"])
-        for name in untouched - set(journal["files"]):
-            require(current_inputs.get(name) == signed["input_hashes"].get(name),
-                    "An unsigned input changed during integration: " + name, 5)
-        if recover:
-            committed = head if head != journal["base"] else None
-            legacy_next_state = {"streak": status["streak"], "package": identifier}
-            if not committed or csp_state not in (next_csp_state, legacy_next_state):
-                require_csp_state(plan, csp_state)
-            validate_recovery_identities(vault, signed["files"], committed)
-        baseline = originals.committed_sources(vault.root, journal["base"])
-        at = journal.get("publication_at") or stamp()
-        try:
-            with Candidate(vault, signed["files"]) as candidate:
-                admissions = admission.plan(vault, candidate, baseline, reviewed=True,
-                                            check_storage=head == journal["base"])
-            recorded = journal.get("admissions")
-            if recorded is not None and recorded != admissions:
-                # Completing a publication may have recorded its first decision before the journal was finalized.
-                same_sources = len(recorded) == len(admissions) and all(
-                    dict(before, state=after["state"]) == after for before, after in zip(recorded, admissions))
-                if head == journal["base"] or not same_sources:
-                    raise admission.AdmissionBlocked("Source admission changed during integration", 5)
-                admissions = recorded
-        except admission.AdmissionBlocked as exc:
-            if recover and head == journal["base"]:
-                withdraw_publication(vault, journal_path, journal, exc)
-            elif recover and head != journal["base"]:
-                admission.publication(vault, journal.get("admissions", []), "committed", at=at)
-                atomic(vault.control / "csp.json", next_csp_state)
-                journal.update(status="complete", commit=head, completed_at=stamp(), admission_conflict=str(exc))
-                atomic(journal_path, journal)
-            raise
-        journal.update(admissions=admissions, publication_at=at)
-        atomic(journal_path, journal)
-        admission.publication(vault, admissions, "planned", at=at)
-        source_files = {name: base64.b64decode(encoded, validate=True)
-                        for name, encoded in signed["files"].items() if originals.source_path(name)}
-        for name, body in source_files.items():
-            if head == journal["base"]:
-                originals.verify_storage(vault.root, name, body)
-            else:
-                require(originals.git_blob(vault.root, head, name) == body,
-                        f"{name}: Git revision {head} differs from the approved original", 5)
-        for name, encoded in journal["files"].items():
-            path = safe_path(vault.root, name)
-            body = base64.b64decode(encoded, validate=True)
-            actual = digest(path.read_bytes()) if path.exists() else None
-            require(actual in {journal["before"][name], digest(body)}, "Concurrent edit during integration: " + name, 5)
-            if actual != digest(body):
-                atomic(path, body)
-            if name not in journal["written"]:
-                journal["written"].append(name)
-                atomic(journal_path, journal)
-        if vault.head() == journal["base"]:
-            # All accepted claims now have their authentic package receipt in the vault.
-            validate_pages(vault)
-            require_suite(vault, cutoff=signed["cutoff"])
-            git(vault.root, "--literal-pathspecs", "add", "--", *journal["files"])
-            staged = set(git_bytes(vault.root, "diff", "--cached", "--name-only", "-z").decode("utf-8").split("\0")) - {""}
-            require(staged <= set(journal["files"]), "Index contains unrelated staged work", 5)
-            for name, body in source_files.items():
-                require(originals.git_blob(vault.root, "", name) == body,
-                        name + ": Git index differs from the approved original", 5)
-            git(vault.root, "-c", "commit.gpgsign=false", "commit", "-m",
-                f"Apply approved knowledge package\n\nHealdan-Package: {identifier}")
-            for name, body in source_files.items():
-                require(originals.git_blob(vault.root, vault.head(), name) == body,
-                        name + ": Git commit differs from the approved original", 5)
-        admission.publication(vault, admissions, "present", at=at)
-        atomic(vault.control / "csp.json", next_csp_state)
-        journal.update(status="complete", commit=vault.head(), completed_at=stamp())
-        atomic(journal_path, journal)
-        vault.receipt("integration", {"package": identifier, "commit": vault.head()})
-        return {"package": identifier, "commit": vault.head(), "status": "complete"}
+            journal = starting_journal(vault, signed, approval, bodies, modes)
+            if terminal is not None:
+                journal_store.preserve_history(vault.control, path)
+            journal_store.persist(path, journal)
+        elif journal.get("format") != journal_store.FORMAT:
+            journal = migrate_legacy(vault, path, journal, signed, approval, bodies, modes, next_csp)
+        validate_intent(vault, journal, signed, approval, bodies, modes)
+        return continue_apply(vault, path, journal, signed, next_csp, bodies, modes)
+
+
+def continue_apply(vault, path, journal, signed, next_csp, bodies, modes):
+    binding, base = journal["destination"], journal["base"]
+    current = git_tx.ref_value(vault, binding)
+    phase = journal["phase"]
+    previous = journal.get("expected_commit")
+    eligible = {previous}
+    if phase in ("intent", "prepared"):
+        eligible.add(base)
+    require(current in eligible, "Integration destination ref differs from its recorded publication", 5)
+    for registry in REQUIRED_REGISTRIES:
+        if registry not in bodies:
+            rows = vault.rows(registry)
+            if registry in REGISTRIES:
+                registry_records(registry, rows)
+    csp = read_csp_state(vault)
+    legacy_commit = (journal.get("legacy") or {}).get("proof", {}).get("payload", {}).get("commit")
+    if phase in ("csp", "receipt"):
+        require(csp == next_csp, "Integration CSP result changed", 5)
+    elif not legacy_csp(legacy_commit, csp, next_csp) and (phase != "admitted" or csp != next_csp):
+        require_csp_state(signed["csp"], csp)
+    tree, overlay = git_tx.prepare_tree(vault, base, modes, bodies)
+    expected = legacy_commit or git_tx.make_commit(vault.root, base, tree, journal["package_id"], journal["git_identity"])
+    git_tx.verify_commit(vault.root, expected, base, tree, overlay, bodies)
+    admissions = isolated_validation(vault, journal, tree, signed)
+    receipt_id = digest(integration_receipt(journal, expected))
+    if phase == "intent":
+        journal.update(phase="prepared", tree=tree, expected_commit=expected,
+                       receipt=receipt_id, admissions=admissions)
+        journal_store.persist(path, journal)
+    else:
+        require(journal["tree"] == tree and previous == expected and journal["receipt"] == receipt_id,
+                "Integration journal prepared objects or receipt differ")
+        check_admission(vault, journal, admissions)
+    effects = WorktreeEffects(vault, path, journal, bodies, overlay)
+    effects.verify()
+    if current == base:
+        require(not git_tx.was_published(vault.root, binding["ref"], journal["operation"], expected),
+                "Integration ref returned to the base after publication", 5)
+        require_csp_state(signed["csp"], read_csp_state(vault))
+        git_tx.publish(vault, binding, base, expected, journal["operation"])
+    def verify_ref():
+        require(git_tx.ref_value(vault, binding) == expected, "Integration published ref changed", 5)
+
+    verify_ref()
+    if journal["phase"] == "prepared":
+        journal["phase"] = "published"
+        journal_store.persist(path, journal)
+    for name in bodies:
+        verify_ref()
+        effects.reconcile(name)
+    if journal["phase"] == "published":
+        journal["phase"] = "indexing"
+        journal_store.persist(path, journal)
+    reconcile_index(vault, effects.index_directory, journal["index_before"], overlay, verify_ref=verify_ref,
+                    completed=journal["phase"] != "indexing")
+    if journal["phase"] == "indexing":
+        journal["phase"] = "indexed"
+        journal_store.persist(path, journal)
+    effects.verify()
+    verify_ref()
+    git_tx.verify_commit(vault.root, expected, base, tree, overlay, bodies)
+    if journal["phase"] == "indexed":
+        check_admission(vault, journal, isolated_validation(vault, journal, tree, signed))
+        admission.publication(vault, journal["admissions"], "present", at=journal["git_identity"]["at"],
+                              exact_location=True)
+        journal["phase"] = "admitted"
+        journal_store.persist(path, journal)
+    admission.verify_integration_publication(vault, journal["admissions"], journal["git_identity"]["at"])
+    if journal["phase"] == "admitted":
+        verify_ref()
+        current_csp = read_csp_state(vault)
+        if current_csp != next_csp:
+            if not legacy_csp(legacy_commit, current_csp, next_csp):
+                require_csp_state(signed["csp"], current_csp)
+            atomic(vault.control / "csp.json", next_csp)
+        journal["phase"] = "csp"
+        journal_store.persist(path, journal)
+    require(read_csp_state(vault) == next_csp, "Integration CSP result changed", 5)
+    verify_ref()
+    record_receipt(vault, journal, expected)
+    if journal["phase"] != "receipt":
+        journal["phase"] = "receipt"
+        journal_store.persist(path, journal)
+    verify_ref()
+    effects.verify()
+    journal.update(status="complete", commit=expected, completed_at=stamp())
+    journal_store.persist(path, journal)
+    return {"package": journal["package_id"], "commit": expected, "status": "complete"}

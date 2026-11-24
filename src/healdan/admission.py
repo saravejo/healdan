@@ -27,7 +27,19 @@ def source_rows(vault):
 
 
 def published_rows(vault):
-    transaction = read_json(vault.control / "transaction.json", {})
+    from .integration_git import destination, ref_value
+    from .integration_journal import FORMAT, read
+    transaction = read(vault.control) or {}
+    if transaction.get("format") == FORMAT and transaction["status"] == "writing":
+        bound = transaction["destination"]
+        if vault.root == vault.relocated_path(bound["worktree"]):
+            head = ref_value(vault, bound)
+            expected = transaction.get("expected_commit")
+            require(head == expected or transaction["phase"] in {"intent", "prepared"} and head == transaction["base"],
+                    "Integration destination ref differs from its recorded publication", 5)
+            return committed_sources(vault.root, head)
+        current = destination(vault)
+        return committed_sources(vault.root, ref_value(vault, current))
     if transaction.get("status") == "writing" and vault.head() == transaction["base"]:
         return committed_sources(vault.root, transaction["base"])
     rows = source_rows(vault)
@@ -374,7 +386,7 @@ def reconcile_sources(vault):
                 "sources": entries}
 
 
-def publication(vault, admissions, status, *, at):
+def publication(vault, admissions, status, *, at, exact_location=False):
     if not admissions:
         return
     records = materials(vault)
@@ -389,7 +401,9 @@ def publication(vault, admissions, status, *, at):
         if identifier:
             record = records[identifier]
             existing = next((c for c in record["copies"] if c.get("source") == source and
-                             c["sha256"] == sha and c["status"] != "deleted"), None)
+                             c["sha256"] == sha and c["status"] != "deleted" and
+                             (not exact_location or c["path"] == entry["path"] and
+                              vault.relocated_path(c["root"]) == vault.root)), None)
             if existing is None and status != "withdrawn":
                 existing = {"root": str(vault.root), "path": entry["path"], "sha256": entry["sha256"],
                             "source": source, "kind": "source", "status": "planned"}
@@ -407,7 +421,13 @@ def publication(vault, admissions, status, *, at):
                     existing.pop("disposition", None)
                     changed = True
         if status == "present":
-            receipt_id = vault.receipt("source-admission", entry, at=at)
+            receipt_value = {"kind": "source-admission", "at": at, "payload": entry}
+            receipt_id = digest(receipt_value)
+            existing_receipt = (read_json(safe_path(vault.control, f"receipts/{receipt_id}.json"))
+                                if exact_location else None)
+            require(existing_receipt in (None, receipt_value), "Source admission receipt differs: " + entry["path"], 5)
+            if existing_receipt is None:
+                receipt_id = vault.receipt("source-admission", entry, at=at)
             item = inbox.get(sha)
             if item is None:
                 item = {"sha256": sha, "size": entry["size"], "paths": [], "versions_of": [],
@@ -443,6 +463,25 @@ def publication(vault, admissions, status, *, at):
         atomic(vault.control / "materials.json", records)
     if inbox_changed:
         atomic(inbox_path, inbox)
+
+
+def verify_integration_publication(vault, admissions, at):
+    if not admissions:
+        return
+    inbox = read_json(safe_path(vault.control, "inbox.json"), {})
+    records = materials(vault)
+    for entry in admissions:
+        receipt_id = digest({"kind": "source-admission", "at": at, "payload": entry})
+        item = inbox.get(entry["sha256"], {})
+        require(receipt_id in item.get("receipts", []) and
+                receipt(vault, receipt_id, "source-admission") == entry,
+                "Source admission receipt changed: " + entry["path"], 5)
+        if entry["material"]:
+            copies = records.get(entry["material"], {}).get("copies", [])
+            require(any(c.get("source") == entry["source"] and c["path"] == entry["path"] and
+                        c["sha256"] == entry["sha256"] and c["status"] == "present" and
+                        vault.relocated_path(c["root"]) == vault.root for c in copies),
+                    "Source admission custody changed: " + entry["path"], 5)
 
 
 def ingest_plan(vault, row, data, before):

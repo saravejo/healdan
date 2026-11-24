@@ -30,12 +30,12 @@ STATE_FILES = {"csp.json", "followups.json", "inbox.json", "lint-state.json", "m
                "reservations.json", "restored-from.json", "source-classification.json", "source-ingest.json", "storage-policy.json",
                "transaction.json", "zero-byte-archive.json"}
 STATE_FOLDERS = {"backup-preservation", "deletions", "lint", "packages", "receipts", "restorations",
-                 "reviews", "sessions", "tasks"}
+                 "reviews", "sessions", "tasks", "integration-history"}
 HISTORICAL_STATE = {"transaction.json", "source-ingest.json", "zero-byte-archive.json", "restored-from.json"}
-HISTORICAL_FOLDERS = {"restorations", "sessions", "tasks"}
+HISTORICAL_FOLDERS = {"restorations", "sessions", "tasks", "integration-history"}
 RESTORE_JOURNAL = "healdan-backup-restore-v1"
 SIGNATURE_FIELDS = {"payload", "digest", "namespace", "identity", "signature"}
-HUMAN_DOMAINS = {"package", "case", "alias", "trial", "decision", "recovery"}
+HUMAN_DOMAINS = {"package", "case", "alias", "trial", "decision", "recovery", "integration-origin"}
 FORBIDDEN_NAMES = re.compile(
     r"(^|/)(?:wiki-1\.4\.md|transcripts|authentication|recovery-profiles|\.ssh|\.env(?:\.[^/]*)?|"
     r"\.credentials\.json|S-[0-9]+\.jsonl)(/|$)|\.(?:age|agekey|key|pem|p12|pfx)$"
@@ -552,7 +552,7 @@ def check_recovery_history(archive, contents, records, backup_signers):
 
 
 def check_historical_journal(name, value, source_vault):
-    if name == "transaction.json" and value:
+    if name == "transaction.json" or name.startswith("integration-history/"):
         from .compatibility import _journal_format
 
         _journal_format(value)
@@ -568,6 +568,9 @@ def check_historical_journal(name, value, source_vault):
                 except (ValueError, TypeError) as exc:
                     raise Blocked("Invalid historical integration entry: " + path, 5) from exc
                 guard_content(path, data)
+        for path, evidence in value.get("reconciliation", {}).items():
+            if "body" in evidence:
+                guard_content(path, base64.b64decode(evidence["body"], validate=True))
     elif name == "source-ingest.json" and value:
         require(value.get("status") in {"complete", "aborted"} and isinstance(value.get("record"), dict) and
                 originals.source_path(value["record"].get("path")) and identifier(value.get("operation")),
@@ -641,8 +644,11 @@ def check_records(archive, contents, signers, backup_signers):
             trial_mirrors[name] = value.get("payload")
         else:
             check_signatures(value, signers, backup_signers, proven)
-        if history:
+        if history or logical_name == "transaction.json" or parent == "integration-history":
             check_historical_journal(logical_name, value, archive["source_vault"])
+        if parent == "integration-history":
+            require(digest(data) == stem and value.get("status") in {"complete", "aborted"},
+                    "Invalid integration history record: " + name, 5)
         if logical_name == "materials.json":
             check_materials(value)
         if parent == "receipts":
