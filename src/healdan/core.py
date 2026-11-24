@@ -182,14 +182,15 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
     return result
 
 
-def git_bytes(root, *args, check=True):
+def git_bytes(root, *args, check=True, data=None):
     # The explicit vault path selects the real worktree, refs, objects and index.
     overrides = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_GRAFT_FILE",
                  "GIT_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
                  "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
     env = {key: value for key, value in os.environ.items() if key.upper() not in overrides}
-    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], env=env, check=check).stdout
+    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args],
+               env=env, check=check, data=data).stdout
 
 
 def git(root, *args, check=True):
@@ -356,8 +357,8 @@ class Vault:
         return digest({"head": self.head(), "files": self.inputs(), "policy": self.policy,
                        "config": self.config, "policy_files": policy_files, "controller": controller})
 
-    def receipt(self, kind, payload):
-        value = {"kind": kind, "at": stamp(), "payload": payload}
+    def receipt(self, kind, payload, *, at=None):
+        value = {"kind": kind, "at": stamp(at), "payload": payload}
         identifier = digest(value)
         with self.locked():
             atomic(self.control / "receipts" / (identifier + ".json"), value)

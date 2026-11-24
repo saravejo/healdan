@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .core import Blocked, digest, require, safe_path, stamp, utc
 from .ids import identity, registry_records
+from . import originals
 from .signing import trusted_signers, verify
 
 LIVE = {"accepted", "hypothesis", "disputed"}
@@ -36,7 +37,9 @@ class Knowledge:
         self.claims = registry_records(claims, vault.rows(claims))
         self.by_identity = {identity(k): k for k in self.claims}
         self.sources = {}
-        sources = "resources/sources/index.jsonl"
+        sources = originals.REGISTRY
+        root, revision = vault.repository.root, vault.head()
+        originals.verify_committed(root, revision, originals.committed_sources(root, revision).values())
         for row in registry_records(sources, vault.rows(sources)).values():
             require(row.get("provenance") and row.get("classification"), "Missing source provenance/class")
             require(row["classification"] != "secret", "Secrets cannot be promoted as canonical sources")
@@ -50,9 +53,9 @@ class Knowledge:
                 utc(captured_at)
             except (Blocked, OverflowError, ValueError) as exc:
                 raise Blocked(message) from exc
-            require(row["path"].startswith("resources/sources/"), "Source path outside source tree")
+            require(originals.source_path(row["path"]), "Source path outside source tree")
             body = safe_path(vault.root, row["path"], exists=True).read_bytes()
-            require(len(body) == row["size"] and digest(body) == row["sha256"], "Source hash/size mismatch")
+            originals.verify_body(row, body)
             self.sources[row["id"]] = (row, body)
         self.membership = {}
         for row in vault.rows("wiki/control/topic-map.jsonl"):

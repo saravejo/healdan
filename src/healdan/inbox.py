@@ -1,9 +1,9 @@
 """Content-addressed triage with preserved capture provenance and versions."""
 from datetime import timedelta
+import os
 from pathlib import Path
-from uuid import uuid4
 
-from .core import atomic, digest, read_json, require, safe_path, stamp, utc
+from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, utc
 
 EXCLUDED = {"inbox/agent-activities-today.md", "inbox/manual-activities-today.md", "inbox/agent-dashboard.html"}
 
@@ -106,19 +106,65 @@ def archive_empty(vault, sha256):
     with vault.locked():
         path = vault.control / "inbox.json"
         items = read_json(path, {})
+        require(sha256 in items, "Inventory the Inbox item first", 2)
         item = items[sha256]
-        require(item["size"] == 0 and item["classification"] == "common", "Only zero-byte ordinary material may auto-archive", 5)
+        require(sha256 == digest(b"") and item["size"] == 0 and item["classification"] == "common",
+                "Only zero-byte ordinary material may auto-archive", 5)
+        journal_path = vault.control / "zero-byte-archive.json"
+        pending = read_json(journal_path, {})
+        moves = []
         for relative in item["paths"]:
+            require(ordinary(relative), "Only ordinary Inbox material may auto-archive", 5)
             source = safe_path(vault.root, relative)
-            if not source.exists():
+            if not source.exists() and relative not in pending:
                 continue
-            require(source.stat().st_size == 0 and digest(source.read_bytes()) == sha256, "Inbox item changed")
-            target = safe_path(vault.root, "archive/" + sha256 + "/" + Path(relative).name)
-            atomic(target, b"")
-            receipt = vault.receipt("zero-byte-archive", {"source": relative, "destination": str(target.relative_to(vault.root)),
-                                                       "sha256": sha256, "size": 0})
-            source.unlink()
-            item["receipts"].append(receipt)
-        item.update(decision="archive", decided_at=stamp())
-        atomic(path, items)
+            target_name = f"archive/{sha256}/{Path(relative).name}"
+            target = empty_archive_target(vault, relative, target_name)
+            if source.exists():
+                require(source.is_file() and source.read_bytes() == b"", "Inbox item changed: " + relative, 5)
+            else:
+                require(target.is_file(), f"Incomplete archive lost both {relative} and {target_name}", 5)
+            moves.append((relative, source, target_name))
+        for relative, source, target_name in moves:
+            payload = {"source": relative, "destination": target_name, "sha256": sha256, "size": 0}
+            move = pending.get(relative)
+            if move is None:
+                move = {"at": stamp(), "payload": payload}
+                pending[relative] = move
+                atomic(journal_path, pending)
+            require(move["payload"] == payload, "Archive journal differs from the requested move", 5)
+            receipt_id = digest({"kind": "zero-byte-archive", **move})
+            if receipt_id not in item["receipts"]:
+                # An existing destination may have appeared after the preflight.
+                create_empty_archive(vault, relative, target_name)
+                if source.exists():
+                    require(safe_path(vault.root, relative, exists=True).read_bytes() == b"",
+                            "Inbox item changed: " + relative, 5)
+                    source.unlink()
+                receipt = vault.receipt("zero-byte-archive", payload, at=move["at"])
+                item["receipts"].append(receipt)
+                item.update(decision="archive", decided_at=move["at"])
+                atomic(path, items)
+            del pending[relative]
+            atomic(journal_path, pending)
         return item
+
+
+def empty_archive_target(vault, source, destination):
+    message = f"Archive destination conflicts with {source}: {destination}"
+    try:
+        target = safe_path(vault.root, destination)
+        require(not target.exists() or (target.is_file() and target.read_bytes() == b""), message, 5)
+        return target
+    except (Blocked, OSError) as exc:
+        raise Blocked(message, 5) from exc
+
+
+def create_empty_archive(vault, source, destination):
+    target = empty_archive_target(vault, source, destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("xb") as stream:
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        empty_archive_target(vault, source, destination)

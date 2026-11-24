@@ -59,6 +59,9 @@ def parser():
     source.add_argument("--captured-at", required=True)
     source.add_argument("--classification", required=True, choices=["common", "personal", "sensitive"])
     source.add_argument("--purpose", type=Path)
+    reconcile_original = inbox.add_parser("reconcile-original")
+    reconcile_original.add_argument("id")
+    reconcile_original.add_argument("raw", type=Path)
     quarantine = inbox.add_parser("quarantine")
     quarantine.add_argument("path")
     quarantine.add_argument("--owner", required=True)
@@ -181,7 +184,7 @@ def parser():
 
 def dispatch(args):
     from . import backups, binding, build, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
-    from . import pages, regression, review, setup, tasks, transactions
+    from . import originals, pages, regression, review, setup, tasks, transactions
     from .knowledge import query
     from .signing import human_sign
     if args.command == "setup":
@@ -242,19 +245,22 @@ def dispatch(args):
                 ("owner", "classification", "entered_at", "entry_origin", "defer_until", "destination")})
         if args.action == "archive-empty":
             return inbox.archive_empty(vault, args.sha256)
+        if args.action == "reconcile-original":
+            return originals.reconcile(vault, args.id, args.raw)
         if args.action == "quarantine":
             return incidents.quarantine(vault, args.path, args.owner)
         if args.action == "ingest":
-            require(args.path.startswith("inbox/"), "Ingest expects an Inbox path", 2)
+            require(inbox.ordinary(args.path), "Ingest expects an ordinary Inbox path", 2)
             require(args.classification == "common", "Personal/sensitive originals require a reviewed minimal-source proposal and retention linkage", 5)
-            data = safe_path(vault.root, args.path, exists=True).read_bytes()
             with vault.locked():
                 vault.no_transaction()
+                data = safe_path(vault.root, args.path, exists=True).read_bytes()
                 identifier = ids.reserve(vault, "F", 1, str(uuid4()), locked=True)[0]
                 target = "resources/sources/" + identifier + "/original" + Path(args.path).suffix
                 record = {"id": identifier, "path": target, "sha256": digest(data), "size": len(data),
                           "captured_at": stamp(args.captured_at), "provenance": args.provenance,
                           "classification": args.classification}
+                originals.verify_storage(vault.root, target, data)
                 atomic(safe_path(vault.root, target), data)
                 registry = vault.rows("resources/sources/index.jsonl") + [record]
                 atomic(vault.root / "resources/sources/index.jsonl", jsonl(registry))

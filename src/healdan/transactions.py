@@ -4,7 +4,8 @@ import copy
 from pathlib import Path
 import tempfile
 
-from .core import REGISTRIES, atomic, digest, git, jsonl, read_json, require, safe_path, stamp
+from .core import REGISTRIES, atomic, digest, git, git_bytes, jsonl, read_json, require, safe_path, stamp
+from . import originals
 from .ids import aliases, committed_registries, identity, registry_records
 from .knowledge import Knowledge
 from .pages import generated_pages, validate_pages
@@ -21,8 +22,8 @@ LEDGER = "control/approvals/packages.jsonl"
 
 
 def allowed(path):
-    return path in EXACT or (path.startswith("wiki/topics/") and path.endswith(".md")) or (
-        path.startswith("resources/sources/") and path != "resources/sources/.gitkeep")
+    return (path in EXACT or (path.startswith("wiki/topics/") and path.endswith(".md")) or
+            (originals.source_path(path) and ".gitattributes" not in Path(path).parts))
 
 
 class Candidate:
@@ -91,6 +92,10 @@ def validate_candidate(vault, candidate, cutoff):
     aliases(candidate)
     changes = proposed_digests(vault, candidate)
     preserve_contracts(vault, candidate)
+    files = {name: data for name, data in vault.input_files() if originals.source_path(name)}
+    for name, body in candidate.input_files():
+        if originals.source_path(name) and name not in files:
+            originals.verify_storage(vault.root, name, body)
     Knowledge(candidate, proposed=changes.values())
     validate_pages(candidate, proposed=changes.values())
     factual = [c["id"] for c in candidate.rows("wiki/claims.jsonl")
@@ -283,6 +288,14 @@ def apply(vault, identifier=None, *, recover=False):
             if not committed or csp_state not in (next_csp_state, legacy_next_state):
                 require_csp_state(plan, csp_state)
             validate_recovery_identities(vault, signed["files"], committed)
+        source_files = {name: base64.b64decode(encoded, validate=True)
+                        for name, encoded in signed["files"].items() if originals.source_path(name)}
+        for name, body in source_files.items():
+            if head == journal["base"]:
+                originals.verify_storage(vault.root, name, body)
+            else:
+                require(originals.git_blob(vault.root, head, name) == body,
+                        f"{name}: Git revision {head} differs from the approved original", 5)
         for name, encoded in journal["files"].items():
             path = safe_path(vault.root, name)
             body = base64.b64decode(encoded, validate=True)
@@ -298,8 +311,16 @@ def apply(vault, identifier=None, *, recover=False):
             validate_pages(vault)
             require_suite(vault, cutoff=signed["cutoff"])
             git(vault.root, "add", "--", *journal["files"])
+            staged = set(git_bytes(vault.root, "diff", "--cached", "--name-only", "-z").decode("utf-8").split("\0")) - {""}
+            require(staged <= set(journal["files"]), "Index contains unrelated staged work", 5)
+            for name, body in source_files.items():
+                require(originals.git_blob(vault.root, "", name) == body,
+                        name + ": Git index differs from the approved original", 5)
             git(vault.root, "-c", "commit.gpgsign=false", "commit", "-m",
-                f"Apply approved knowledge package\n\nHealdan-Package: {identifier}", "--", *journal["files"])
+                f"Apply approved knowledge package\n\nHealdan-Package: {identifier}")
+            for name, body in source_files.items():
+                require(originals.git_blob(vault.root, vault.head(), name) == body,
+                        name + ": Git commit differs from the approved original", 5)
         atomic(vault.control / "csp.json", next_csp_state)
         journal.update(status="complete", commit=vault.head(), completed_at=stamp())
         atomic(journal_path, journal)
