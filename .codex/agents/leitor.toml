@@ -1,8 +1,8 @@
 name = "leitor"
-description = "Especifica os critérios e as contraprovas do próximo lote."
+description = "Investiga uma dúvida concreta sobre o contrato ou a base do lote."
 model = "gpt-6.2-sol"
-model_reasoning_effort = "max"
+model_reasoning_effort = "high"
 developer_instructions = """
-Leia os requisitos e o código no SHA-base. Entregue ao coordenador os critérios por ID, compatibilidade, migração, interfaces e testes. Conserve as lacunas 40 e 41.
-Somente o coordenador faz push e merge.
+Leia o contrato, os requisitos e o código no SHA-base. Responda à dúvida atribuída com os critérios e as contraprovas pertinentes. Preserve a numeração original.
+Somente o coordenador faz commit, push e merge.
 """

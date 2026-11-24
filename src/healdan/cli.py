@@ -11,11 +11,27 @@ from .core import Blocked, Vault, atomic, canonical, digest, jsonl, read_json, r
 def parser():
     result = argparse.ArgumentParser(prog="healdan", description="Local evidence-based wiki controller")
     result.add_argument("--version", action="version", version=__version__)
-    result.add_argument("--vault", default=".")
+    result.add_argument("--vault")
     result.add_argument("--state", help="External controller state directory")
+    result.add_argument("--vault-id", help="Require the selected vault identity")
     commands = result.add_subparsers(dest="command", required=True)
     setup = commands.add_parser("setup")
     setup.add_argument("--interactive", action="store_true")
+    state = commands.add_parser("state", help="Inspect and confirm changes to the vault binding")
+    state_actions = state.add_subparsers(dest="action", required=True)
+    for name, description in (("adopt", "Adopt proven legacy or restored state"),
+                              ("rebind", "Check the vault and state at their new locations")):
+        operation = state_actions.add_parser(name, help=description)
+        operation.add_argument("--confirm", help="Confirmation digest from the preview")
+    build = commands.add_parser("build", help="Prepare, identify, or select the vault's controller")
+    build_actions = build.add_subparsers(dest="action", required=True)
+    build_actions.add_parser("identity")
+    prepare = build_actions.add_parser("prepare")
+    prepare.add_argument("wheel", type=Path)
+    prepare.add_argument("--store", type=Path)
+    activate = build_actions.add_parser("activate")
+    activate.add_argument("sha256")
+    activate.add_argument("--store", type=Path)
     commands.add_parser("doctor")
     commands.add_parser("status")
     query = commands.add_parser("query")
@@ -118,9 +134,18 @@ def parser():
     execute.add_argument("plan")
     schedule = maintenance.add_parser("schedule")
     schedule.add_argument("--activate", action="store_true")
+    schedule.add_argument("--trial", action="store_true", help="Use a disposable launchd trial vault")
+    trial = maintenance.add_parser("prepare-launchd-trial", help="Create a disposable launchd trial vault")
+    trial.add_argument("directory", type=Path)
+    scheduled = maintenance.add_parser("run-scheduled", help=argparse.SUPPRESS)
+    scheduled.add_argument("job", choices=("lint", "daily"))
+    scheduled.add_argument("--trial", action="store_true")
     attest = maintenance.add_parser("attest")
     attest.add_argument("trial")
     attest.add_argument("evidence", type=Path)
+    environment = maintenance.add_parser("trial-environment", help="Measure the installed native trial environment")
+    environment.add_argument("trial")
+    environment.add_argument("--profile", type=Path)
     hold = maintenance.add_parser("hold")
     hold.add_argument("material")
     hold.add_argument("--owner", required=True)
@@ -155,36 +180,56 @@ def parser():
 
 
 def dispatch(args):
-    from . import backups, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
+    from . import backups, binding, build, custody, ids, inbox, incidents, launcher, linting, maintenance, migration
     from . import pages, regression, review, setup, tasks, transactions
     from .knowledge import query
     from .signing import human_sign
     if args.command == "setup":
         return setup.initialize(args.vault, args.state, interactive=args.interactive)
+    if args.command == "state":
+        change = binding.adopt if args.action == "adopt" else binding.rebind
+        return change(args.vault, args.state, args.confirm)
+    if args.command == "build" and args.action == "prepare":
+        from .installation import prepare
+        if (Path(args.vault).resolve() / ".git").exists() or args.state is not None:
+            build.validate_store(args.store if args.store is not None else build.store_path(), args.vault, args.state)
+        prepared = prepare(args.wheel, args.store)
+        return {"build": prepared.identity, "controller": str(prepared.entry_point)}
     external_recovery = (args.command, getattr(args, "action", None)) in {
         ("restore", None), ("backup", "verify"), ("session", "restore"), ("session", "approve-recovery")
     }
-    vault = Vault(args.vault, args.state, operational=not external_recovery)
+    vault = Vault(args.vault, args.state, operational=not external_recovery,
+                  expected_binding=getattr(args, "vault_binding", None))
+    if hasattr(args, "controller_selection"):
+        vault.controller_selection = args.controller_selection
+    if args.command == "build":
+        if args.action == "activate":
+            return build.activate(vault, args.sha256, args.store)
+        return {"build": build.require_active(vault).identity, "vault_id": vault.identity}
     if args.command == "doctor":
-        result = setup.doctor(vault)
+        with vault.reading():
+            result = setup.doctor(vault)
         return result, 0 if result["ready"] else 5
     if args.command == "status":
-        state = read_json(vault.control / "lint-state.json", {})
-        return {"commit": vault.head(), "state": str(vault.state),
-                "lint_overdue": linting.stale(state.get("last_complete_lint_at")),
-                "last_complete_lint_at": state.get("last_complete_lint_at"),
-                "tasks": [{"id": t["id"], "state": t["state"], "worktree_age": tasks.age_status(t),
-                           "capacity_held": t["capacity_held"], "reminders": t.get("reminders", []),
-                           "waiting_since": t.get("presented_at"), "closure_pending": t.get("closure_pending", False)}
-                          for t in tasks.all_tasks(vault)],
-                "transaction": read_json(vault.control / "transaction.json", {}).get("status"),
-                "native_trials": maintenance.trial_status(vault)}
+        with vault.reading():
+            state = read_json(vault.control / "lint-state.json", {})
+            return {"commit": vault.head(), "vault_id": vault.identity, "state": str(vault.state),
+                    "lint_overdue": linting.stale(state.get("last_complete_lint_at")),
+                    "last_complete_lint_at": state.get("last_complete_lint_at"),
+                    "tasks": [{"id": t["id"], "state": t["state"], "worktree_age": tasks.age_status(t),
+                               "capacity_held": t["capacity_held"], "reminders": t.get("reminders", []),
+                               "waiting_since": t.get("presented_at"), "closure_pending": t.get("closure_pending", False)}
+                              for t in tasks.all_tasks(vault)],
+                    "transaction": read_json(vault.control / "transaction.json", {}).get("status"),
+                    "native_trials": maintenance.trial_status(vault)}
     if args.command == "query":
         filters = {k: getattr(args, k) for k in ("entity", "property", "environment", "modality", "topic", "term") if getattr(args, k)}
-        result = query(vault, filters, args.cutoff, max_records=args.max_records)
+        with vault.reading(stable_integration=True):
+            result = query(vault, filters, args.cutoff, max_records=args.max_records)
         return result, result["code"]
     if args.command == "preview":
-        return pages.preview(vault, args.cutoff)
+        with vault.reading(stable_integration=True):
+            return pages.preview(vault, args.cutoff)
     if args.command == "lint":
         result = linting.lint(vault)
         return result, 5 if result["status"] != "complete" or result["findings"] else 0
@@ -265,9 +310,10 @@ def dispatch(args):
         if args.action == "inspect":
             return transactions.inspect_package(vault, args.package, read_json(args.results))
         if args.action == "sign-case":
-            signed = regression.sign_case(vault, read_json(args.input))
-            atomic(args.output, signed)
-            return {"output": str(args.output), "digest": signed["approval"]["digest"]}
+            with vault.locked():
+                signed = regression.sign_case(vault, read_json(args.input))
+                atomic(args.output, signed)
+                return {"output": str(args.output), "digest": signed["approval"]["digest"]}
         if args.action == "regression":
             result = regression.suite(vault)
             return result, 5 if result["failed"] or result["pending"] else 0
@@ -276,6 +322,9 @@ def dispatch(args):
     if args.command == "apply":
         return transactions.apply(vault, args.package, recover=args.recover)
     if args.command == "maintenance":
+        if args.action == "run-scheduled":
+            result = maintenance.run_scheduled(vault, args.job, args.vault_id, trial=args.trial)
+            return result, 5 if args.job == "lint" and (result["status"] != "complete" or result["findings"]) else 0
         if args.action == "daily":
             return maintenance.daily(vault)
         if args.action == "plan":
@@ -286,9 +335,15 @@ def dispatch(args):
             from .retention import execute
             return execute(vault, args.plan)
         if args.action == "schedule":
-            return maintenance.schedule(vault, activate=args.activate)
+            return maintenance.schedule(vault, activate=args.activate, trial=args.trial)
+        if args.action == "prepare-launchd-trial":
+            return maintenance.prepare_launchd_trial(vault, args.directory)
         if args.action == "attest":
             return maintenance.attest(vault, args.trial, read_json(args.evidence))
+        if args.action == "trial-environment":
+            from .trials import environment
+            with vault.reading():
+                return environment(vault, args.trial, args.profile)
         if args.action == "hold":
             with vault.locked():
                 return custody.hold(vault, args.material, args.reason, args.owner, review_at=args.review_at)
@@ -314,18 +369,51 @@ def dispatch(args):
             result = migration.purge_check(vault)
             return result, 0 if result["eligible_for_review"] else 5
         if args.action == "sign-alias":
-            value = read_json(args.input)
-            require(ids.identity(value["alias"]) == ids.identity(value["target"]), "Alias changes identity")
-            require(value.get("reason") and value.get("decided_at"), "Alias needs a human decision", 2)
-            value["approval"] = human_sign(vault, value.copy(), "alias")
-            atomic(args.output, value)
-            return {"output": str(args.output)}
+            with vault.locked():
+                value = read_json(args.input)
+                require(ids.identity(value["alias"]) == ids.identity(value["target"]), "Alias changes identity")
+                require(value.get("reason") and value.get("decided_at"), "Alias needs a human decision", 2)
+                value["approval"] = human_sign(vault, value.copy(), "alias")
+                atomic(args.output, value)
+                return {"output": str(args.output)}
     raise Blocked("Unsupported operation", 2)
 
 
+def redirect(args, argv):
+    if args.command in {"setup", "state"} or (args.command == "build" and args.action in {"prepare", "activate"}):
+        return None
+    from .binding import Repository, bound
+    from .build import read_selection, selected_build
+    from .installation import run_installed
+
+    repository = Repository.open(args.vault)
+    binding = bound(repository, args.state)
+    require(args.vault_id is None or args.vault_id == binding["vault_id"], "The selected vault identity differs", 5)
+    args.vault_binding = binding
+    args.controller_selection = read_selection(repository.control, binding["vault_id"])
+    if args.controller_selection:
+        build = selected_build(repository, binding, args.controller_selection)
+        if not build.running():
+            return run_installed(build, argv)
+    return None
+
+
 def main(argv=None):
-    args = parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    commands = parser()
+    args = commands.parse_args(argv)
+    # The original B02 plists supplied all three selectors with the manual command spelling.
+    if args.vault_id is not None and args.state is not None and args.vault is not None:
+        job = (args.command,) if args.command == "lint" else (args.command, getattr(args, "action", None))
+        if job in {("lint",), ("maintenance", "daily")}:
+            argv = [*argv[:-len(job)], "maintenance", "run-scheduled", job[-1]]
+            args = commands.parse_args(argv)
+    if args.vault is None:
+        args.vault = "."
     try:
+        redirected = redirect(args, argv)
+        if redirected is not None:
+            return redirected
         result = dispatch(args)
         value, code = result if isinstance(result, tuple) else (result, 0)
     except Blocked as exc:

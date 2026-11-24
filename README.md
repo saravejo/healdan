@@ -34,13 +34,14 @@ Sessions   -> External encrypted storage -> Retention -> Backup
 git clone https://github.com/saravejo/healdan.git
 cd healdan
 python3 scripts/setup.py
-healdan --vault "$PWD" doctor
 ```
 
 ZIP installations use the same setup command. Setup preserves existing files
 and Git history, and removes only the inherited distribution remote.
-The controller is installed outside the vault. Personal configuration,
-keys, native profiles, and encrypted conversations stay outside Git.
+Setup prints the absolute controller path. Add its directory to `PATH`, then
+run `healdan --vault "$PWD" doctor`. The controller selects the build bound
+to the vault. Personal configuration, keys, native profiles, and encrypted
+conversations stay outside Git.
 
 Open this same folder as an Obsidian vault. No community plugins are required.
 Follow [setup](docs/setup.md) to configure signing, custody, recovery, and backup.

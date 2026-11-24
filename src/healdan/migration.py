@@ -1,7 +1,7 @@
 """Read-only migration projections, legacy inventory and purge prerequisites."""
 import re
 
-from .core import Blocked, REGISTRIES, digest, executable, git, read_json, require, run
+from .core import Blocked, REGISTRIES, digest, git, git_bytes, read_json, require
 from .ids import identity, inventory as id_inventory, registry_records
 from .regression import case_projections
 from .review import csp_state_bytes, csp_state_streak, csp_status, decode_csp_state
@@ -112,7 +112,7 @@ def inventory(vault):
                       "signed_or_historical": any(part in name for part in ("approval", "decision", "lesson", "history"))})
     assumptions = []
     line_counts = {"implementation": 0, "tests": 0, "configuration": 0}
-    names = run([executable("git"), "-C", vault.root, "ls-files", "-z"]).stdout.decode("utf-8").split("\0")
+    names = git_bytes(vault.root, "ls-files", "-z").decode("utf-8").split("\0")
     for name in names:
         path = vault.root / name
         if path.suffix not in {".py", ".json", ".toml", ".yml"} or not path.is_file():

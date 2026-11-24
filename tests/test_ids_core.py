@@ -6,7 +6,7 @@ import sys
 import unittest
 from uuid import uuid4
 
-from support import VaultTest
+from support import VaultTest, controller_environment
 from healdan.core import Blocked, Vault, atomic, decode, digest, git, jsonl, read_json, safe_path, utc
 from healdan.ids import TEXT, aliases, format_id, identity, inventory, reserve
 
@@ -93,10 +93,11 @@ class IDs(VaultTest):
     def test_real_processes_reserve_across_worktrees(self):
         worktree = self.base / "second worktree"
         git(self.root, "worktree", "add", "--detach", str(worktree), "HEAD")
-        source = str(Path(__file__).resolve().parent.parent / "src")
-        script = "import sys;sys.path.insert(0,sys.argv[1]);from healdan.core import Vault;from healdan.ids import reserve;print(reserve(Vault(sys.argv[2],sys.argv[3]),'S',1,sys.argv[4])[0])"
-        procs = [subprocess.Popen([sys.executable, "-c", script, source, str(self.root if i % 2 else worktree),
-                                  str(self.state), str(uuid4())], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(6)]
+        script = ("import sys; from healdan.core import Vault; from healdan.ids import reserve; "
+                  "print(reserve(Vault(sys.argv[1], sys.argv[2]), 'S', 1, sys.argv[3])[0])")
+        procs = [subprocess.Popen([sys.executable, "-c", script, str(self.root if i % 2 else worktree),
+                                  str(self.state), str(uuid4())], env=controller_environment(),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(6)]
         completed = [(proc, *proc.communicate(timeout=60)) for proc in procs]
         results = []
         for proc, out, err in completed:

@@ -13,53 +13,127 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22.12.0'
-      - name: Install real dependencies
-        run: |
-          brew install age
-          npm install --global @anthropic-ai/sandbox-runtime@0.0.83
-          python -m pip install .
-      - name: Record dependency versions
-        run: |
-          python --version
-          git --version
-          age --version
-          node --version
-          srt --version
-      - name: Run controller and real OS sandbox tests
-        shell: bash
-        run: python -m unittest discover -s tests -v 2>&1 | tee test-results.txt
-      - name: Exercise the sprint gate contract
-        run: python -m unittest scripts.test_sprint_gate -v
-      - name: Audit public tree
-        run: python scripts/audit_publication.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: macos-controller-results
-          path: test-results.txt
-
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      wheel_id: ${{ steps.wheel.outputs.artifact-id }}
+      wheel_attempt: ${{ steps.wheel_context.outputs.attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: python -m pip install build
       - run: python -m build
-      - run: python scripts/audit_publication.py --packages dist
+      - name: Audit wheel, source distribution and full history
+        run: python -I scripts/audit_publication.py --root . --expected-commit "${{ github.sha }}" --packages dist --require-distributions
+      - name: Upload tested wheel
+        id: wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: healdan-wheel-${{ github.run_attempt }}
+          path: dist/*.whl
+          if-no-files-found: error
+      - name: Record the wheel's attempt
+        id: wheel_context
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+  profile:
+    name: test-${{ matrix.profile }}
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: linux
+            runner: ubuntu-latest
+          - profile: windows
+            runner: windows-latest
+          - profile: macos
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Require the package from this attempt
+        shell: bash
+        env:
+          HEALDAN_WHEEL_ATTEMPT: ${{ needs.package.outputs.wheel_attempt }}
+        run: |
+          if [[ "$HEALDAN_WHEEL_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo '::error::The package and all profile results must come from one attempt. Use Re-run all jobs.'
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        if: matrix.profile == 'macos'
+        with:
+          node-version: '22.12.0'
+      - name: Install Linux dependencies
+        if: matrix.profile == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age openssh-client
+      - name: Install Windows age release
+        if: matrix.profile == 'windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'healdan-age.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'healdan-age'
+          Invoke-WebRequest -Uri 'https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-windows-amd64.zip' -OutFile $archive
+          if ((Get-FileHash -Algorithm SHA256 $archive).Hash -ne 'F48D8F8F9EBE903AB5027ED067652F2CC1DB94BC206976430133B905DCD8E8C7') {
+            throw 'Windows age release digest mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $destination 'age') -Encoding UTF8
+      - name: Install macOS native sandbox dependencies
+        if: matrix.profile == 'macos'
+        run: |
+          brew install age
+          npm install --global @anthropic-ai/sandbox-runtime@0.0.83
+      - uses: actions/download-artifact@v4
+        with:
+          name: healdan-wheel-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/healdan-wheel
+      - name: Run installed controller tests
+        shell: bash
+        env:
+          HEALDAN_PROFILE: ${{ matrix.profile }}
+          HEALDAN_WHEEL_ID: ${{ needs.package.outputs.wheel_id }}
+        run: |
+          python -I scripts/run_ci.py --profile "$HEALDAN_PROFILE" --artifact-id "$HEALDAN_WHEEL_ID" \
+            --wheel-dir "$RUNNER_TEMP/healdan-wheel" --work-dir "$RUNNER_TEMP/healdan-$HEALDAN_PROFILE"
+      - name: Upload structured profile results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: healdan-results-${{ matrix.profile }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/healdan-${{ matrix.profile }}/results.json
+          if-no-files-found: error
+
+  test:
+    if: always()
+    needs: [package, profile]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all installed controller profiles
+        shell: bash
+        env:
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          PROFILE_RESULT: ${{ needs.profile.result }}
+          HEALDAN_WHEEL_ATTEMPT: ${{ needs.package.outputs.wheel_attempt }}
+        run: |
+          if [[ "$PACKAGE_RESULT" = success && "$HEALDAN_WHEEL_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo '::error::The package and all profile results must come from one attempt. Use Re-run all jobs.'
+            exit 1
+          fi
+          test "$PACKAGE_RESULT" = success && test "$PROFILE_RESULT" = success

@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -182,7 +183,13 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
 
 
 def git_bytes(root, *args, check=True):
-    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], check=check).stdout
+    # The explicit vault path selects the real worktree, refs, objects and index.
+    overrides = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
+                 "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_GRAFT_FILE",
+                 "GIT_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
+                 "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
+    env = {key: value for key, value in os.environ.items() if key.upper() not in overrides}
+    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args], env=env, check=check).stdout
 
 
 def git(root, *args, check=True):
@@ -241,35 +248,82 @@ REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/contro
 
 
 class Vault:
-    def __init__(self, root, state=None, *, operational=True):
-        self.root = Path(root).resolve()
-        common = Path(git(self.root, "rev-parse", "--git-common-dir"))
-        self.common = (self.root / common).resolve() if not common.is_absolute() else common.resolve()
-        self.control = self.common / "healdan"
-        key = digest(str(self.common))[:20]
-        self.state = Path(state).resolve() if state else Path.home() / ".local/share/healdan" / key
-        require(not self.state.is_relative_to(self.root), "Controller state must be outside the vault")
+    def __init__(self, root, state=None, *, operational=True, expected_binding=None):
+        from .binding import Repository, bound
+        self.repository = Repository.open(root)
+        self.root = self.repository.root
+        self.common = self.repository.common
+        self.control = self.repository.control
+        self.binding = bound(self.repository, state, expected=expected_binding)
+        self.identity = self.binding["vault_id"]
+        self.state = Path(self.binding["location"]["state"])
         self.config_path = self.state / "config.json"
-        self.config = read_json(self.config_path, {})
-        self.policy = read_json(Path(__file__).with_name("defaults.json"))
-        if "context_bytes" in self.config:
-            limits = self.config["context_bytes"]
-            require(set(limits) == set(self.policy["context_bytes"]) and
-                    all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
-            self.policy["context_bytes"] = limits
+        self._lock = threading.local()
+        self.refresh_settings()
         if operational:
-            self.check_registries()
+            with self.reading():
+                self.check_registries()
 
+    def refresh_settings(self):
+        from .binding import project_config
+
+        with self.reading():
+            self.config = project_config(read_json(safe_path(self.state, "config.json"), {}), self.binding)
+            self.policy = read_json(Path(__file__).with_name("defaults.json"))
+            if "context_bytes" in self.config:
+                limits = self.config["context_bytes"]
+                require(set(limits) == set(self.policy["context_bytes"]) and
+                        all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
+                self.policy["context_bytes"] = limits
+
+    def _check_binding(self):
+        from .binding import bound
+        bound(self.repository, self.state, expected=self.binding)
+        if hasattr(self, "controller_selection"):
+            from .build import read_selection
+            require(read_selection(self.control, self.identity) == self.controller_selection,
+                    "Controller selection changed; run the command again", 5)
+
+    @contextlib.contextmanager
+    def reading(self, *, stable_integration=False):
+        """Revalidate the read view without waiting for unrelated controller writes."""
+        if getattr(self._lock, "held", False):
+            yield
+            return
+        self._check_binding()
+        before = self.no_transaction() if stable_integration else None
+        yield
+        if stable_integration:
+            require(self.no_transaction() == before, "An integration changed while the command was reading", 5)
+        self._check_binding()
+
+    @contextlib.contextmanager
     def locked(self):
-        return lock(self.control / "controller.lock")
+        from .binding import pair_lock
+        if getattr(self._lock, "held", False):
+            yield
+            return
+        self._check_binding()
+        with pair_lock(self.repository, self.state):
+            self._check_binding()
+            self._lock.held = True
+            try:
+                yield
+            finally:
+                self._lock.held = False
 
-    def rows(self, name, *, include_bytes=False):
+    def relocated_path(self, path):
+        from .binding import relocated_path
+        return relocated_path(path, self.binding)
+
+    def rows(self, name, *, include_bytes=False, root=None):
         required = Path(name).as_posix() in REQUIRED_REGISTRIES
-        return read_jsonl(safe_path(self.root, name, exists=required), required=required, include_bytes=include_bytes)
+        return read_jsonl(safe_path(root if root is not None else self.root, name, exists=required),
+                          required=required, include_bytes=include_bytes)
 
-    def check_registries(self):
+    def check_registries(self, *, root=None):
         for name in REQUIRED_REGISTRIES:
-            self.rows(name)
+            self.rows(name, root=root)
 
     def head(self):
         result = git(self.root, "rev-parse", "--verify", "HEAD", check=False)
@@ -305,16 +359,18 @@ class Vault:
     def receipt(self, kind, payload):
         value = {"kind": kind, "at": stamp(), "payload": payload}
         identifier = digest(value)
-        atomic(self.control / "receipts" / (identifier + ".json"), value)
+        with self.locked():
+            atomic(self.control / "receipts" / (identifier + ".json"), value)
         return identifier
 
     def no_transaction(self):
-        pending = read_json(self.control / "transaction.json")
+        pending = read_json(safe_path(self.control, "transaction.json"))
         require(not pending or pending["status"] == "complete",
                 "An integration needs recovery", 5)
+        return pending
 
     def clean_inputs(self):
-        tracked = run([executable("git"), "-C", self.root, "ls-files", "-z"]).stdout.decode("utf-8").split("\0")
+        tracked = git_bytes(self.root, "ls-files", "-z").decode("utf-8").split("\0")
         require(set(self.inputs()) <= set(tracked), "Commit preserved sources and canonical inputs before creating a task", 5)
         changed = git(self.root, "diff", "HEAD", "--name-only", "--", "wiki", "resources/sources", "config", "templates", "control/approvals")
         require(not changed, "Canonical task inputs have uncommitted changes", 5)

@@ -5,7 +5,11 @@ and the failed operation journal. Run `backup verify` on the selected manifest
 and every available destination. Restore into a new empty directory using
 `restore`; it rejects absolute paths, traversal, symlinks and mismatched hashes.
 Do not overwrite a live vault. Compare the recovered manifest and Git history,
-then run doctor, lint, query regression, and source locator validation.
+then preview `healdan --vault RESTORED --state NEW_STATE state adopt` with a
+fresh external state directory. Confirm the reported recovery provenance
+with `--confirm DIGEST`. Follow [setup](setup.md) to configure and activate
+the controller for the restored vault, then run doctor, lint, query regression,
+and source locator validation.
 
 For conversations, `session capture` creates an age archive outside Git and
 immediately decrypts it in memory to verify its digest. Inventory the native

@@ -1,8 +1,8 @@
 name = "implementador"
 description = "Implementa e testa o lote com contrato revisado."
 model = "gpt-6.2-sol"
-model_reasoning_effort = "max"
+model_reasoning_effort = "high"
 developer_instructions = """
 Trabalhe somente no lote atribuído. Preserve dados e assinaturas existentes. Execute os testes do contrato e informe os arquivos, resultados e limitações ao coordenador.
-Somente o coordenador faz push e merge.
+Somente o coordenador faz commit, push e merge.
 """

@@ -1,0 +1,10 @@
+{
+  "binding": ["healdan-vault-binding-v1"],
+  "config": [1],
+  "policy": [1],
+  "case": [null, "healdan-query-case-v2"],
+  "package": ["healdan-claim-digests-v1", "healdan-approval-package-v1", "healdan-approval-package-v2"],
+  "csp": [null, "CSP-1/i111/f0.1/numeric-v1"],
+  "journal": ["healdan-transaction-legacy-v1"],
+  "archive": ["healdan-tree-v1"]
+}

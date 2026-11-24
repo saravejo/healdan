@@ -1,47 +1,17 @@
 """Daily retention-before-backup orchestration, signed trials and launchd."""
 from datetime import timedelta
+import os
 from pathlib import Path
 import platform
 import plistlib
-import sys
+from tempfile import mkdtemp
 
-from .core import Blocked, atomic, digest, executable, read_json, require, run, stamp, utc
-from .signing import human_sign, trusted_signers, verify
+from .build import active
+from .core import Blocked, Vault, atomic, executable, read_json, require, run, safe_path, utc
+from .launchd import JOBS, gui_domain, job_label
+from .trials import TRIALS, attest, status as trial_status
 
-TRIALS = ("claude-auth", "native-resume", "native-cleanup", "offline-recovery", "launchd")
-
-
-def attest(vault, name, evidence):
-    require(name in TRIALS, "Unknown native acceptance trial", 2)
-    require(evidence.get("platform") == "Darwin" and evidence.get("commit") == vault.head() and
-            evidence.get("passed") is True and evidence.get("versions") and evidence.get("artifacts") and
-            evidence.get("procedure") and evidence.get("started_at") and evidence.get("completed_at"),
-            "Trial needs real macOS evidence, exact commit, procedure, times, versions and artifact hashes", 2)
-    require(utc(evidence["completed_at"]) >= utc(evidence["started_at"]), "Invalid trial times", 2)
-    for artifact in evidence["artifacts"]:
-        path = Path(artifact["path"])
-        require(path.is_file() and digest(path.read_bytes()) == artifact["sha256"], "Trial artifact mismatch")
-    payload = {"name": name, **evidence}
-    approval = human_sign(vault, payload, "trial")
-    atomic(vault.control / "trials" / (name + ".json"), approval)
-    return approval
-
-
-def trial_status(vault):
-    results = []
-    for name in TRIALS:
-        try:
-            value = read_json(vault.control / "trials" / (name + ".json"))
-            payload = verify(value, "trial", trusted_signers(vault))
-            require(payload.get("name") == name and payload.get("commit") == vault.head() and payload.get("passed") is True,
-                    "Trial is stale or failed")
-            for artifact in payload["artifacts"]:
-                require(Path(artifact["path"]).is_file() and digest(Path(artifact["path"]).read_bytes()) == artifact["sha256"],
-                        "Trial artifact is unavailable or changed")
-            results.append({"name": name, "passed": True, "reason": "Signed native evidence verified"})
-        except (Blocked, OSError, KeyError, TypeError) as exc:
-            results.append({"name": name, "passed": False, "reason": str(exc)})
-    return results
+TRIAL_MARKER = "launchd-trial.json"
 
 
 def daily(vault, now=None):
@@ -76,28 +46,135 @@ def daily(vault, now=None):
     return {"status": "complete", "retention": result["id"], "backup": backup["id"], "notices": notices}
 
 
-def schedule(vault, *, activate=False):
-    require(platform.system() == "Darwin", "launchd schedules require macOS", 5)
+def prepare_launchd_trial(vault, directory):
+    from .build import activate, external, require_active
+    from .setup import initialize
+
+    require(platform.system() == "Darwin", "launchd trials require macOS", 5)
+    with vault.locked():
+        require(trial_workspace(vault) is None, "Start launchd trial preparation from the target vault", 5)
+        build = require_active(vault)
+        directory = Path(directory).absolute()
+        require(directory.is_dir() and directory.resolve() == directory,
+                "Choose an existing canonical directory outside the target vault and state", 5)
+        external(directory, vault.repository, vault.state)
+        require(not directory.is_relative_to(build.prefix.parent), "Keep the trial outside the controller build store", 5)
+        workspace = Path(mkdtemp(prefix="healdan-launchd-trial-", dir=directory))
+
+    root, state = workspace / "vault", workspace / "state"
+    setup = initialize(root, state)
+    fixture = Vault(root, state)
+    with fixture.locked():
+        atomic(fixture.control / TRIAL_MARKER, {"format": "healdan-launchd-trial-v1", "binding": fixture.binding})
+    activate(fixture, build.identity["sha256"], build.prefix.parent)
+    return {**setup, "workspace": str(workspace), "trial_vault_id": fixture.identity,
+            "controller": str(build.entry_point), "build": build.identity}
+
+
+def trial_workspace(vault):
+    marker = safe_path(vault.control, TRIAL_MARKER)
+    if not marker.exists():
+        return None
+    workspace = vault.repository.primary.parent
+    require(read_json(marker) == {"format": "healdan-launchd-trial-v1", "binding": vault.binding} and
+            workspace.name.startswith("healdan-launchd-trial-") and vault.repository.primary == workspace / "vault" and
+            vault.common == vault.root / ".git" and vault.state == workspace / "state",
+            "The disposable launchd trial must use its original vault and state", 5)
+    return workspace
+
+
+def _check_trial_settings(vault, workspace):
+    from .binding import CONFIG_PATHS, CONFIG_ROOTS
+
+    paths = [vault.config[name] for name in CONFIG_PATHS if vault.config.get(name)]
+    for name in CONFIG_ROOTS:
+        paths.extend(vault.config.get(name, []))
+    for name in paths:
+        path = Path(name)
+        require(path != workspace and path.is_relative_to(workspace),
+                "Launchd trial keys, storage roots and backup destinations must stay in its workspace", 5)
+        safe_path(workspace, path.relative_to(workspace))
+    for root, directories in ((vault.root, ("inbox", "wiki")),
+                              (vault.state, ("custody", "tasks", "launchd")),
+                              (vault.control, ("deletions", "lint", "receipts", "sessions", "tasks"))):
+        for name in directories:
+            relative = (root / name).relative_to(workspace)
+            path = safe_path(workspace, relative)
+            require(path.resolve() == path and (not path.exists() or path.is_dir()),
+                    "Launchd trial requires a canonical workspace directory at " + str(relative), 5)
+    require(all(root.is_relative_to(workspace) for root in vault.repository.worktree_roots()),
+            "Launchd trial worktrees must stay in its workspace", 5)
+
+
+def _schedule_scope(vault, trial):
+    workspace = trial_workspace(vault)
+    require(trial == (workspace is not None), "Select the matching production or disposable launchd trial vault", 5)
+    if trial:
+        _check_trial_settings(vault, workspace)
+
+
+def _check_readiness(vault, trial, operation):
     from .setup import doctor
-    require(doctor(vault)["ready"], "Configuration/recovery must pass before scheduling", 5)
-    executable_path = Path(sys.executable).parent / "healdan"
-    require(executable_path.is_file() and not executable_path.resolve().is_relative_to(vault.root),
-            "External installed controller required", 5)
-    output = []
+
+    report = doctor(vault)
+    ready = report["ready"]
+    if trial:
+        checks = report["checks"]
+        ready = (sum(row["name"] == "trial:launchd" for row in checks) == 1 and
+                 all(row["passed"] for row in checks if row["name"] != "trial:launchd"))
+    require(ready, "Configuration and native trials must pass before " + operation, 5)
+
+
+def schedule(vault, *, activate=False, trial=False):
+    with vault.locked():
+        return _schedule(vault, activate=activate, trial=trial)
+
+
+def run_scheduled(vault, job, expected_vault, *, trial=False):
+    from .linting import lint
+
+    require(job in JOBS, "Unknown scheduled job", 2)
+    require(expected_vault == vault.identity and vault.root == vault.repository.primary,
+            "The scheduled command must name its vault identity and primary worktree", 5)
+    with vault.locked():
+        vault.refresh_settings()
+        _schedule_scope(vault, trial)
+        _check_readiness(vault, trial, "running a scheduled job")
+        return lint(vault) if job == "lint" else daily(vault)
+
+
+def schedule_definitions(vault, build=None, *, trial=False):
+    build = build if build is not None else active(vault)
+    search_path = os.pathsep.join(path for path in os.environ.get("PATH", os.defpath).split(os.pathsep)
+                                  if Path(path).is_absolute())
+    definitions = []
     for job, calendar in vault.policy["schedules"].items():
-        label = "org.healdan." + digest(str(vault.common))[:12] + "." + job
-        command = ["lint"] if job == "lint" else ["maintenance", "daily"]
-        plist = {"Label": label, "ProgramArguments": [str(executable_path), "--vault", str(vault.root),
-                 "--state", str(vault.state), *command], "StartCalendarInterval": calendar,
+        label = job_label(vault.identity, job, trial=trial)
+        definitions.append({"Label": label, "ProgramArguments": [str(build.entry_point), "--vault", str(vault.repository.primary),
+                 "--state", str(vault.state), "--vault-id", vault.identity, "maintenance", "run-scheduled", job,
+                 *(["--trial"] if trial else [])], "EnvironmentVariables": {"PATH": search_path},
+                 "StartCalendarInterval": calendar,
                  "StandardOutPath": str(vault.state / (job + ".out")),
-                 "StandardErrorPath": str(vault.state / (job + ".err"))}
-        destination = vault.state / "launchd" / (label + ".plist")
+                 "StandardErrorPath": str(vault.state / (job + ".err"))})
+    return definitions
+
+
+def _schedule(vault, *, activate, trial):
+    require(platform.system() == "Darwin", "launchd schedules require macOS", 5)
+    vault.refresh_settings()
+    _schedule_scope(vault, trial)
+    if activate:
+        _check_readiness(vault, trial, "activating a schedule")
+    output = []
+    for plist in schedule_definitions(vault, trial=trial):
+        destination = safe_path(vault.state, "launchd/" + plist["Label"] + ".plist")
+        for name in ("StandardOutPath", "StandardErrorPath"):
+            safe_path(vault.state, Path(plist[name]).relative_to(vault.state))
         atomic(destination, plistlib.dumps(plist))
         if activate:
-            import os
             target = Path.home() / "Library/LaunchAgents" / destination.name
             atomic(target, destination.read_bytes())
-            result = run(["launchctl", "bootstrap", f"gui/{os.getuid()}", target], check=False)
+            result = run([executable("launchctl"), "bootstrap", gui_domain(), target], check=False)
             require(result.returncode == 0, "launchd activation failed; inspect the job before retry", 5)
         output.append(str(destination))
     return {"plists": output, "activated": activate}

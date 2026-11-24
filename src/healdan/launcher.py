@@ -20,10 +20,16 @@ from .tasks import get_session, get_task, require_active, task_path, validate_ev
 def runtime_version(vault):
     require(platform.system() == "Darwin", "Production sandbox launch requires macOS", 5)
     version = run([executable("srt"), "--version"]).stdout.decode().strip()
-    require(version == vault.policy["srt_version"], "srt version differs from pinned policy", 5)
-    node = run([executable("node"), "--version"]).stdout.decode().strip().lstrip("v")
-    require(tuple(map(int, node.split(".")[:3])) >= (22, 12, 0), "Node.js 22.12+ is required", 5)
+    node = run([executable("node"), "--version"]).stdout.decode().strip()
+    validate_runtime(vault, version, node)
     return version
+
+
+def validate_runtime(vault, version, node):
+    require(version == vault.policy["srt_version"], "srt version differs from pinned policy", 5)
+    parts = node.removeprefix("v").split(".")
+    require(len(parts) == 3 and all(part.isascii() and part.isdecimal() for part in parts) and
+            tuple(map(int, parts)) >= (22, 12, 0), "Node.js 22.12+ is required", 5)
 
 
 def settings(vault, writable, readable, *, network=False):
@@ -53,6 +59,11 @@ def clean_env(temporary, profile=None):
 
 
 def probe(vault):
+    with vault.locked():
+        return _probe(vault)
+
+
+def _probe(vault):
     version = runtime_version(vault)
     vault.state.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="probe-", dir=vault.state) as temp, \
@@ -69,7 +80,8 @@ def probe(vault):
         sentinel = "denial-probe-" + str(uuid4())
         targets = [secret, vault.root / sentinel, vault.common / sentinel,
                    vault.state / sentinel, Path(__file__).parent / sentinel, Path("/tmp/claude") / sentinel]
-        config = settings(vault, [allowed], [allowed, Path(sys.executable).resolve().parent.parent])
+        config = settings(vault, [allowed], [allowed, Path(sys.prefix), Path(sys.base_prefix),
+                                            Path(sys.executable).resolve().parent.parent])
         config_path = root / "sandbox.json"
         atomic(config_path, config)
         script = """import json, os, pathlib, socket, subprocess, sys
@@ -108,6 +120,11 @@ print(json.dumps(result))
 
 
 def profile(vault, operation):
+    with vault.locked():
+        return _profile(vault, operation)
+
+
+def _profile(vault, operation):
     session = get_session(vault, operation)
     directory = vault.state / "tasks" / session["task"] / "temporary" / session["role"] / session["uuid"] / "native"
     directory.mkdir(parents=True, exist_ok=True)
@@ -121,9 +138,11 @@ def profile(vault, operation):
 
 
 def launch(vault, operation, *, resume=False, recovery_material=None):
-    probe(vault)  # Never reuse an old successful probe as authorization to launch.
-    require(not Path(__file__).resolve().is_relative_to(vault.root), "Install the controller outside the vault before launch", 5)
+    from .build import require_active
+
     with vault.locked():
+        require_active(vault)
+        _probe(vault)  # Run a fresh OS isolation probe before every launch.
         vault.no_transaction()
         session = get_session(vault, operation)
         task = get_task(vault, session["task"])
@@ -137,6 +156,7 @@ def launch(vault, operation, *, resume=False, recovery_material=None):
         require(bool(session["launches"]) == resume, "Use resume for an existing session; new launches need a new S-", 2)
         base = vault.state / "tasks" / session["task"]
         proposal = Path(session["proposal"])
+        require(proposal.resolve().is_relative_to(base / "proposals"), "Session proposal belongs outside this vault state", 5)
         temporary = base / "temporary" / session["role"] / session["uuid"]
         native = Path(session["recovery_profile"]) if recovery_material else profile(vault, operation)
         require(native.resolve().is_relative_to(vault.state), "Native recovery profile must stay in controller state")

@@ -7,7 +7,7 @@ import sys
 import unittest
 from uuid import uuid4
 
-from support import VaultTest
+from support import VaultTest, controller_environment
 from healdan.core import Blocked, Vault, atomic, digest, git, read_json, stamp, utc
 from healdan import backups, custody, ids, inbox, pages, tasks
 
@@ -60,7 +60,7 @@ class Boundaries(VaultTest):
         self.assertEqual(custody.retention_deadline(record), entered + timedelta(days=7))
 
     def test_empty_cli_exit_codes_and_structured_output(self):
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent / "src"))
+        env = controller_environment()
         result = subprocess.run([sys.executable, "-m", "healdan", "--vault", str(self.root), "--state", str(self.state), "query"],
                                 capture_output=True, env=env)
         self.assertEqual(result.returncode, 20)

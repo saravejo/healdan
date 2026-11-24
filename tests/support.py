@@ -7,10 +7,22 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+SOURCE = Path(__file__).resolve().parent.parent / "src"
+INSTALLED = os.environ.get("HEALDAN_INSTALLED_TESTS") == "1"
+if not INSTALLED:
+    sys.path.insert(0, str(SOURCE))
 from healdan.core import Vault, atomic, decode, digest, executable, git, jsonl, run
 from healdan.setup import initialize
 from healdan.signing import envelope
+
+
+def controller_environment():
+    env = dict(os.environ)
+    if INSTALLED:
+        from healdan.installation import isolated_environment
+        return isolated_environment()
+    env["PYTHONPATH"] = str(SOURCE)
+    return env
 
 
 class VaultTest(unittest.TestCase):
@@ -42,9 +54,8 @@ class VaultTest(unittest.TestCase):
         atomic(self.root / path, jsonl(rows))
 
     def cli(self, *args):
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent / "src"))
         result = run([sys.executable, "-m", "healdan", "--vault", self.root, "--state", self.state, *args],
-                     env=env, check=False)
+                     env=controller_environment(), check=False)
         self.assertEqual(result.stderr, b"")
         return result.returncode, decode(result.stdout)
 

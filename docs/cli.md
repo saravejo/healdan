@@ -2,12 +2,17 @@
 
 Run commands from a human shell using the external installed controller.
 Global options precede the command: `healdan --vault '/path with spaces'`.
-`--state` selects external controller state; normal setup derives it from the
-common Git directory. All commands return JSON. `--help` lists exact arguments.
+`--state` selects external controller state at setup. Subsequent commands
+resolve the bound state from the common Git directory. All commands return
+JSON. `--help` lists exact arguments.
 
 | Command | Input and effect |
 |---|---|
 | `setup [--interactive]` | Preserve files/history; initialize missing empty registries; external configuration |
+| `state adopt [--confirm DIGEST]` | Preview and confirm the binding for an existing state or a restored vault |
+| `state rebind [--confirm DIGEST]` | Preview and confirm new paths for the bound vault or state |
+| `build prepare WHEEL` | Verify and install a wheel at its digest-specific path |
+| `build activate DIGEST`, `build identity` | Check compatibility before selecting a build or report the active identity |
 | `doctor`, `status` | Dependency/configuration/trial health and operational clocks |
 | `inbox inventory` | Record content identity, paths, versions; never infer capture time |
 | `inbox decide HASH DECISION` | Owner, class, known entry provenance, destination or explicit deferral |
@@ -42,8 +47,11 @@ common Git directory. All commands return JSON. `--help` lists exact arguments.
 | `maintenance daily` | Reconcile clocks, retention, then verified backup |
 | `maintenance hold`, `maintenance release-hold` | Recorded suspension and dependency resolution |
 | `maintenance incident MATERIAL rotation|deletion DECISION.json` | Separate signed incident decisions |
-| `maintenance attest TRIAL EVIDENCE.json` | Sign native acceptance evidence at the exact Git commit |
+| `maintenance trial-environment TRIAL [--profile PATH]` | Record the measured environment for a native trial |
+| `maintenance attest TRIAL EVIDENCE.json` | Sign native acceptance evidence for the vault, controller build, and trial environment |
 | `maintenance schedule [--activate]` | Generate/activate local-calendar launchd jobs after readiness |
+| `maintenance prepare-launchd-trial DIRECTORY` | Create a disposable vault and state for the launchd trial with the target build |
+| `maintenance schedule --trial [--activate]` | Generate/activate isolated launchd jobs from a prepared disposable trial vault |
 | `backup create --kind long --expires-at UTC` | Encrypted generation to all configured destinations |
 | `backup verify ID`, `restore ID DESTINATION` | Verify every copy and restore to a fresh directory |
 | `migration inventory`, `migration purge-check` | Read-only legacy/width inventory and purge prerequisites |
