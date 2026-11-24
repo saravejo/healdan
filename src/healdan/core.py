@@ -248,26 +248,26 @@ REQUIRED_REGISTRIES = (*REGISTRIES, "wiki/control/topic-map.jsonl", "wiki/contro
 
 
 class Vault:
-    def __init__(self, root, state=None, *, operational=True):
+    def __init__(self, root, state=None, *, operational=True, expected_binding=None):
         from .binding import Repository, bound
         self.repository = Repository.open(root)
         self.root = self.repository.root
         self.common = self.repository.common
         self.control = self.repository.control
-        self.binding = bound(self.repository, state)
+        self.binding = bound(self.repository, state, expected=expected_binding)
         self.identity = self.binding["vault_id"]
         self.state = Path(self.binding["location"]["state"])
         self.config_path = self.state / "config.json"
         self._lock = threading.local()
-        with self.locked():
-            self.refresh_settings()
-            if operational:
+        self.refresh_settings()
+        if operational:
+            with self.reading():
                 self.check_registries()
 
     def refresh_settings(self):
         from .binding import project_config
 
-        with self.locked():
+        with self.reading():
             self.config = project_config(read_json(safe_path(self.state, "config.json"), {}), self.binding)
             self.policy = read_json(Path(__file__).with_name("defaults.json"))
             if "context_bytes" in self.config:
@@ -276,19 +276,36 @@ class Vault:
                         all(type(v) is int and v > 0 for v in limits.values()), "Invalid configured context budgets")
                 self.policy["context_bytes"] = limits
 
+    def _check_binding(self):
+        from .binding import bound
+        bound(self.repository, self.state, expected=self.binding)
+        if hasattr(self, "controller_selection"):
+            from .build import read_selection
+            require(read_selection(self.control, self.identity) == self.controller_selection,
+                    "Controller selection changed; run the command again", 5)
+
     @contextlib.contextmanager
-    def locked(self):
-        from .binding import bound, pair_lock
+    def reading(self, *, stable_integration=False):
+        """Revalidate the read view without waiting for unrelated controller writes."""
         if getattr(self._lock, "held", False):
             yield
             return
-        bound(self.repository, self.state, expected=self.binding)
+        self._check_binding()
+        before = self.no_transaction() if stable_integration else None
+        yield
+        if stable_integration:
+            require(self.no_transaction() == before, "An integration changed while the command was reading", 5)
+        self._check_binding()
+
+    @contextlib.contextmanager
+    def locked(self):
+        from .binding import pair_lock
+        if getattr(self._lock, "held", False):
+            yield
+            return
+        self._check_binding()
         with pair_lock(self.repository, self.state):
-            bound(self.repository, self.state, expected=self.binding)
-            if hasattr(self, "controller_selection"):
-                from .build import read_selection
-                require(read_selection(self.control, self.identity) == self.controller_selection,
-                        "Controller selection changed; run the command again", 5)
+            self._check_binding()
             self._lock.held = True
             try:
                 yield
@@ -347,9 +364,10 @@ class Vault:
         return identifier
 
     def no_transaction(self):
-        pending = read_json(self.control / "transaction.json")
+        pending = read_json(safe_path(self.control, "transaction.json"))
         require(not pending or pending["status"] == "complete",
                 "An integration needs recovery", 5)
+        return pending
 
     def clean_inputs(self):
         tracked = git_bytes(self.root, "ls-files", "-z").decode("utf-8").split("\0")

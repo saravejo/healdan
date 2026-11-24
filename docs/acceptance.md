@@ -70,6 +70,8 @@ to collect execution evidence before signing for the target environment.
 Keep authenticated credentials in the personal environment.
 
 Activate the wheel from the successful Actions attempt for the release commit.
+Use **Re-run all jobs** when repeating an Actions run. The package, the three
+test profiles and their uploaded results must all come from the same attempt.
 Run `python scripts/release_check.py --vault PATH --ci-run RUN_ID`. Use
 `--ci-attempt ATTEMPT` to require the current attempt number explicitly. The
 check verifies the wheel, every required test outcome, the selected vault and

@@ -105,6 +105,15 @@ def _binary_identity(path):
         return {"path": str(path), "sha256": file_digest(stream, "sha256").hexdigest()}
 
 
+def _base_runtime(path):
+    base = _binary_identity(path)
+    runtime = {"base": base}
+    if os.name == "nt":
+        runtime["windows_runtime"] = {p.name: _binary_identity(p)
+                                      for p in sorted(Path(base["path"]).parent.glob("python3*.dll"))}
+    return runtime
+
+
 def _startup_files(prefix, site_packages, python):
     files = {}
     for path in sorted(site_packages.iterdir()):
@@ -122,7 +131,7 @@ def _startup_files(prefix, site_packages, python):
     return files
 
 
-def installed_layout(prefix, details, base_executable):
+def installed_layout(prefix, details, base_executable, *, base_runtime=None):
     candidates = ([prefix / "Lib/site-packages"] if os.name == "nt" else
                   list((prefix / "lib").glob("python*/site-packages")))
     candidates = [p for p in candidates if p.is_dir()]
@@ -140,10 +149,8 @@ def installed_layout(prefix, details, base_executable):
     require(os.access(entry, os.X_OK), "Controller entry point is unavailable", 5)
     python = program(prefix, "python")
     safe_path(prefix, python.parent.relative_to(prefix))
-    base = _binary_identity(base_executable)
-    binaries = {"program": _binary_identity(python), "base": base}
-    if os.name == "nt":
-        binaries["windows_runtime"] = {p.name: _binary_identity(p) for p in sorted(Path(base["path"]).parent.glob("python3*.dll"))}
+    runtime = base_runtime if base_runtime is not None else _base_runtime(base_executable)
+    binaries = {"program": _binary_identity(python), **runtime}
     return {"site_packages": site_packages.relative_to(prefix).as_posix(),
             "venv_config_sha256": digest(cfg.read_bytes()),
             "entry_point_sha256": digest(safe_path(prefix, entry.relative_to(prefix), exists=True).read_bytes()),
@@ -184,10 +191,18 @@ def verify_build(prefix):
     data = wheel.read_bytes()
     require(digest(data) == prefix.name, "Saved wheel digest differs from the selected controller", 5)
     details = wheel_details(wheel.name, data)
-    base_executable = manifest.get("layout", {}).get("python", {}).get("base", {}).get("path")
+    recorded_python = manifest.get("layout", {}).get("python", {})
+    base_executable = recorded_python.get("base", {}).get("path")
     require(isinstance(base_executable, str) and Path(base_executable).is_absolute(),
             "Controller build manifest has no verified base interpreter", 5)
-    require(dict(details, layout=installed_layout(prefix, details, base_executable)) == manifest,
+    recovery = ("The recorded base Python is unavailable or changed. Prepare the same wheel and activate it "
+                "from a new store using scripts/setup.py --wheel WHEEL --store NEW_STORE.")
+    try:
+        current = _base_runtime(base_executable)
+    except (Blocked, OSError) as exc:
+        raise Blocked(recovery, 5) from exc
+    require(current == {key: value for key, value in recorded_python.items() if key != "program"}, recovery, 5)
+    require(dict(details, layout=installed_layout(prefix, details, base_executable, base_runtime=current)) == manifest,
             "Controller build manifest does not match the verified wheel and environment", 5)
     return Build(prefix, manifest)
 
@@ -221,7 +236,7 @@ def selected_build(repository, binding, selection):
 
 
 def active(vault):
-    with vault.locked():
+    with vault.reading():
         selection = read_selection(vault.control, vault.identity)
         require(selection, "Activate a verified controller build for this vault", 5)
         return selected_build(vault.repository, vault.binding, selection)

@@ -14,7 +14,7 @@ import zipfile
 from support import VaultTest
 import healdan
 from healdan import binding, build, installation, launchd, maintenance, tasks
-from healdan.core import Blocked, Vault, atomic, decode, git, run
+from healdan.core import Blocked, Vault, atomic, decode, git, read_json, run
 from healdan.setup import initialize
 
 
@@ -150,6 +150,49 @@ class ImmutableInstallation(VaultTest):
         self.assertEqual(self.identity(b.entry_point), a.identity)
         self.activate(b)
         self.assertEqual(self.identity(a.entry_point), b.identity)
+
+    def test_same_wheel_recovers_in_new_store_after_base_python_changes(self):
+        original = self.stage("wheel with older Python receipt")
+        other = self.stage("independent vault build")
+        sibling = self.base / "other vault"
+        initialize(sibling, self.base / "other state")
+        other_vault = Vault(sibling)
+        self.activate(original)
+        self.activate(other, other_vault)
+        selected = self.vault.control / build.SELECTION
+        other_selection = other_vault.control / build.SELECTION
+        before = {path: path.read_bytes() for path in (selected, other_selection)}
+        wheel = original.prefix / "artifact" / original.manifest["wheel"]
+        receipt_path = original.prefix / build.BUILD_RECEIPT
+        receipt = read_json(receipt_path)
+        receipt["layout"]["python"]["base"]["sha256"] = "0" * 64
+        atomic(receipt_path, receipt)
+        old_installation = {p.relative_to(original.prefix): p.read_bytes()
+                            for p in (receipt_path, original.entry_point, wheel)}
+        setup = Path(__file__).resolve().parent.parent / "scripts/setup.py"
+        command = [sys.executable, "-I", setup, "--vault", self.root, "--wheel", wheel, "--no-interactive"]
+        new_store = self.base / "store for upgraded Python"
+        old_command = run([original.entry_point, "--vault", self.root, "build", "identity"], check=False)
+        self.assertEqual(old_command.returncode, 5)
+        self.assertIn("base Python is unavailable or changed", decode(old_command.stdout)["error"])
+        blocked = run([*command, "--store", self.store], check=False)
+        self.assertEqual(blocked.returncode, 5)
+        self.assertIn("--store NEW_STORE", decode(blocked.stdout)["error"])
+        config_before = self.vault.config_path.read_bytes()
+        atomic(self.vault.config_path, {**self.vault.config, "schema_version": 100})
+        blocked = run([*command, "--store", new_store], check=False)
+        self.assertEqual(blocked.returncode, 5)
+        self.assertIn(b"cannot read current config format".lower(), blocked.stdout.lower())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        atomic(self.vault.config_path, config_before)
+        recovered = run([*command, "--store", new_store])
+        activation = decode(recovered.stdout.splitlines()[-1])
+        self.assertEqual(activation["build"], original.identity)
+        self.assertEqual(Path(activation["controller"]).parent.parent, new_store / original.identity["sha256"])
+        self.assertEqual(self.identity(activation["controller"]), original.identity)
+        self.assertEqual(other_selection.read_bytes(), before[other_selection])
+        self.assertEqual(self.identity(other.entry_point, sibling), other.identity)
+        self.assertEqual({path: (original.prefix / path).read_bytes() for path in old_installation}, old_installation)
 
     def test_compatible_rollback_and_rejection_preserve_external_state_bytes(self):
         a, b = (self.stage(variant) for variant in ("earlier", "later"))

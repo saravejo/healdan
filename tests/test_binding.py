@@ -165,6 +165,61 @@ class VaultBinding(VaultTest):
         shared_state = self.base / "shared state"
         compete((other_vaults[0], shared_state), (other_vaults[1], shared_state))
 
+    def test_normal_reads_do_not_wait_for_the_maintenance_write_lock(self):
+        with self.vault.locked(), ThreadPoolExecutor(max_workers=4) as pool:
+            writer = pool.submit(self.cli, "task", "reserve-id", "C", "--operation", str(uuid4()))
+            status = pool.submit(self.cli, "status")
+            query = pool.submit(self.cli, "query", "--entity", "instrument")
+            preview = pool.submit(self.cli, "preview")
+            self.assertEqual(status.result(timeout=12)[0], 0)
+            self.assertEqual(query.result(timeout=12)[0], 20)
+            self.assertEqual(preview.result(timeout=12)[0], 0)
+            code, details = writer.result(timeout=30)
+            self.assertEqual(code, 5, details)
+            self.assertIn("Controller lock is busy", details["error"])
+
+            atomic(self.vault.control / "transaction.json", {"status": "writing"})
+            code, status = self.cli("status")
+            self.assertEqual(code, 0)
+            self.assertEqual(status["transaction"], "writing")
+            for command in ("query", "preview"):
+                code, result = self.cli(command)
+                self.assertEqual(code, 5)
+                self.assertIn("integration needs recovery", result["error"])
+
+        self.assertFalse((self.vault.control / "reservations.json").exists())
+        with self.assertRaisesRegex(Blocked, "binding is interrupted"), self.vault.reading():
+            atomic(self.vault.control / binding.PENDING, {"synthetic": "binding in progress"})
+
+    def test_rebind_accepts_only_confirmed_missing_task_worktree(self):
+        task = tasks.create(self.vault, "Recorded removal of a disposable task worktree")
+        original = Path(task["worktree"])
+        saved_worktree = self.base / "retained synthetic worktree"
+        original.rename(saved_worktree)
+        admin, linked = next(self.vault.repository.linked_worktrees())
+        self.assertEqual(linked.parent, original)
+        new_state = self.base / "relocated external state"
+        self.state.rename(new_state)
+        target = new_state / original.relative_to(self.state)
+        with self.assertRaisesRegex(Blocked, "Missing Git worktree has no confirmed removal"):
+            binding.rebind(self.root, new_state)
+        self.assertEqual(binding.marker(new_state), self.vault.binding)
+
+        task["worktree_removed"] = True
+        atomic(tasks.task_path(self.vault, task["id"]), task)
+        locked = admin / "locked"
+        atomic(locked, b"unavailable portable fixture")
+        with self.assertRaisesRegex(Blocked, "Missing Git worktree has no confirmed removal"):
+            binding.rebind(self.root, new_state)
+        locked.unlink()
+        preview = binding.rebind(self.root, new_state)
+        self.assertEqual(preview["worktrees"], [{"path": str(target), "git_directory": str(admin),
+                                                 "needs_repair": False, "removed": True}])
+        self.assertEqual(binding.rebind(self.root, new_state, preview["confirmation"])["status"], "rebound")
+        self.assertEqual(tasks.get_task(Vault(self.root), task["id"])["worktree"], str(target))
+        self.assertTrue(saved_worktree.is_dir())
+        self.assertTrue((admin / "gitdir").is_file())
+
     def test_rebind_separately_and_together_preserves_worktrees_and_signed_custody(self):
         self.age()
         destination = self.state / "backup location"

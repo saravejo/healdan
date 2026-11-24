@@ -60,9 +60,22 @@ def legacy_proof(repository, state):
 def _linked_worktrees(repository, old, new):
     """Validate both ends of every registered link, including links that need repair."""
     worktrees = []
+    targets = set()
     previous_common = Path(old["location"]["common"])
     for admin, linked in repository.linked_worktrees():
         target = relocated_path(linked, new)
+        require(target not in targets, "Multiple Git worktrees point to: " + str(target.parent), 5)
+        targets.add(target)
+        original_present = linked.parent.exists() or linked.parent.is_symlink()
+        target_present = target.parent.exists() or target.parent.is_symlink()
+        if not original_present and not target_present:
+            require(_removed_task_worktree(repository, target, new) and
+                    not (admin / "locked").exists() and not (admin / "locked").is_symlink(),
+                    "Missing Git worktree has no confirmed removal. Reconcile it before reassociation: " + str(target.parent), 5)
+            worktrees.append({"path": str(target.parent), "git_directory": str(admin),
+                              "needs_repair": False, "removed": True})
+            continue
+        require(target.is_file(), "Linked worktree backlink is unavailable: " + str(target), 5)
         expected = previous_common / admin.relative_to(repository.common)
         backlink = _backlink(target)
         require(backlink in (admin, expected), "Linked worktree points to another Git directory: " + str(target), 5)
@@ -70,6 +83,20 @@ def _linked_worktrees(repository, old, new):
         worktrees.append({"path": str(target.parent), "git_directory": str(admin),
                           "needs_repair": linked != target or backlink != admin})
     return worktrees
+
+
+def _removed_task_worktree(repository, target, binding):
+    worktree = target.parent
+    state = Path(binding["location"]["state"])
+    if worktree.name != "worktree" or worktree.parent.parent != state / "tasks":
+        return False
+    safe_path(state, worktree.relative_to(state))
+    require(worktree.resolve() == worktree, "Missing worktree path is aliased: " + str(worktree), 5)
+    task_id = worktree.parent.name
+    task = read_json(safe_path(repository.control, f"tasks/{task_id}.json"))
+    return (isinstance(task, dict) and task.get("id") == task_id and task.get("worktree_removed") is True and
+            not task.get("processes") and isinstance(task.get("worktree"), str) and
+            relocated_path(task["worktree"], binding) == worktree)
 
 
 def _references(repository, binding, worktrees):
@@ -91,7 +118,7 @@ def _references(repository, binding, worktrees):
                 require(available, "Reassociation configuration path is unavailable: " + str(target), 5)
                 report("config:" + name, original, target)
 
-    registered = {Path(tree["path"]) for tree in worktrees}
+    registered = {Path(tree["path"]) for tree in worktrees if not tree.get("removed")}
     for task in _records(repository, "tasks"):
         require(not task.get("processes"), "Reconcile active native tasks before moving the vault", 5)
         original = Path(task["worktree"])
@@ -236,9 +263,9 @@ def relocation_summary(plan):
 def apply_relocation(repository, binding, plan):
     _validate_move(repository, plan["old"], binding)
     worktrees = _linked_worktrees(repository, plan["old"], binding)
-    fields = ("path", "git_directory")
-    require([tuple(tree[key] for key in fields) for tree in worktrees] ==
-            [tuple(tree[key] for key in fields) for tree in plan["worktrees"]] and
+    fields = ("path", "git_directory", "removed")
+    require([tuple(tree.get(key) for key in fields) for tree in worktrees] ==
+            [tuple(tree.get(key) for key in fields) for tree in plan["worktrees"]] and
             _references(repository, binding, worktrees) == plan["paths"],
             "Reassociation paths changed after confirmation", 5)
     changes = []

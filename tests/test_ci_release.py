@@ -140,6 +140,14 @@ class StructuredCI(unittest.TestCase):
         fixture = EvidenceFixture()
         with self.assertRaisesRegex(Blocked, "current CI attempt"):
             fixture.verify(1)
+        fixture = EvidenceFixture()
+        fixture.jobs = [job for job in fixture.jobs if job["name"] != "package"]
+        with self.assertRaisesRegex(Blocked, "missing from attempt 2: package.*Re-run all jobs"):
+            fixture.verify()
+        fixture = EvidenceFixture()
+        next(job for job in fixture.jobs if job["name"] == "package")["run_attempt"] = 1
+        with self.assertRaisesRegex(Blocked, "another attempt: package.*Re-run all jobs"):
+            fixture.verify()
 
 
 class PublicationHistory(VaultTest):

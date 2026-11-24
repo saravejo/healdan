@@ -61,6 +61,13 @@ def _profile(vault, name, requested):
 
 def _config_receipt(vault, names, *, recovery):
     values = {name: vault.config.get(name) for name in names}
+    if values.get("signing_key"):
+        key = Path(values["signing_key"])
+        effective = key.resolve()
+        require(key.is_absolute() and effective.is_file() and
+                not any(effective.is_relative_to(root) for root in vault.repository.worktree_roots()),
+                "External human signing key is unavailable", 5)
+        values["signing_key"] = {"path": str(effective), "sha256": digest(effective.read_bytes())}
     if "backup_allowed_signers" in values and values["backup_allowed_signers"]:
         path = Path(values["backup_allowed_signers"])
         require(path.is_absolute() and path.is_file(), "Backup signer policy is unavailable", 5)
@@ -159,7 +166,7 @@ def attest(vault, name, evidence):
 def status(vault):
     results = []
     tools = {}
-    with vault.locked():
+    with vault.reading():
         for name in TRIALS:
             try:
                 path = _receipt_path(vault, name)

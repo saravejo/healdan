@@ -198,7 +198,8 @@ def dispatch(args):
     external_recovery = (args.command, getattr(args, "action", None)) in {
         ("restore", None), ("backup", "verify"), ("session", "restore"), ("session", "approve-recovery")
     }
-    vault = Vault(args.vault, args.state, operational=not external_recovery)
+    vault = Vault(args.vault, args.state, operational=not external_recovery,
+                  expected_binding=getattr(args, "vault_binding", None))
     if hasattr(args, "controller_selection"):
         vault.controller_selection = args.controller_selection
     if args.command == "build":
@@ -206,25 +207,29 @@ def dispatch(args):
             return build.activate(vault, args.sha256, args.store)
         return {"build": build.require_active(vault).identity, "vault_id": vault.identity}
     if args.command == "doctor":
-        result = setup.doctor(vault)
+        with vault.reading():
+            result = setup.doctor(vault)
         return result, 0 if result["ready"] else 5
     if args.command == "status":
-        state = read_json(vault.control / "lint-state.json", {})
-        return {"commit": vault.head(), "vault_id": vault.identity, "state": str(vault.state),
-                "lint_overdue": linting.stale(state.get("last_complete_lint_at")),
-                "last_complete_lint_at": state.get("last_complete_lint_at"),
-                "tasks": [{"id": t["id"], "state": t["state"], "worktree_age": tasks.age_status(t),
-                           "capacity_held": t["capacity_held"], "reminders": t.get("reminders", []),
-                           "waiting_since": t.get("presented_at"), "closure_pending": t.get("closure_pending", False)}
-                          for t in tasks.all_tasks(vault)],
-                "transaction": read_json(vault.control / "transaction.json", {}).get("status"),
-                "native_trials": maintenance.trial_status(vault)}
+        with vault.reading():
+            state = read_json(vault.control / "lint-state.json", {})
+            return {"commit": vault.head(), "vault_id": vault.identity, "state": str(vault.state),
+                    "lint_overdue": linting.stale(state.get("last_complete_lint_at")),
+                    "last_complete_lint_at": state.get("last_complete_lint_at"),
+                    "tasks": [{"id": t["id"], "state": t["state"], "worktree_age": tasks.age_status(t),
+                               "capacity_held": t["capacity_held"], "reminders": t.get("reminders", []),
+                               "waiting_since": t.get("presented_at"), "closure_pending": t.get("closure_pending", False)}
+                              for t in tasks.all_tasks(vault)],
+                    "transaction": read_json(vault.control / "transaction.json", {}).get("status"),
+                    "native_trials": maintenance.trial_status(vault)}
     if args.command == "query":
         filters = {k: getattr(args, k) for k in ("entity", "property", "environment", "modality", "topic", "term") if getattr(args, k)}
-        result = query(vault, filters, args.cutoff, max_records=args.max_records)
+        with vault.reading(stable_integration=True):
+            result = query(vault, filters, args.cutoff, max_records=args.max_records)
         return result, result["code"]
     if args.command == "preview":
-        return pages.preview(vault, args.cutoff)
+        with vault.reading(stable_integration=True):
+            return pages.preview(vault, args.cutoff)
     if args.command == "lint":
         result = linting.lint(vault)
         return result, 5 if result["status"] != "complete" or result["findings"] else 0
@@ -337,7 +342,7 @@ def dispatch(args):
             return maintenance.attest(vault, args.trial, read_json(args.evidence))
         if args.action == "trial-environment":
             from .trials import environment
-            with vault.locked():
+            with vault.reading():
                 return environment(vault, args.trial, args.profile)
         if args.action == "hold":
             with vault.locked():
@@ -384,6 +389,7 @@ def redirect(args, argv):
     repository = Repository.open(args.vault)
     binding = bound(repository, args.state)
     require(args.vault_id is None or args.vault_id == binding["vault_id"], "The selected vault identity differs", 5)
+    args.vault_binding = binding
     args.controller_selection = read_selection(repository.control, binding["vault_id"])
     if args.controller_selection:
         build = selected_build(repository, binding, args.controller_selection)

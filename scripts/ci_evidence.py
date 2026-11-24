@@ -83,9 +83,12 @@ def _jobs(api, path, run_id, attempt, head):
     required = {**SETUP_STEPS, **{"test-" + profile: PROFILE_STEPS for profile in PROFILES}}
     for name, steps in required.items():
         matches = [row for row in rows if row["name"] == name]
+        require(matches, f"Required CI job is missing from attempt {attempt}: {name}. Use Re-run all jobs.", 5)
         require(len(matches) == 1, "Required CI job is unavailable or duplicated: " + name, 5)
         job = matches[0]
-        require(job.get("run_id") == run_id and job.get("run_attempt", attempt) == attempt and job.get("head_sha") == head and
+        require(job.get("run_attempt", attempt) == attempt,
+                f"Required CI job belongs to another attempt: {name}. Use Re-run all jobs.", 5)
+        require(job.get("run_id") == run_id and job.get("head_sha") == head and
                 job.get("status") == "completed" and job.get("conclusion") == "success",
                 "Required CI job did not succeed in the selected attempt: " + name, 5)
         for step in steps:

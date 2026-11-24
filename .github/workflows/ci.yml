@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       wheel_id: ${{ steps.wheel.outputs.artifact-id }}
+      wheel_attempt: ${{ steps.wheel_context.outputs.attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,6 +38,9 @@ jobs:
           name: healdan-wheel-${{ github.run_attempt }}
           path: dist/*.whl
           if-no-files-found: error
+      - name: Record the wheel's attempt
+        id: wheel_context
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
   profile:
     name: test-${{ matrix.profile }}
@@ -54,6 +58,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
+      - name: Require the package from this attempt
+        shell: bash
+        env:
+          HEALDAN_WHEEL_ATTEMPT: ${{ needs.package.outputs.wheel_attempt }}
+        run: |
+          if [[ "$HEALDAN_WHEEL_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo '::error::The package and all profile results must come from one attempt. Use Re-run all jobs.'
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -117,4 +130,10 @@ jobs:
         env:
           PACKAGE_RESULT: ${{ needs.package.result }}
           PROFILE_RESULT: ${{ needs.profile.result }}
-        run: test "$PACKAGE_RESULT" = success && test "$PROFILE_RESULT" = success
+          HEALDAN_WHEEL_ATTEMPT: ${{ needs.package.outputs.wheel_attempt }}
+        run: |
+          if [[ "$PACKAGE_RESULT" = success && "$HEALDAN_WHEEL_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo '::error::The package and all profile results must come from one attempt. Use Re-run all jobs.'
+            exit 1
+          fi
+          test "$PACKAGE_RESULT" = success && test "$PROFILE_RESULT" = success

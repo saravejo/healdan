@@ -41,12 +41,20 @@ directory moved. Preserve both original binding markers during the move. On
 macOS, unload the vault's installed LaunchAgents and remove their installed
 plist files before reassociation. Recheck readiness at the new paths before
 activating the schedules again.
+Reconcile any missing Git worktree before moving the vault. A reassociation
+preview can report a stale Git entry for a task whose worktree removal the
+controller already recorded.
 
 Use `healdan --vault PATH build identity` to see the active version and digest.
 To switch builds, run `healdan build prepare WHEEL`, then use the reported digest
 with `healdan --vault PATH build activate DIGEST`. Use the previous prepared
 digest to return to an earlier build. Activation verifies the target and its
 compatibility with the vault's persisted formats before changing the selection.
+If the recorded base Python is unavailable after an upgrade, run
+`python3 scripts/setup.py --vault PATH --wheel WHEEL --store NEW_STORE` with
+the new Python. Use the original wheel and an unused external store. Setup
+prepares and verifies a new installation before switching the selected vault.
+Keep the old store for its existing selections and installation history.
 
 Configure the external JSON file printed by setup, or use interactive setup.
 Provide Git name/email, a human signing identity and public/private SSH key,

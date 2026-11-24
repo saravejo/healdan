@@ -130,6 +130,7 @@ def bound(repository, state=None, *, expected=None):
     require(state is None or Path(state).resolve() == selected, "Selected state differs from this vault's binding", 5)
     require(repository.location(selected) == value["location"], "Vault location has changed; use state rebind", 5)
     require(marker(selected) == value, "Git and external state binding markers do not agree", 5)
+    require(not _optional_file(repository.control, PENDING), "Vault binding is interrupted; repeat its setup or state operation", 5)
     require(expected is None or expected == value, "Vault binding changed while the operation was open", 5)
     return value
 

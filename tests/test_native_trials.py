@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from support import VaultTest
 from healdan import maintenance, trials
-from healdan.core import Blocked, Vault, atomic, digest, git
+from healdan.core import Blocked, Vault, atomic, digest, executable, git, read_json, run
 from healdan.setup import initialize
+from healdan.signing import verify
 
 
 class NativeTrialIdentity(VaultTest):
@@ -171,3 +172,22 @@ class NativeTrialIdentity(VaultTest):
             self.assertEqual(maintenance.run_scheduled(self.vault, "lint", self.vault.identity), lint.return_value)
             self.assertEqual(maintenance.run_scheduled(self.vault, "daily", self.vault.identity), daily.return_value)
         self.assertFalse((self.state / "launchd").exists())
+
+    def test_signing_key_rotation_invalidates_the_measured_trial(self):
+        name = "claude-auth"
+        maintenance.attest(self.vault, name, self.evidence(name))
+        maintenance.attest(self.vault, "offline-recovery", self.evidence("offline-recovery"))
+        receipt = self.vault.control / f"trials/v2/{name}.json"
+        original = receipt.read_bytes()
+        signer_policy = self.signers.read_bytes()
+        self.assertTrue(self.statuses()[name]["passed"])
+        new_key = self.base / "new disposable signing key"
+        run([executable("ssh-keygen"), "-q", "-t", "ed25519", "-N", "", "-f", new_key])
+        atomic(self.key, new_key.read_bytes())
+        self.assertEqual(verify(read_json(receipt), "trial", self.signers)["name"], name)
+        statuses = self.statuses()
+        self.assertFalse(statuses[name]["passed"])
+        self.assertRegex(statuses[name]["reason"], "environment changed")
+        self.assertTrue(statuses["offline-recovery"]["passed"])
+        self.assertEqual(receipt.read_bytes(), original)
+        self.assertEqual(self.signers.read_bytes(), signer_policy)
