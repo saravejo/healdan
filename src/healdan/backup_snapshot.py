@@ -587,22 +587,25 @@ def check_historical_journal(name, value, source_vault):
                 isinstance(binding.get("destination"), str), "Invalid historical conversation restoration journal", 5)
 
 
-def check_trial_receipt(name, receipt, source_vault, expected=None):
+def check_trial_receipt(name, receipt, source_vault, signers, proven, expected=None):
     require(isinstance(receipt, dict) and SIGNATURE_FIELDS == receipt.keys() and receipt["namespace"] == "trial" and
             sha256(receipt["digest"]) and all(isinstance(receipt[key], str) and receipt[key] for key in ("signature", "identity")),
             "Invalid signed trial receipt: " + name, 5)
     payload = receipt["payload"]
     require(isinstance(payload, dict), "Invalid signed trial payload: " + name, 5)
     if expected is None:
-        # The unversioned audit wrapper is shared by both producers.
-        measured = payload.get("environment")
-        versioned = payload.get("format") == trials.TRIAL_FORMAT and isinstance(measured, dict) and "vault_id" in measured
+        # Without a matching nominal record, only the complete measured shape identifies v2.
+        versioned = payload.get("format") == trials.TRIAL_FORMAT and trials.measured_environment_shape(payload.get("environment"))
         expected = payload.get("name"), versioned
     trial, versioned = expected
     try:
         trials.check_preserved_evidence(payload, trial, source_vault, versioned=versioned)
     except (Blocked, ValueError, OverflowError) as exc:
         raise Blocked(f"Invalid historical trial receipt {name}: {exc}", 5) from exc
+    token = digest(receipt)
+    if token not in proven:
+        verify(receipt, "trial", signers)
+        proven.add(token)
 
 
 def check_records(archive, contents, signers, backup_signers):
@@ -623,9 +626,9 @@ def check_records(archive, contents, signers, backup_signers):
         stem = filename.removesuffix(".json")
         if logical_name in trials.RECEIPTS:
             expected = trials.RECEIPTS[logical_name]
-            check_trial_receipt(name, value, archive["source_vault"], expected)
+            check_trial_receipt(name, value, archive["source_vault"], signers, proven, expected)
             trial_versions[digest(value)] = expected
-        if parent == "receipts" and value.get("kind") == "trial-signature":
+        elif parent == "receipts" and value.get("kind") == "trial-signature":
             trial_mirrors[name] = value.get("payload")
         else:
             check_signatures(value, signers, backup_signers, proven)
@@ -653,8 +656,7 @@ def check_records(archive, contents, signers, backup_signers):
                     isinstance(usage, dict) and all(type(amount) is int and amount >= 0 for amount in usage.values()) and
                     id_identity(value.get("id"))[0] == "S", "Invalid backed-up session record: " + stem, 5)
     for name, receipt in trial_mirrors.items():
-        check_trial_receipt(name, receipt, archive["source_vault"], trial_versions.get(digest(receipt)))
-        check_signatures(receipt, signers, backup_signers, proven)
+        check_trial_receipt(name, receipt, archive["source_vault"], signers, proven, trial_versions.get(digest(receipt)))
     csp_state_streak(records.get("csp.json", {"streak": 0}))
     for operation, reservation in records.get("reservations.json", {}).items():
         require(identifier(operation) and isinstance(reservation, dict) and isinstance(reservation.get("ids"), list) and

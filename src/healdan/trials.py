@@ -154,6 +154,21 @@ def _validate_evidence(evidence):
     require(utc(evidence["completed_at"]) >= utc(evidence["started_at"]), "Invalid trial times", 2)
 
 
+def measured_environment_shape(value):
+    if not (isinstance(value, dict) and isinstance(value.get("vault_id"), str) and sha256(value.get("config_sha256"))):
+        return False
+    text_fields = {"controller": ("version",), "profile": ("trial",),
+                   "platform": ("system", "release", "machine", "version"), "python": ("command", "version")}
+    for name, fields in text_fields.items():
+        measurement = value.get(name)
+        if not isinstance(measurement, dict) or not all(isinstance(measurement.get(field), str) for field in fields):
+            return False
+    tools = value.get("tools")
+    return sha256(value["controller"].get("sha256")) and isinstance(tools, dict) and bool(tools) and all(
+        isinstance(tool, dict) and isinstance(tool.get("path"), str) and sha256(tool.get("sha256")) and
+        (name not in TOOL_ARGUMENTS or isinstance(tool.get("version"), str)) for name, tool in tools.items())
+
+
 def check_preserved_evidence(payload, name, vault_id, *, versioned):
     require(isinstance(payload, dict) and name in TRIALS and payload.get("name") == name,
             "Trial evidence has an invalid name", 5)
@@ -179,11 +194,7 @@ def check_preserved_evidence(payload, name, vault_id, *, versioned):
         measured = payload.get("environment")
         require(payload.get("format") == TRIAL_FORMAT and isinstance(measured, dict) and measured.get("vault_id") == vault_id,
                 "Trial receipt has the wrong format or source vault identity", 5)
-        profile, controller = measured.get("profile"), measured.get("controller")
-        require(isinstance(profile, dict) and profile.get("trial") == name and isinstance(controller, dict) and
-                isinstance(controller.get("version"), str) and sha256(controller.get("sha256")) and
-                sha256(measured.get("config_sha256")) and all(isinstance(measured.get(key), dict) and measured[key]
-                                                            for key in ("platform", "python", "tools")),
+        require(measured_environment_shape(measured) and measured["profile"]["trial"] == name,
                 "Invalid measured trial environment", 5)
         paths = [artifact["path"] for artifact in artifacts]
         require(len(set(paths)) == len(paths) and all(PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()

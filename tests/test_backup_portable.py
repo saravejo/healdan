@@ -1265,17 +1265,89 @@ class BackupPortable(VaultTest):
         self.assertFalse((recovered.control / relative).exists())
         self.assertEqual(alias.read_bytes(), original)
 
+    def test_1_orphan_native_trial_mirrors_keep_their_compatible_format(self):
+        self.configure()
+        qa = {"identity": "fixture identity", "namespace": "local label", "signature": "artifact description"}
+        receipt_bytes, nominal_bytes = {}, {}
+        for name in ("native-resume", "native-cleanup", "offline-recovery"):
+            _, evidence, measured = self.trial_evidence(name)
+            common = {**evidence, "name": name, "commit": self.vault.head(), "qa": qa}
+            if name == "native-resume":
+                legacy = {**common, "versions": ["age"], "environment": {"vault_id": "legacy-audit-value"}}
+            elif name == "native-cleanup":
+                legacy = {**common, "versions": "fixture", "procedure": {"steps": ["Disposable fixture"]},
+                          "environment": {"vault_id": self.vault.identity},
+                          "artifacts": [{**evidence["artifacts"][0], "role": "recorded rehearsal"}]}
+            else:
+                legacy = {**common, "versions": {"age": "fixture"},
+                          "environment": {**measured, "python": {"version": ["legacy evidence"], "command": False}}}
+            older = human_sign(self.vault, {**legacy, "format": trials.TRIAL_FORMAT}, "trial")
+            nominal = self.vault.control / "trials" / f"{name}.json"
+            atomic(nominal, older)
+            path, = [receipt for receipt in (self.vault.control / "receipts").glob("*.json")
+                     if read_json(receipt).get("payload") == older]
+            receipt_bytes[path.name] = path.read_bytes()
+            renewed = human_sign(self.vault, {**common, "versions": {"age": "newer fixture"}}, "trial")
+            atomic(nominal, renewed)
+            self.assertNotEqual(read_json(nominal), older)
+            nominal_bytes[f"trials/{name}.json"] = nominal.read_bytes()
+
+        with patch("healdan.trials.environment", return_value=measured):
+            measured_approval = trials.attest(self.vault, name, {**evidence, "environment": measured})
+        (self.vault.control / "trials/v2" / f"{name}.json").unlink()
+        measured_mirror, = [path for path in (self.vault.control / "receipts").glob("*.json")
+                            if read_json(path).get("payload") == measured_approval]
+        receipt_bytes[measured_mirror.name] = measured_mirror.read_bytes()
+
+        record = self.create()
+        plain = custody.decrypt(self.vault, self.paths(record)[1].read_bytes())
+        contents = backup_snapshot.check_entries(decode(plain), record["approval"]["payload"])
+        result = self.restore(record)
+        recovered = Vault(result["destination"], result["state"])
+        for filename, original in receipt_bytes.items():
+            relative = f"receipts/{filename}"
+            self.assertEqual(contents[backup_snapshot.STATE + relative], original)
+            self.assertEqual((recovered.control / relative).read_bytes(), original)
+        for relative, original in nominal_bytes.items():
+            self.assertEqual(contents[backup_snapshot.STATE + relative], original)
+            self.assertEqual((recovered.control / "historical" / relative).read_bytes(), original)
+            self.assertFalse((recovered.control / relative).exists())
+        self.assertFalse(any(row["passed"] for row in trials.status(recovered)))
+
+        foreign_payload = {**common, "format": trials.TRIAL_FORMAT, "versions": {"age": "fixture"},
+                           "environment": {**measured, "vault_id": str(uuid4())}}
+        unrelated = self.signed(foreign_payload, "trial")
+        forged = {**older, "signature": "Invalid SSH fixture"}
+        inventory = custody.materials(self.vault)
+        files = sorted(self.destinations[0].iterdir())
+        for receipt, reason in ((unrelated, "source vault"), (forged, "Invalid human SSH signature")):
+            with self.subTest(reason=reason):
+                proof = self.vault.receipt("trial-signature", receipt)
+                try:
+                    with self.assertRaisesRegex(Blocked, reason):
+                        self.create()
+                finally:
+                    (self.vault.control / "receipts" / (proof + ".json")).unlink()
+                self.assertEqual(custody.materials(self.vault), inventory)
+                self.assertEqual(sorted(self.destinations[0].iterdir()), files)
+        self.vault.receipt("ordinary-fixture", {"qa": qa})
+        with self.assertRaisesRegex(Blocked, "Unknown signature envelope in snapshot"):
+            self.create()
+
     def test_1_invalid_native_trial_evidence_blocks_backup_publication(self):
         self.configure()
         name = "offline-recovery"
         _, evidence, measured = self.trial_evidence(name)
         payload = {**evidence, "name": name, "format": trials.TRIAL_FORMAT, "environment": measured}
         approved = self.signed(payload, "trial")
+        wrong_measurement = {**measured, "python": {"command": 0, "version": "3.12.10"}}
+        legacy_extras = {"commit": self.vault.head(), "versions": {"age": "fixture"}}
         path = self.vault.control / f"trials/v2/{name}.json"
         for value, reason in (
             ({"payload": payload}, "Invalid signed trial receipt"),
             (self.signed({**payload, "name": "launchd"}, "trial"), "invalid name"),
             (self.signed({**payload, "environment": {**measured, "vault_id": str(uuid4())}}, "trial"), "source vault"),
+            (self.signed({**payload, **legacy_extras, "environment": wrong_measurement}, "trial"), "measured trial environment"),
             (self.signed({**payload, "procedure": {"steps": ["Disposable"]}}, "trial"), "a procedure"),
             (self.signed({**payload, "procedure": " \t"}, "trial"), "a procedure"),
             (self.signed({**payload, "artifacts": [{"path": "/origin/fixture", "sha256": "invalid"}]}, "trial"), "artifact inventory"),
