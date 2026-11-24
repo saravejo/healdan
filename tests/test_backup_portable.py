@@ -465,7 +465,7 @@ class BackupPortable(VaultTest):
         self.assertFalse(dest.exists())
 
     def test_1_custody_retention_and_authorized_remap(self):
-        self.configure()
+        self.configure(2)
         decision = self.policy()
         old = utc() - timedelta(days=40)
 
@@ -494,19 +494,22 @@ class BackupPortable(VaultTest):
             entry.pop("kind")
         plain = canonical({"format": "healdan-tree-v1", "files": files})
         cipher = custody.encrypt(self.vault, plain)
-        replica = self.destinations[0] / (legacy_id + ".age")
-        atomic(replica, cipher)
+        replicas = [directory / (legacy_id + ".age") for directory in self.destinations]
+        for replica in replicas:
+            atomic(replica, cipher)
         legacy = {"id": legacy_id, "kind": "backup", "generation": "long", "created_at": stamp(old),
                   "expires_at": stamp(old + timedelta(days=1)), "members": [], "commit": self.vault.head(),
                   "plain_sha256": digest(plain), "cipher_sha256": digest(cipher), "holds": [], "dependencies": [],
                   "copies": [{"root": str(replica.parent), "path": replica.name, "kind": "ciphertext",
-                              "sha256": digest(cipher), "status": "present"}], "status": "complete", "verified_at": stamp(old)}
+                              "sha256": digest(cipher), "status": "present"} for replica in replicas],
+                  "status": "complete", "verified_at": stamp(old)}
         legacy["approval"] = envelope(deepcopy(legacy), "backup", "backup", self.vault.config["backup_signing_key"])
         custody.save_material(self.vault, legacy)
 
         # Persist the initial B04 intent after unlink, then use retention to write the original receipt format.
         now = utc()
-        historical_plan = retention.plan(self.vault, now)
+        surviving_slot = retention.slot({"material": legacy_id, "copy_index": 1, "copy": legacy["copies"][1]})
+        historical_plan = retention.plan(self.vault, now, exclude=[surviving_slot])
         self.assertEqual({entry["material"] for entry in historical_plan["entries"]},
                          {historical["id"], divergent["id"], legacy_id})
         for entry in historical_plan["entries"]:
@@ -526,10 +529,39 @@ class BackupPortable(VaultTest):
         self.assertEqual(retention.plan_digest(completed), completed["digest"])
         atomic(self.vault.control / historical_path, completed)
 
+        legacy_record = custody.materials(self.vault)[legacy_id]
+        receipt_id = legacy_record["copies"][0]["deletion_receipt"]
+        receipt_path = self.vault.control / "receipts" / f"{receipt_id}.json"
+        control_path = self.vault.control / historical_path
+        history = {path: path.read_bytes() for path in (control_path, receipt_path, self.vault.control / "materials.json")}
+        code, explicit = self.cli("backup", "verify", legacy_id)
+        self.assertEqual(code, 0, explicit)
+        strict = backups.inspect_backup(self.vault, legacy_record, decrypt_replicas=True)
+        restored_legacy = backups.restore(self.vault, legacy_id, self.base / "legacy-with-retired-replica")
+        for report in (explicit, strict, restored_legacy):
+            self.assertEqual([row["status"] for row in report["replicas"]], ["deleted", "verified"])
+            self.assertEqual(report["replica"], str(replicas[1]))
+            self.assertEqual(report["deleted_copies"], [{"copy_index": 0, "root": str(replicas[0].parent), "receipt": receipt_id}])
+        self.assertEqual(git(Path(restored_legacy["destination"]), "rev-parse", "HEAD"), legacy["commit"])
+
+        bad_plan = read_json(control_path)
+        legacy_entry = next(entry for entry in bad_plan["entries"] if entry["material"] == legacy_id)
+        legacy_entry["intent"]["file_identity"][1] += 1
+        self.assertEqual(retention.plan_digest(bad_plan), bad_plan["digest"])
+        atomic(control_path, bad_plan)
+        code, explicit = self.cli("backup", "verify", legacy_id)
+        self.assertEqual(code, 0, explicit)
+        self.assertEqual([row["status"] for row in explicit["replicas"]], ["invalid", "verified"])
+        self.assertEqual(explicit["deleted_copies"], [])
+        with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
+            backups.inspect_backup(self.vault, legacy_record, decrypt_replicas=True)
+        atomic(control_path, history[control_path])
+        self.assertEqual({path: path.read_bytes() for path in history}, history)
+
         round_deleted, _ = export("deleted-by-round", old)
         round_divergent, _ = export("divergent-round-date", old)
         # The earliest producer persisted the completed slot's own timestamp and a single receipt for the round.
-        round_plan = retention.plan(self.vault, now)
+        round_plan = retention.plan(self.vault, now, exclude=[surviving_slot])
         round_material = {record["id"]: record for record in (round_deleted, round_divergent)}
         self.assertEqual({entry["material"] for entry in round_plan["entries"]}, round_material.keys())
         for entry in round_plan["entries"]:

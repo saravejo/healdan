@@ -202,7 +202,8 @@ def legacy_round_deletion_proof(record, copy, index, deletion_plans, deletion_re
 def historical_deletion_plan(intent, plans):
     matches = 0
     for name, plan in plans:
-        if (name != f"deletions/{plan['id']}.json" or plan.get("digest") != intent["plan_digest"] or
+        if (not isinstance(plan, dict) or plan.get("digest") != intent["plan_digest"] or
+                name != f"deletions/{plan.get('id')}.json" or
                 plan.get("status") not in {"planned", "pending", "complete"} or plan_digest(plan) != plan["digest"]):
             continue
         matches += sum(entry.get("intent") == intent and type(entry.get("copy_index")) is int and
@@ -214,7 +215,7 @@ def historical_deletion_plan(intent, plans):
 
 
 def historical_backup_slot(record, index, copy):
-    # The snapshot verifier has already checked the signature of the legacy envelope.
+    # The snapshot verifier or the operational plan reader authenticates the legacy envelope.
     approval = record.get("approval", {})
     signed = approval.get("payload", {})
     slots = signed.get("copies", [])

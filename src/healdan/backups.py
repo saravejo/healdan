@@ -497,22 +497,23 @@ def verified_replica(vault, record, copy):
     return cipher
 
 
+def legacy_deletion_records(vault, folder):
+    directory = safe_path(vault.control, folder)
+    for path in sorted(directory.glob("*.json")):
+        try:
+            yield path.stem, read_json(safe_path(directory, path.name, exists=True))
+        except (Blocked, OSError, ValueError, KeyError, TypeError):
+            continue
+
+
 def legacy_replica_receipt(vault, record, copy, index):
     if not (copy.get("deleted_at") and record.get("expires_at") and utc(copy["deleted_at"]) >= utc(record["expires_at"])):
         return None
     root = vault.relocated_path(copy["root"])
     if "origin_status" not in copy and root.is_dir() and safe_path(root, copy["path"]).exists():
         return None
-
-    def entries(folder):
-        directory = safe_path(vault.control, folder)
-        for path in sorted(directory.glob("*.json")):
-            try:
-                yield path.stem, read_json(safe_path(directory, path.name, exists=True))
-            except (Blocked, OSError, ValueError, KeyError, TypeError):
-                continue
-
-    return legacy_replica_proof(record, copy, index, entries("deletions"), entries("receipts"))
+    return legacy_replica_proof(record, copy, index, legacy_deletion_records(vault, "deletions"),
+                                legacy_deletion_records(vault, "receipts"))
 
 
 def legacy_replica_proof(record, copy, index, deletion_plans, deletion_receipts):
@@ -521,6 +522,12 @@ def legacy_replica_proof(record, copy, index, deletion_plans, deletion_receipts)
     if not (copy.get("deleted_at") and record.get("expires_at") and utc(copy["deleted_at"]) >= utc(record["expires_at"])):
         return None
     return legacy_round_deletion_proof(record, copy, index, deletion_plans, deletion_receipts)
+
+
+def historical_replica_plans(vault, record):
+    authenticate_generation(vault, record)
+    for identifier, plan in legacy_deletion_records(vault, "deletions"):
+        yield f"deletions/{identifier}.json", plan
 
 
 def verify_replica_deletion(vault, record, index, copy):
@@ -533,9 +540,11 @@ def verify_replica_deletion(vault, record, index, copy):
         legacy = None if writing else legacy_replica_receipt(vault, record, copy, index)
         require(legacy, reason, 5)
         return {"copy_index": index, "root": root, "receipt": legacy, "proof": "legacy-round"}
+    origin_plans = historical_replica_plans(vault, record) if not writing and "format" not in record else None
     receipt_id = check_deletion_proof(record, index, copy, lambda name: read_json(safe_path(vault.control, name)),
                                       lambda path, claim: deletion_location(vault, path, claim),
-                                      generation_digest=None if writing else record["approval"]["digest"], reason=reason)
+                                      generation_digest=None if writing else record["approval"]["digest"], reason=reason,
+                                      origin_plans=origin_plans)
     return {"copy_index": index, "root": root, "receipt": receipt_id}
 
 
