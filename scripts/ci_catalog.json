@@ -180,6 +180,7 @@
     "test_source_policy.SourcePolicy.test_unknown_deferral_allows_first_triage_without_resetting_custody",
     "test_source_policy.SourcePolicy.test_unmerged_page_ancestry_cannot_supply_claim_revisions",
     "test_storage_lifecycle.StorageLifecycle.test_backup_deleted_replica_requires_intent_receipt",
+    "test_storage_lifecycle.StorageLifecycle.test_checkpoint_deletion_waits_for_verified_capture_and_reconciles_cipher",
     "test_storage_lifecycle.StorageLifecycle.test_daily_discovers_new_expiry_and_reports_held_material_by_cli",
     "test_storage_lifecycle.StorageLifecycle.test_deletion_intent_recovers_unlink_and_detects_offline_or_unexplained_absence",
     "test_storage_lifecycle.StorageLifecycle.test_eligible_long_backup_runs_while_short_body_is_ineligible",

@@ -220,6 +220,11 @@ def require_secret_decisions(vault, record):
                 "Secret incident step does not match the material", 5)
 
 
+def has_active_checkpoints(record):
+    return record.get("kind") == "conversation" and any(
+        copy["kind"] == "checkpoint" and copy["status"] not in INACTIVE_COPIES for copy in record["copies"])
+
+
 def material_guard(vault, record, now, policy):
     from .backups import signed_manifest, verify_replica_deletions
     require(not preserved(vault, record, policy), "Retention policy preserves material", 5)
@@ -244,6 +249,8 @@ def material_guard(vault, record, now, policy):
             for entry in recovery_holds:
                 entry.update(ended_at=stamp(now), resolution=[record["native_recovery"]["digest"]])
             save_material(vault, record)
+    elif has_active_checkpoints(record):
+        verified_capture(vault, record)
 
 
 def authorized_target(vault, record, copy):
@@ -301,8 +308,7 @@ def guard_ciphertext(vault, record):
     require(not pending_restoration(vault, record["id"]), "Ciphertext is needed by a pending restoration", 5)
     require(not any(c["kind"] == "native" and c["status"] not in INACTIVE_COPIES for c in record["copies"]),
             NATIVE_REPLICAS_PENDING, 5)
-    require(record.get("kind") != "conversation" or not any(c["kind"] == "checkpoint" and c["status"] not in INACTIVE_COPIES
-                    for c in record["copies"]), CHECKPOINT_REPLICAS_PENDING, 5)
+    require(not has_active_checkpoints(record), CHECKPOINT_REPLICAS_PENDING, 5)
 
 
 def pending_plans(vault):

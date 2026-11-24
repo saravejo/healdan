@@ -448,6 +448,49 @@ class StorageLifecycle(VaultTest):
         self.assertIn("offline", reasons["offline"])
         self.assertTrue(offline.exists())
 
+    def test_checkpoint_deletion_waits_for_verified_capture_and_reconciles_cipher(self):
+        self.age()
+        self.change_policy()
+        material, origin = self.capture()
+        identifier = material["id"]
+        cipher = self.state / "custody" / (identifier + ".age")
+        clear = [origin / name for name in ("a.jsonl", "nested/b.jsonl")]
+        original = {path: path.read_bytes() for path in [*clear, cipher]}
+        _, independent = self.export("independent-expiry")
+        now = "2026-02-10T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        with patch("healdan.retention.verified_capture", side_effect=Blocked("Fixture capture temporarily unavailable", 5)):
+            result = retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(result["status"], "pending", result)
+        self.assertEqual({item["material"] for item in result["pending"]}, {identifier})
+        self.assertTrue(any("temporarily unavailable" in item["reason"] for item in result["pending"]))
+        self.assertEqual({path: path.read_bytes() for path in [*clear, cipher]}, original)
+        self.assertFalse(independent.exists())
+
+        unlink = Path.unlink
+
+        def interrupt_cipher(path, *args, **kwargs):
+            if path == cipher:
+                raise SystemExit("interrupted before the ciphertext unlink")
+            return unlink(path, *args, **kwargs)
+
+        with patch("healdan.retention.verified_capture", wraps=custody.verified_capture) as verified, \
+                patch.object(Path, "unlink", interrupt_cipher), self.assertRaises(SystemExit):
+            retention.execute(self.vault, plan["id"], now)
+        self.assertEqual(verified.call_count, len(clear))
+        self.assertFalse(any(path.exists() for path in clear))
+        self.assertEqual(cipher.read_bytes(), original[cipher])
+        reconciled = custody.materials(self.vault)[identifier]
+        clear_proofs = [copy["deletion_receipt"] for copy in reconciled["copies"][1:]]
+        self.assertTrue(all(reconciled["copies"][i]["status"] == "deleted" for i in (1, 2)))
+
+        with patch("healdan.retention.verified_capture", side_effect=Blocked("Fixture age temporarily unavailable", 5)) as verified:
+            completed = retention.execute(self.vault, plan["id"], now)
+        verified.assert_not_called()
+        self.assertEqual(completed["status"], "complete", completed)
+        self.assertFalse(cipher.exists())
+        self.assertEqual([copy["deletion_receipt"] for copy in custody.materials(self.vault)[identifier]["copies"][1:]], clear_proofs)
+
     def test_shared_checkpoints_protect_both_captures_and_reconcile_every_slot(self):
         self.age()
         self.change_policy()
