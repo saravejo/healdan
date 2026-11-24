@@ -28,6 +28,14 @@ class OriginalAdmission(VaultTest):
         return [row["payload"] for path in (self.vault.control / "receipts").glob("*.json")
                 if (row := read_json(path))["kind"] == "zero-byte-archive"]
 
+    def expiring_export(self, identifier, *copies):
+        record = {"id": identifier, "kind": "export", "classification": "common",
+                  "captured_at": "2026-04-01T00:00:00Z", "holds": [], "dependencies": [],
+                  "copies": [{"root": str(root), "path": relative, "kind": kind, "status": "present",
+                              "sha256": digest((root / relative).read_bytes())} for root, relative, kind in copies]}
+        custody.save_material(self.vault, record)
+        return record
+
     def source_proposal(self, body):
         identifier, = reserve(self.vault, "F", 1, str(uuid4()))
         task = tasks.create(self.vault, "Preserve a source without promoting claims")
@@ -187,6 +195,116 @@ class OriginalAdmission(VaultTest):
         result = retention.execute(self.vault, plan["id"], now)
         self.assertIn("Active hold", result["entries"][0]["error"])
         self.assertEqual(archive.read_bytes(), b"")
+
+    def test_retention_preserves_paths_of_pending_archive_moves(self):
+        source_path = "inbox/a/nota.txt"
+        sha = self.triage_empty(source_path)
+        source = self.root / source_path
+        archive_path = f"{sha}/nota.txt"
+        destination = self.root / "archive" / archive_path
+        atomic(destination, b"")
+        tracked = self.expiring_export("archive-move", (self.root / "inbox", "a/nota.txt", "export"),
+                                       (self.root / "archive", archive_path, "archive"))
+        other = self.state / "custody" / "independent.age"
+        atomic(other, b"")
+        self.expiring_export("independent", (other.parent, other.name, "ciphertext"))
+        now = "2026-04-15T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        self.assertEqual(len(plan["entries"]), 3)
+        unlink = Path.unlink
+
+        def interrupt_before_remove(path, *args, **kwargs):
+            if path == source:
+                raise OSError("interrupted before removing Inbox copy")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", interrupt_before_remove), self.assertRaisesRegex(OSError, "interrupted"):
+            inbox.archive_empty(self.vault, sha)
+        fresh = retention.plan(self.vault, now)
+        self.assertEqual([entry["material"] for entry in fresh["entries"]], ["independent"])
+        results = retention.execute(self.vault, plan["id"], now)["entries"]
+        self.assertEqual([entry["status"] for entry in results], ["pending", "pending", "deleted"])
+        self.assertTrue(all("Inbox archive move is pending" in entry["error"] for entry in results[:2]))
+        self.assertEqual(source.read_bytes(), b"")
+        self.assertEqual(destination.read_bytes(), b"")
+        self.assertFalse(other.exists())
+
+        linked = self.expiring_export("shared-export", (self.root / "inbox", "a/nota.txt", "export"))
+        hold = custody.hold(self.vault, linked["id"], "Preserve shared copy", "human")
+        save = custody.save_material
+
+        def interrupt_after_first_custody(vault, material):
+            save(vault, material)
+            if material["id"] == tracked["id"]:
+                raise OSError("interrupted before archive receipt")
+
+        with patch("healdan.custody.save_material", side_effect=interrupt_after_first_custody), self.assertRaisesRegex(OSError, "interrupted"):
+            inbox.archive_empty(self.vault, sha)
+        self.assertFalse(source.exists())
+        self.assertEqual(self.archive_receipts(), [])
+        self.assertEqual(custody.materials(self.vault)[linked["id"]]["copies"][0]["status"], "present")
+        self.assertEqual(retention.plan(self.vault, now)["entries"], [])
+        results = retention.execute(self.vault, plan["id"], now)["entries"]
+        self.assertEqual([entry["status"] for entry in results], ["moved", "pending", "deleted"])
+        self.assertEqual(destination.read_bytes(), b"")
+        inbox.archive_empty(self.vault, sha)
+        self.assertEqual(len(self.archive_receipts()), 1)
+        saved = custody.materials(self.vault)[tracked["id"]]
+        self.assertEqual(custody.retention_deadline(saved), custody.retention_deadline(tracked))
+        held_result = retention.execute(self.vault, plan["id"], now)
+        self.assertIn("Active hold", held_result["entries"][1]["error"])
+        self.assertEqual(destination.read_bytes(), b"")
+        custody.release_hold(self.vault, linked["id"], hold["id"], [])
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertFalse(destination.exists())
+
+    def test_retention_checks_holds_on_shared_origin_and_archive_paths(self):
+        source = "inbox/nota.txt"
+        sha = self.triage_empty(source)
+        archived = f"{sha}/nota.txt"
+        atomic(self.root / "archive" / archived, b"")
+        free = self.expiring_export("free", (self.root / "inbox", "nota.txt", "export"),
+                                    (self.root / "archive", archived, "archive"))
+        shared = self.expiring_export("held", (self.root, source, "export"),
+                                      (self.root, "archive/" + archived, "export"))
+        hold = custody.hold(self.vault, shared["id"], "Preserve shared copies", "human")
+        now = "2026-04-15T00:00:00Z"
+        plan = retention.plan(self.vault, now)
+        result = retention.execute(self.vault, plan["id"], now)
+        ours = [entry for entry in result["entries"] if entry["material"] == free["id"]]
+        self.assertEqual([entry["status"] for entry in ours], ["pending", "pending"])
+        self.assertTrue(all("Active hold" in entry["error"] for entry in ours))
+        self.assertEqual((self.root / source).read_bytes(), b"")
+        self.assertEqual((self.root / "archive" / archived).read_bytes(), b"")
+        self.assertEqual(custody.materials(self.vault)[shared["id"]]["holds"], [hold])
+
+    def test_stale_deleted_copy_plan_preserves_reused_archive_destination(self):
+        first = "inbox/a/nota.txt"
+        sha = self.triage_empty(first)
+        material = self.expiring_export("archive-copy", (self.root / "inbox", "a/nota.txt", "export"))
+        inbox.archive_empty(self.vault, sha)
+        now = "2026-04-15T00:00:00Z"
+        old = retention.plan(self.vault, now)
+        deletion = retention.plan(self.vault, now)
+        self.assertEqual(retention.execute(self.vault, deletion["id"], now)["status"], "complete")
+        destination = self.root / "archive" / sha / "nota.txt"
+        self.assertFalse(destination.exists())
+        second = "inbox/b/nota.txt"
+        atomic(self.root / second, b"")
+        inbox.inventory(self.vault)
+        inbox.archive_empty(self.vault, sha)
+        new = retention.plan(self.vault, now)
+        self.assertNotEqual(old["entries"][0]["copy_index"], new["entries"][0]["copy_index"])
+        path = self.vault.control / "materials.json"
+        before = path.read_bytes()
+        result = retention.execute(self.vault, old["id"], "2026-04-16T00:00:00Z")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["entries"][0]["status"], "deleted")
+        old_copy = custody.materials(self.vault)[material["id"]]["copies"][old["entries"][0]["copy_index"]]
+        self.assertEqual(result["entries"][0]["at"], old_copy["deleted_at"])
+        self.assertEqual(destination.read_bytes(), b"")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(self.archive_receipts()), 2)
 
     def test_original_bytes_survive_stage_commit_checkout_and_locators(self):
         git(self.root, "config", "core.autocrlf", "true")

@@ -7,6 +7,7 @@ from . import admission, custody
 from .core import Blocked, atomic, digest, read_json, require, safe_path, stamp, sync_directory, utc
 
 EXCLUDED = {"inbox/agent-activities-today.md", "inbox/manual-activities-today.md", "inbox/agent-dashboard.html"}
+ARCHIVE_JOURNAL = "zero-byte-archive.json"
 
 
 def ordinary(path):
@@ -124,6 +125,15 @@ def findings(item, now=None):
     return result
 
 
+def pending_archive_paths(vault):
+    pending = read_json(safe_path(vault.control, ARCHIVE_JOURNAL), {})
+    paths = set()
+    for move in pending.values():
+        roots = (vault.relocated_path(move["worktree"]),) if "worktree" in move else vault.repository.worktree_roots()
+        paths.update(root / move["payload"][key] for root in roots for key in ("source", "destination"))
+    return paths
+
+
 def archive_empty(vault, sha256):
     with vault.locked():
         path = vault.control / "inbox.json"
@@ -134,13 +144,17 @@ def archive_empty(vault, sha256):
         current, _ = classification.current(sha256)
         require(sha256 == digest(b"") and item["size"] == 0 and current == "common",
                 "Only zero-byte ordinary material may auto-archive", 5)
-        journal_path = vault.control / "zero-byte-archive.json"
+        journal_path = safe_path(vault.control, ARCHIVE_JOURNAL)
         pending = read_json(journal_path, {})
         moves = []
         for relative in item["paths"]:
             require(ordinary(relative), "Only ordinary Inbox material may auto-archive", 5)
             source = safe_path(vault.root, relative)
-            if not source.exists() and relative not in pending:
+            move = pending.get(relative)
+            if move and "worktree" in move:
+                require(vault.relocated_path(move["worktree"]) == vault.root,
+                        "Retry the pending archive move in its original worktree: " + relative, 5)
+            if not source.exists() and not move:
                 continue
             target_name = f"archive/{sha256}/{Path(relative).name}"
             target = empty_archive_target(vault, relative, target_name)
@@ -153,11 +167,12 @@ def archive_empty(vault, sha256):
             payload = {"source": relative, "destination": target_name, "sha256": sha256, "size": 0}
             move = pending.get(relative)
             if move is None:
-                move = {"at": stamp(), "payload": payload}
+                move = {"at": stamp(), "payload": payload, "worktree": str(vault.root)}
                 pending[relative] = move
                 atomic(journal_path, pending)
             require(move["payload"] == payload, "Archive journal differs from the requested move", 5)
-            receipt_id = digest({"kind": "zero-byte-archive", **move})
+            receipt_fields = {"at": move["at"], "payload": payload}
+            receipt_id = digest({"kind": "zero-byte-archive", **receipt_fields})
             if receipt_id not in item["receipts"]:
                 # An existing destination may have appeared after the preflight.
                 create_empty_archive(vault, relative, target_name)
@@ -171,7 +186,7 @@ def archive_empty(vault, sha256):
                 custody.record_archive_move(vault, classification.links.get(sha256, []), move, receipt_id)
                 receipt = vault.receipt("zero-byte-archive", payload, at=move["at"])
                 item["receipts"].append(receipt)
-                item.setdefault("archive_moves", []).append({**move, "receipt": receipt})
+                item.setdefault("archive_moves", []).append({**receipt_fields, "receipt": receipt})
                 atomic(path, items)
             del pending[relative]
             atomic(journal_path, pending)
