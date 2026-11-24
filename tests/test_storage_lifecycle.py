@@ -206,7 +206,7 @@ class StorageLifecycle(VaultTest):
         material["copies"][1]["status"] = "deleted"
         custody.save_material(self.vault, material)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
-            backups.verify_backup(self.vault, identifier)
+            backups.inspect_backup(self.vault, material)
         self.assertIn("verified deletion receipt", linting.lint(self.vault)["findings"][f"custody:{identifier}"]["message"])
 
         material["copies"][1]["status"] = "present"
@@ -237,7 +237,7 @@ class StorageLifecycle(VaultTest):
         material["copies"][1]["deletion_receipt"] = replacement
         custody.save_material(self.vault, material)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
-            backups.verify_backup(self.vault, identifier)
+            backups.inspect_backup(self.vault, material)
         atomic(plan_path, before)
         material["copies"][1]["deletion_receipt"] = replica_receipt
         custody.save_material(self.vault, material)
@@ -263,13 +263,13 @@ class StorageLifecycle(VaultTest):
         material["copies"][1].update(status="deleted", deleted_at=stamp(cutoff))
         custody.save_material(self.vault, material)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
-            backups.verify_backup(self.vault, identifier)
+            backups.inspect_backup(self.vault, material)
         plan.update(status="pending")
         plan["entries"][0].update(status="pending", error="Copy destination is offline", at=stamp(cutoff))
         plan["entries"][1].update(status="deleted", at=stamp(cutoff))
         atomic(path, plan)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
-            backups.verify_backup(self.vault, identifier)
+            backups.inspect_backup(self.vault, material)
         offline = first.with_name("legacy primary offline")
         first.rename(offline)
         try:
@@ -294,11 +294,11 @@ class StorageLifecycle(VaultTest):
         plan["entries"][1]["at"] = stamp(cutoff + timedelta(seconds=1))
         atomic(path, plan)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
-            backups.verify_backup(self.vault, identifier)
+            backups.inspect_backup(self.vault, material)
         atomic(path, history[path])
         atomic(lost, cipher)
         with self.assertRaisesRegex(Blocked, "verified deletion receipt"):
-            backups.verify_backup(self.vault, identifier)
+            backups.inspect_backup(self.vault, material)
         self.assertEqual(lost.read_bytes(), cipher)
         self.assertEqual(custody.materials(self.vault)[identifier]["approval"], original["approval"])
         lost.unlink()

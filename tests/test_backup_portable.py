@@ -2,6 +2,7 @@
 from datetime import timedelta
 import os
 from pathlib import Path
+import sys
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -34,7 +35,6 @@ class BackupPortable(VaultTest):
                                        state=state or self.base / "recovered-state", remap=remap, **self.trust)
 
     def portable_cli(self, *args, paths, state):
-        import sys
         manifest, replica = paths
         result = run([sys.executable, "-m", "healdan", "--state", state, *args,
                       "--manifest", manifest, "--replica", replica, "--age-identity", self.identities[1],
@@ -210,6 +210,7 @@ class BackupPortable(VaultTest):
                          ["unavailable", "verified"])
         atomic(replica, cipher)
         receipt = self.vault.control / "receipts" / (record["copies"][0]["publication_receipt"] + ".json")
+        original_receipt = receipt.read_bytes()
         atomic(receipt, {"kind": "changed first publication receipt"})
         report = backups.verify_backup(self.vault, record["id"])
         self.assertEqual([entry["status"] for entry in report["replicas"]], ["invalid", "verified"])
@@ -218,6 +219,33 @@ class BackupPortable(VaultTest):
             backups.signed_manifest(self.vault, record)
         result = backups.restore(self.vault, record["id"], self.base / "fallback-after-invalid-receipt")
         self.assertEqual(result["replica"], str(self.paths(record, 1)[1]))
+        atomic(receipt, original_receipt)
+
+        second_destination = self.destinations[1]
+        offline = second_destination.rename(self.base / "temporarily-offline")
+        after_expiry = utc(record["expires_at"]) + timedelta(seconds=1)
+        plan = retention.plan(self.vault, after_expiry)
+        self.assertEqual(retention.execute(self.vault, plan["id"], after_expiry)["status"], "pending")
+        offline.rename(second_destination)
+        current = custody.materials(self.vault)[record["id"]]
+        self.assertEqual([entry["status"] for entry in backups.verify_backup(self.vault, record["id"])["replicas"]],
+                         ["deleted", "verified"])
+        deletion = self.vault.control / "receipts" / (current["copies"][0]["deletion_receipt"] + ".json")
+        deletion.unlink()
+        report = backups.verify_backup(self.vault, record["id"])
+        self.assertEqual([entry["status"] for entry in report["replicas"]], ["invalid", "verified"])
+        self.assertEqual(report["deleted_copies"], [])
+        self.assertIn("lacks a verified deletion receipt", report["replicas"][0]["reason"])
+        with self.assertRaisesRegex(Blocked, "lacks a verified deletion receipt"):
+            backups.inspect_backup(self.vault, current)
+        self.assertEqual(retention.execute(self.vault, plan["id"], after_expiry)["status"], "pending")
+        destination = self.base / "fallback-after-invalid-deletion-proof"
+        self.assertEqual(backups.restore(self.vault, record["id"], destination)["replica"], str(self.paths(record, 1)[1]))
+        atomic(self.paths(record, 1)[1], b"last replica changed")
+        unavailable = self.base / "failed-without-a-verified-replica"
+        with self.assertRaisesRegex(Blocked, "no verified retained replicas.+verified deletion receipt.+ciphertext mismatch"):
+            backups.restore(self.vault, record["id"], unavailable)
+        self.assertFalse(unavailable.exists())
 
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
@@ -620,7 +648,20 @@ class BackupPortable(VaultTest):
         eligible = self.conversation("eligible", closed_at=now)
         unknown = self.conversation("unknown-deadline")
         deadline = now + timedelta(days=30)
-        record = self.create("short", deadline - timedelta(seconds=1), [eligible["id"]])
+        working = self.base / "unrelated-launch-directory"
+        ordinary = working / "ordinary.txt"
+        unrelated = b"Independent file outside the controller"
+        atomic(ordinary, unrelated)
+        homonym = working / "conversation.jsonl"
+        os.link(ordinary, homonym)
+        result = run([sys.executable, "-m", "healdan", "--vault", self.root, "--state", self.state,
+                      "backup", "create", "--kind", "short", "--expires-at", stamp(deadline - timedelta(seconds=1)),
+                      "--members", eligible["id"]], cwd=working, env=controller_environment(), check=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stderr, b"")
+        self.assertTrue(ordinary.samefile(homonym))
+        self.assertEqual(ordinary.read_bytes(), unrelated)
+        record = decode(result.stdout)
         new = self.restore(record)
         recovered = Vault(new["destination"], new["state"])
         current = custody.materials(recovered)[eligible["id"]]
@@ -680,6 +721,16 @@ class BackupPortable(VaultTest):
         self.assertTrue(cipher.is_file())
         self.assertFalse(manifest.exists())
         self.assertEqual([copy["status"] for copy in pending["copies"]], ["present", "planned"])
+        written = cipher.read_bytes()
+        self.policy("off")
+        with self.assertRaisesRegex(Blocked, "disabled by policy"):
+            backups.reconcile(self.vault, pending["id"])
+        self.assertFalse(manifest.exists())
+        self.assertEqual(cipher.read_bytes(), written)
+        self.assertEqual(custody.materials(self.vault)[pending["id"]], pending)
+        self.assertEqual(backups.verify_backup(self.vault, original["id"])["status"], "complete")
+        self.assertEqual(backups.reconcile(self.vault, original["id"])["status"], "complete")
+        self.policy("manual")
         done = backups.reconcile(self.vault, pending["id"])
         self.assertEqual(done["status"], "complete")
         self.assertTrue(manifest.is_file())
@@ -687,3 +738,27 @@ class BackupPortable(VaultTest):
             self.assertTrue(copy["publication_receipt"])
         for index, pair in enumerate(originals):
             self.assertEqual(tuple(path.read_bytes() for path in self.paths(original, index)), pair)
+
+        self.policy(permanent=True)
+        member = self.conversation("finite-after-policy-change", closed_at=utc())
+        with patch("healdan.backups.atomic", side_effect=stop_manifest), self.assertRaisesRegex(OSError, "between age"):
+            self.create("short", "permanent", [member["id"]])
+        short, = [item for item in custody.materials(self.vault).values() if item.get("status") == "writing"]
+        short_manifest, short_cipher = self.paths(short, 1)
+        sealed = short_cipher.read_bytes()
+        self.policy(permanent=False)
+        with self.assertRaisesRegex(Blocked, "precede every finite material deadline"):
+            backups.reconcile(self.vault, short["id"])
+        self.assertFalse(short_manifest.exists())
+        self.assertEqual(short_cipher.read_bytes(), sealed)
+        self.assertEqual(custody.materials(self.vault)[short["id"]], short)
+        self.policy(permanent=True)
+        changed_member = {**member, "cipher_sha256": "f" * 64}
+        custody.save_material(self.vault, changed_member)
+        with self.assertRaisesRegex(Blocked, "differs from its current custody ciphertext"):
+            backups.reconcile(self.vault, short["id"])
+        self.assertFalse(short_manifest.exists())
+        custody.save_material(self.vault, member)
+        finished = backups.reconcile(self.vault, short["id"])
+        self.assertEqual(finished["approval"], short["publication"])
+        self.assertEqual(short_cipher.read_bytes(), sealed)
