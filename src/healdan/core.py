@@ -8,6 +8,7 @@ import math
 import os
 import platform
 from pathlib import Path
+from secrets import token_hex
 import shutil
 import stat
 import subprocess
@@ -157,13 +158,18 @@ def canonical_storage_path(path):
         raise Blocked(message, 5) from exc
 
 
-def atomic(path, data):
+def atomic(path, data, *, mode=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     require(not path.is_symlink(), "Refusing symlink destination")
     if not isinstance(data, bytes):
         data = canonical(data) + b"\n"
-    fd, name = tempfile.mkstemp(prefix=".healdan-", dir=path.parent)
+    if mode is None:
+        fd, name = tempfile.mkstemp(prefix=".healdan-", dir=path.parent)
+    else:
+        # Creation applies the process umask without changing it.
+        name = path.parent / (".healdan-" + token_hex(16))
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(data)

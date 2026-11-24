@@ -82,7 +82,7 @@ def _operating_roots(vault):
 
     roots = {vault.root, vault.repository.primary}
     for task in all_tasks(vault):
-        if task["state"] not in {"closed", "cancelled"} and not task.get("worktree_removed"):
+        if task["state"] not in {"closed", "cancelled", "reconciliation_required"} and not task.get("worktree_removed"):
             worktree = Repository.open(Path(task["worktree"]))
             require(worktree.common == vault.common and worktree.primary == vault.repository.primary,
                     "Active task worktree belongs to another Git repository", 5)
@@ -142,6 +142,22 @@ def check(vault, capabilities):
     if (vault.control / "materials.json").exists() or (vault.root / "control/repository.bundle").exists():
         needs("archive", "healdan-tree-v1")
     from .custody import materials
+    from .backup_snapshot import FORMAT as BACKUP_ARCHIVE, MANIFEST as BACKUP_MANIFEST
+    from .backup_snapshot import RECOVERY_HISTORY, historical_paths
+    from .backup_recovery import JOURNAL as BACKUP_RESTORE
 
-    if any(copy.get("status") == "absent" for record in materials(vault).values() for copy in record.get("copies", [])):
+    records = materials(vault)
+    if any(record.get("format") == BACKUP_MANIFEST for record in records.values()):
+        needs("archive", BACKUP_ARCHIVE)
+        needs("journal", BACKUP_MANIFEST)
+    if any("origin_binding_sha256" in record for record in records.values()) or any(
+            name.endswith(".manifest.json") for name in historical_paths(vault.control, folders=("",))):
+        needs("journal", RECOVERY_HISTORY)
+    restored = read_json(safe_path(vault.control, "restored-from.json"), {})
+    if restored.get("format") == BACKUP_RESTORE:
+        needs("journal", BACKUP_RESTORE)
+        if any("origin_status" in copy for record in records.values() for copy in record.get("copies", [])):
+            needs("archive", BACKUP_ARCHIVE)
+
+    if any(copy.get("status") == "absent" for record in records.values() for copy in record.get("copies", [])):
         needs("journal", "healdan-backup-writing-absence-v1")

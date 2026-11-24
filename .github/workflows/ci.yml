@@ -56,7 +56,7 @@ jobs:
           - profile: macos
             runner: macos-15
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.profile == 'windows' && 40 || 20 }}
     steps:
       - name: Require the package from this attempt
         shell: bash

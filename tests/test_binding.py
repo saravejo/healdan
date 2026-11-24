@@ -297,6 +297,10 @@ class VaultBinding(VaultTest):
             self.assertTrue(Path(tasks.get_session(vault, session["operation"])["proposal"]).is_dir())
             self.assertEqual(backups.verify_backup(vault, backup["id"])["copies"][0]["root"],
                              str(next_state / destination.name))
+            stored_backup = custody.materials(vault)[backup["id"]]
+            strict = backups.inspect_backup(vault, stored_backup)
+            self.assertEqual([entry["root"] for entry in strict["copies"]],
+                             [str(next_state / destination.name), str(external_destination)])
             self.assertEqual((vault.control / material_file.name).read_bytes(), captured_material)
             self.assertEqual((vault.control / "deletions" / deletion_file.name).read_bytes(), captured_deletion)
             schedule = plistlib.loads((next_state / "launchd" / plist.name).read_bytes())
@@ -304,9 +308,9 @@ class VaultBinding(VaultTest):
             self.assertEqual(schedule["StandardOutPath"], str(next_state / "lint.out"))
             root, state = next_root, next_state
         restored = self.base / "restored vault"
-        backups.restore(vault, backup["id"], restored)
         isolated = self.base / "restored state"
+        backups.restore(vault, backup["id"], restored, state=isolated)
         adoption = binding.adopt(restored, isolated)
-        self.assertEqual(adoption["provenance"][0]["kind"], "restored-backup")
-        binding.adopt(restored, isolated, adoption["confirmation"])
-        self.assertNotEqual(Vault(restored).identity, vault.identity)
+        self.assertEqual(adoption["status"], "already-bound")
+        self.assertEqual(Vault(restored).identity, vault.identity)
+        self.assertEqual(Vault(restored).state, isolated)

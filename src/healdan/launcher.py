@@ -26,7 +26,11 @@ def runtime_version(vault):
 
 
 def validate_runtime(vault, version, node):
-    require(version == vault.policy["srt_version"], "srt version differs from pinned policy", 5)
+    validate_runtime_versions(version, node, vault.policy["srt_version"])
+
+
+def validate_runtime_versions(version, node, expected_srt):
+    require(version == expected_srt, "srt version differs from pinned policy", 5)
     parts = node.removeprefix("v").split(".")
     require(len(parts) == 3 and all(part.isascii() and part.isdecimal() for part in parts) and
             tuple(map(int, parts)) >= (22, 12, 0), "Node.js 22.12+ is required", 5)
@@ -126,6 +130,7 @@ def profile(vault, operation):
 
 def _profile(vault, operation):
     session = get_session(vault, operation)
+    require(not session.get("reconciliation"), "Restored session requires an explicit recovery reconstruction", 5)
     directory = vault.state / "tasks" / session["task"] / "temporary" / session["role"] / session["uuid"] / "native"
     directory.mkdir(parents=True, exist_ok=True)
     config = directory / "settings.json"

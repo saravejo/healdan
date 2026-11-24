@@ -28,6 +28,7 @@ JSON. `--help` lists exact arguments.
 | `task present ID --question TEXT --receipt TEXT` | Record successful human presentation and start waiting clock |
 | `task close ID` | Verified encrypted preservation, worktree removal, reconciled closure |
 | `task reconcile ID` | Preserve and dismantle an expired worktree while keeping the task/waiting clock |
+| `task reconcile-restored ID --confirm` | Verify recovered custody, close a restored task, and release its writing capacity |
 | `task answer ID DECISION.json` | Sign a timely human response without resetting worktree age |
 | `task reopen ID DECISION.json` | Explicitly link a new task to a reconciled closed task and carry prior consumption |
 | `session create TASK --role ROLE --action-name ACTION --context FILE` | Measure context; allocate S-/UUID and external profile identity |
@@ -58,11 +59,27 @@ JSON. `--help` lists exact arguments.
 | `maintenance schedule [--activate]` | Generate/activate local-calendar launchd jobs after readiness |
 | `maintenance prepare-launchd-trial DIRECTORY` | Create a disposable vault and state for the launchd trial with the target build |
 | `maintenance schedule --trial [--activate]` | Generate/activate isolated launchd jobs from a prepared disposable trial vault |
-| `backup create --kind long --expires-at UTC` | Encrypted generation to all configured destinations. Use `permanent` for explicit permanent expiry |
-| `backup verify ID`, `restore ID DESTINATION` | Verify every copy and restore to a fresh directory |
+| `backup create --kind long --expires-at UTC` | Publish a signed manifest and encrypted snapshot in each configured destination. Use `permanent` for explicit permanent expiry |
+| `backup create --kind short --expires-at UTC --members ID ...` | Include the encrypted bodies of the specified eligible captures |
+| `backup verify ID`, `restore ID DESTINATION` | Report the state of each known replica and recover from the first verified copy. Use `--recovery-state PATH` to choose the external state for a restore by ID |
+| `backup reconcile ID` | Resume an interrupted portable publication using a verified ciphertext from its recorded destinations |
 | `migration inventory`, `migration purge-check` | Read-only legacy/width inventory and purge prerequisites |
 | `migration preview` | Verify signed cases and inspection records, then report compatible projections and pending fields |
 | `migration sign-alias INPUT.json --output SIGNED.json` | Same-identity alias with a human signed decision |
+
+`maintenance plan` returns code `5` when it reports per-material inventory
+findings in `pending`. It saves the plan for entries whose discovery completed.
+
+`maintenance daily` reports a restored task that needs explicit reconciliation
+in `pending` and leaves its clocks untouched. Independent retention and backup
+work still runs. Use `task reconcile-restored ID --confirm` to close the task.
+
+With a verified retained replica, `backup verify ID` returns its JSON inventory
+report. It returns code `0` when every known replica is verified or has verified
+deletion proof. It reports `status: pending` and returns `4` when replicas are
+unavailable, or `5` when a replica or the inventory is invalid. It fails with
+code `5` when no retained replica verifies. `restore ID DESTINATION` can still
+complete from a verified replica and reports the known replica findings.
 
 To set an independent backup and retention policy, supply a reason and both
 modes in the policy request. For example, an installation without scheduled or

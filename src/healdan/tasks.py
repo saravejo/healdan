@@ -6,7 +6,7 @@ import shutil
 from uuid import uuid4
 
 from .binding import project_record
-from .core import atomic, decode, digest, git, json_paths, jsonl, read_json, require, safe_path, stamp, utc
+from .core import Blocked, atomic, decode, digest, git, json_paths, jsonl, read_json, require, safe_path, stamp, utc
 from .ids import reserve
 from . import originals
 
@@ -27,8 +27,14 @@ def age_status(task, now=None):
 
 
 def require_active(task, now=None):
+    require_reconciled(task)
     require(task["state"] in {"active", "waiting"} and age_status(task, now) != "expired",
             "Task/worktree cannot perform new actions or integrations", 5)
+
+
+def require_reconciled(task):
+    require(task.get("state") != "reconciliation_required",
+            "Restored task requires reconciliation. Use task reconcile-restored ID --confirm", 5)
 
 
 def task_ids(vault):
@@ -135,6 +141,7 @@ def present(vault, task_id, question, delivery_receipt, now=None):
     require(delivery_receipt and question, "Successful presentation receipt and question are required", 2)
     with vault.locked():
         task = get_task(vault, task_id)
+        require_reconciled(task)
         require(task["state"] not in {"closed", "cancelled"}, "Task is already closed", 5)
         require(not task.get("presented_at"), "Waiting question already presented", 5)
         task.update(state="waiting", question=question, delivery_receipt=delivery_receipt, presented_at=stamp(now))
@@ -174,6 +181,7 @@ def reopen(vault, task_id, decision):
 
 
 def reconcile_clock(vault, task, now=None):
+    require_reconciled(task)
     now = utc(now)
     updates = []
     if age_status(task, now) == "expired" and task["state"] not in {"closed", "cancelled"}:
@@ -198,6 +206,7 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
     from .custody import capture_tree, materials, verified_capture
     with vault.locked():
         task = get_task(vault, task_id)
+        require_reconciled(task)
         if task.get("closed_at") and not task.get("capacity_held"):
             return task
         require(not task.get("processes"), "Processes require reconciliation before closure", 5)
@@ -249,8 +258,138 @@ def preserve_and_close(vault, task_id, *, reason="completed"):
         return task
 
 
+def restored_task_origin(vault, task):
+    from .backup_recovery import JOURNAL, JOURNAL_FILE, reconcile_task
+    from .backup_snapshot import STATE, identifier
+    from .lineage import sha256
+
+    origin = task.get("reconciliation")
+    require(task["state"] == "reconciliation_required" and isinstance(origin, dict) and identifier(origin.get("backup")),
+            "Restored task reconciliation is unavailable for this task", 5)
+    journal = read_json(safe_path(vault.state, JOURNAL_FILE), {})
+    require(journal.get("format") == JOURNAL and journal.get("phase") == "complete" and
+            journal.get("origin", {}).get("vault") == vault.identity and sha256(journal.get("receipt")),
+            "Portable backup recovery must complete before task reconciliation", 5)
+    receipt = read_json(safe_path(vault.control, f"receipts/{journal['receipt']}.json"), {})
+    require(digest(receipt) == journal["receipt"] and receipt.get("kind") == "backup-restored" and
+            all(receipt["payload"].get(key) == value for key, value in journal["origin"].items()),
+            "Portable backup recovery receipt is unavailable or differs from the journal", 5)
+    generation = journal["origin"].get("backup")
+    require(identifier(generation), "Portable backup recovery generation is invalid", 5)
+    manifest = safe_path(vault.control, f"historical/{generation}.manifest.json", exists=True).read_bytes()
+    inventory = journal["inventory"]
+    require(digest(manifest) == journal["origin"].get("manifest_sha256") and
+            digest(inventory) == decode(manifest)["payload"]["inventory_sha256"],
+            "Portable backup recovery inventory differs from the authenticated manifest", 5)
+
+    filename = "tasks/" + task["id"] + ".json"
+    primary = "historical/" + filename
+    latest = f"historical/generations/{generation}/{filename}" if STATE + primary in inventory else primary
+    for name in (primary, f"historical/generations/{origin['backup']}/{filename}"):
+        entry = inventory.get(STATE + (filename if name == latest else name), {})
+        path = safe_path(vault.control, name)
+        if path.is_file():
+            raw = path.read_bytes()
+            checksum = digest(raw)
+            if checksum != entry.get("sha256"):
+                continue
+            source = decode(raw)
+            if (all(source.get(key) == task[key] for key in ("id", "created_at", "sessions")) and
+                    reconcile_task(source, origin["backup"]).get("reconciliation") == origin):
+                return source, checksum, journal["receipt"]
+    require(False, "Restored task origin record is unavailable or differs from reconciliation evidence", 5)
+
+
+def verified_restored_custody(vault, source, sessions):
+    from .custody import materials, verified_capture
+    from .retention import require_custody_inventory
+
+    task_id = source["id"]
+    records = materials(vault)
+    expected = [(source.get(field), None) for field in ("preservation", "expiry_preservation")]
+    expected.extend((session.get("preservation"), session["operation"]) for session in sessions)
+    for capture, session in expected:
+        if capture:
+            record = records.get(capture, {})
+            require(record.get("id") == capture and record.get("kind") == "conversation" and
+                    record.get("task") == task_id and record.get("session") == session,
+                    "Recorded preservation does not belong to this task or session", 5)
+    verified = {}
+    for key, record in sorted(records.items()):
+        if record.get("task") != task_id or record.get("kind") != "conversation":
+            continue
+        require(record.get("id") == key, "Task custody material identity changed", 5)
+        # A recovered copy has its own local inventory slot. Origin slots are evidence.
+        copies = [copy for copy in record["copies"] if copy["kind"] == "ciphertext" and copy["status"] == "present" and
+                  vault.relocated_path(copy["root"]) == vault.state / "custody"]
+        try:
+            require_custody_inventory(record)
+            verified_capture(vault, {**record, "copies": copies})
+        except Blocked as exc:
+            raise Blocked(f"Task custody material {key} requires verification. {exc}", exc.code) from exc
+        verified[key] = record["cipher_sha256"]
+    return verified
+
+
+def reconcile_restored(vault, task_id, *, confirmed=False):
+    from .backup_snapshot import identifier
+    from .lineage import sha256
+
+    require(confirmed, "Use --confirm to close a restored task and release its capacity", 2)
+    require(identifier(task_id), "Invalid restored task ID", 2)
+    with vault.locked():
+        vault.no_transaction()
+        task = get_task(vault, task_id)
+        require(task["id"] == task_id, "Task identity does not match its record", 5)
+        receipt_kind = "task-restored-reconciled"
+        history = task.get("reconciliation_history", [])
+        if task["state"] in {"closed", "cancelled"} and not task["capacity_held"] and history:
+            receipt_id = history[-1].get("receipt")
+            require(sha256(receipt_id), "Restored task closure receipt is invalid", 5)
+            receipt = read_json(safe_path(vault.control, f"receipts/{receipt_id}.json"), {})
+            require(digest(receipt) == receipt_id and receipt.get("kind") == receipt_kind and
+                    receipt["payload"].get("task") == task_id and receipt["payload"].get("closed_at") == task["closed_at"],
+                    "Restored task closure receipt does not match its record", 5)
+            return task
+        source, source_sha, recovery_receipt = restored_task_origin(vault, task)
+        require(not task.get("processes"), "Local task processes require reconciliation before closure", 5)
+        workspace = vault.state / "tasks" / task_id
+        require(not any(path.is_symlink() or path.is_junction() for path in (workspace.parent, workspace)) and
+                not workspace.exists(), "Local task workspace requires preservation before closure", 5)
+        sessions = [get_session(vault, operation) for operation in task["sessions"]]
+        require(all(session["task"] == task_id and session["operation"] == operation and session.get("state") != "running" and
+                    not (session.get("active_profile") or session.get("launch_intent"))
+                    for operation, session in zip(task["sessions"], sessions, strict=True)),
+                "A task session is active locally or belongs to a different task", 5)
+        verified = verified_restored_custody(vault, source, sessions)
+
+        pending = task.get("restored_closure_pending")
+        at = pending["at"] if pending else stamp()
+        closed_at = source.get("closed_at") or at
+        require(closed_at == stamp(closed_at), "Restored task closure timestamp is invalid", 5)
+        reason = (pending["payload"]["closure_reason"] if pending else
+                  source.get("closure_reason") or task.get("closure_reason") or "restored_reconciliation")
+        state = "cancelled" if source["state"] == "cancelled" or reason == "human_timeout" else "closed"
+        payload = {"task": task_id, "origin_backup": task["reconciliation"]["backup"], "origin_task_sha256": source_sha,
+                   "recovery_receipt": recovery_receipt, "verified_captures": verified, "closed_at": closed_at,
+                   "closure_reason": reason, "state": state}
+        if pending is None:
+            task["restored_closure_pending"] = {"at": at, "payload": payload}
+            atomic(task_path(vault, task_id), task)
+        else:
+            require(pending == {"at": at, "payload": payload}, "Restored task closure evidence changed during reconciliation", 5)
+        receipt_id = vault.receipt(receipt_kind, payload, at=at)
+        origin = task.pop("reconciliation")
+        task.pop("restored_closure_pending")
+        task.update(state=state, closure_reason=reason, closed_at=closed_at, closure_pending=False, capacity_held=False,
+                    reconciliation_history=[*history, {"origin": origin, "receipt": receipt_id}])
+        atomic(task_path(vault, task_id), task)
+        return task
+
+
 def reconcile_processes(vault, task):
     """On macOS, stop only the supervised process identity recorded at launch."""
+    require_reconciled(task)
     import platform
     import signal
     import time
@@ -358,6 +497,7 @@ def reconcile_expired(vault, task_id, now=None):
     from .custody import capture_tree
     with vault.locked():
         task = get_task(vault, task_id)
+        require_reconciled(task)
         require(age_status(task, now) == "expired", "Worktree has not expired", 2)
         if task.get("worktree_removed"):
             return task

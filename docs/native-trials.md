@@ -107,6 +107,13 @@ the measured `environment`, `procedure`, `started_at`, `completed_at`, and
 claude-auth, native-resume, native-cleanup, offline-recovery and launchd.
 Failed/incomplete trials remain pending and cannot be signed as passed.
 
+Portable backup preserves the signed trial receipts as historical evidence.
+After restore, these files live under `historical/trials/` in the vault's Git
+control directory. Their signed measurements and artifact paths describe the
+origin. The external human signer policy must authorize the keys that signed
+the preserved evidence, including older keys after rotation. Run and attest
+the applicable trials on the recovered controller to establish its readiness.
+
 Run `python scripts/release_check.py --vault . --ci-run RUN_ID`. It checks the
 exact commit's successful CI, public-content audit and native signatures.
 Only then create the stable v1.0.0 tag/release at that validated commit.

@@ -3,9 +3,10 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from . import storage_policy
+from . import backup_snapshot, storage_policy
 from .core import Blocked, atomic, canonical_storage_path, digest, json_paths, read_json, require, safe_path, stamp, sync_directory, utc
-from .custody import INACTIVE_COPIES, materials, native_guard, save_material, verified_capture
+from .custody import INACTIVE_COPIES, material_copy_error, materials, native_guard, save_material, verified_capture
+from .lineage import sha256
 from .inbox import pending_archive_paths
 from .tasks import get_task
 
@@ -63,10 +64,13 @@ def recovery_hold(hold):
 
 
 def copy_path(vault, copy):
+    require(copy.get("status") != "unavailable", "Origin custody location is unavailable", 5)
     return canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"])
 
 
 def shares_path(vault, copy, target):
+    if copy.get("status") == "unavailable":
+        return False
     try:
         return copy_path(vault, copy) == target
     except (Blocked, OSError, ValueError, KeyError, TypeError) as original:
@@ -82,13 +86,25 @@ def shares_path(vault, copy, target):
 
 def copy_identity(copy):
     state = {"status", "deleted_at", "moved_at", "move_receipt", "archive_copy_index", "verified_archive_sha256",
-             "deletion_receipt", "absent_at", "absence_receipt"}
+             "deletion_receipt", "absent_at", "absence_receipt", "origin_status", "published_at", "publication_receipt"}
     return {key: value for key, value in copy.items() if key not in state}
 
 
 def active_slots(vault, inventory, location):
-    return [(record, index, copy) for record in inventory.values() for index, copy in enumerate(record.get("copies", []))
-            if copy["status"] not in INACTIVE_COPIES and shares_path(vault, copy, location)]
+    from .backups import check_portable_replica_inventory
+
+    slots = []
+    for identifier, record in inventory.items():
+        if record.get("format") == backup_snapshot.MANIFEST:
+            # A portable generation can own only its reserved ciphertext name, even when its slot path is lost.
+            names = {(name + ".age").casefold() for name in (identifier, record.get("id")) if isinstance(name, str)}
+            if location.name.casefold() not in names:
+                continue
+            require(record.get("id") == identifier, "Backup identity changed", 5)
+            check_portable_replica_inventory(vault, record)
+        slots.extend((record, index, copy) for index, copy in enumerate(record.get("copies", []))
+                     if copy["status"] not in INACTIVE_COPIES and shares_path(vault, copy, location))
+    return slots
 
 
 def generation_locator(material, index, copy):
@@ -148,6 +164,111 @@ def deletion_payload(entry, material, index):
     return {"material": material, "copy_index": index, "sha256": entry["copy"]["sha256"], "intent": entry.get("intent")}
 
 
+def legacy_round_deletion_proof(record, copy, index, deletion_plans, deletion_receipts):
+    deleted_at = copy.get("deleted_at")
+    if not isinstance(deleted_at, str):
+        return None
+    identity = copy_identity(copy)
+    plans = {}
+    for key, plan in deletion_plans:
+        try:
+            if (plan["id"] == key and plan["status"] in {"pending", "complete"} and plan_digest(plan) == plan["digest"] and
+                    utc(plan["created_at"]) <= utc(deleted_at) and any(
+                        entry["material"] == record["id"] and type(entry["copy_index"]) is int and entry["copy_index"] == index and
+                        entry["status"] == "deleted" and entry.get("at") == deleted_at and
+                        not ({"intent", "receipt"} & entry.keys()) and entry["copy"].get("status") == "present" and
+                        copy_identity(entry["copy"]) == identity for entry in plan["entries"])):
+                plans[plan["id"]] = plan["digest"]
+        except (Blocked, OSError, ValueError, KeyError, TypeError):
+            continue
+    if not plans:
+        return None
+    for key, receipt in deletion_receipts:
+        try:
+            if not isinstance(receipt, dict):
+                continue
+            payload = receipt.get("payload", {})
+            if (receipt.get("kind") == "deletion-round" and isinstance(payload, dict) and
+                    set(payload) == {"plan", "digest", "status"} and
+                    payload["plan"] in plans and payload["digest"] == plans[payload["plan"]] and
+                    payload["status"] in {"pending", "complete"} and utc(receipt["at"]) >= utc(deleted_at) and
+                    digest(receipt) == key):
+                return key
+        except (Blocked, OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def historical_deletion_plan(intent, plans):
+    matches = 0
+    for name, plan in plans:
+        if (not isinstance(plan, dict) or plan.get("digest") != intent["plan_digest"] or
+                name != f"deletions/{plan.get('id')}.json" or
+                plan.get("status") not in {"planned", "pending", "complete"} or plan_digest(plan) != plan["digest"]):
+            continue
+        matches += sum(entry.get("intent") == intent and type(entry.get("copy_index")) is int and
+                       list(slot(entry)) == intent["slot"] and
+                       (entry.get("status") == "deleted" or
+                        entry.get("status") == "deleting" and plan["status"] != "complete")
+                       for entry in plan["entries"])
+    return matches == 1
+
+
+def historical_backup_slot(record, index, copy):
+    # The snapshot verifier or the operational plan reader authenticates the legacy envelope.
+    approval = record.get("approval", {})
+    signed = approval.get("payload", {})
+    slots = signed.get("copies", [])
+    return (record.get("format") != backup_snapshot.MANIFEST and approval.get("namespace") == "backup" and
+            {key: value for key, value in record.items() if key not in {"approval", "copies"}} ==
+            {key: value for key, value in signed.items() if key != "copies"} and
+            isinstance(slots, list) and len(slots) == len(record["copies"]) and index < len(slots) and
+            isinstance(slots[index], dict) and copy_identity(slots[index]) == copy_identity(copy) and
+            signed.get("cipher_sha256") == copy["sha256"] and isinstance(record.get("expires_at"), str) and
+            utc(copy["deleted_at"]) >= utc(record["expires_at"]))
+
+
+def check_deletion_proof(record, index, copy, read_record, matches_path, *, generation_digest=None, reason, origin_plans=None):
+    receipt_id = copy.get("deletion_receipt")
+    require(sha256(receipt_id), reason, 5)
+    receipt = read_record(f"receipts/{receipt_id}.json")
+    require(isinstance(receipt, dict) and isinstance(receipt.get("payload"), dict), reason, 5)
+    payload = receipt["payload"]
+    intent = payload.get("intent")
+    require(isinstance(intent, dict), reason, 5)
+    expected = generation_locator(record, index, copy)
+    intent_slot = intent.get("slot")
+    generations = intent.get("generations", [])
+    require(isinstance(generations, list), reason, 5)
+    primary = intent_slot == [expected["material"], expected["copy_index"], expected["identity"]]
+    association = intent if primary else next((item for item in generations if isinstance(item, dict) and
+                                                all(item.get(key) == value for key, value in expected.items())), None)
+    historical = origin_plans is not None and "plan_id" not in intent
+    require(digest(receipt) == receipt_id and receipt.get("kind") == "deletion-copy" and
+            isinstance(receipt.get("at"), str) and receipt["at"] == copy.get("deleted_at") == intent.get("at") and
+            payload.get("material") == record["id"] and type(payload.get("copy_index")) is int and
+            payload["copy_index"] == index and payload.get("sha256") == copy["sha256"] and association is not None and
+            association.get("generation_digest") == (None if historical else generation_digest) and
+            isinstance(intent.get("path"), str) and matches_path(intent["path"], copy), reason, 5)
+    if historical:
+        require(primary and type(intent_slot[1]) is int and
+                intent.keys() == {"at", "path", "slot", "root_identity", "file_identity", "plan_digest"} and
+                all(isinstance(identity, list) and len(identity) == 2 and all(type(value) is int for value in identity)
+                    for identity in (intent["root_identity"], intent["file_identity"])) and
+                sha256(intent["plan_digest"]) and payload == deletion_payload({"copy": copy, "intent": intent}, record["id"], index) and
+                (record["kind"] != "backup" or historical_backup_slot(record, index, copy)) and
+                historical_deletion_plan(intent, origin_plans), reason, 5)
+        return receipt_id
+    plan_id = intent.get("plan_id")
+    require(isinstance(plan_id, str) and plan_id and Path(plan_id).name == plan_id, reason, 5)
+    plan = read_record(f"deletions/{plan_id}.json")
+    require(isinstance(plan, dict) and plan.get("id") == plan_id and plan.get("digest") == intent.get("plan_digest") and
+            plan_digest(plan) == plan["digest"] and any(list(slot(entry)) == intent_slot and
+                entry.get("status") in {"deleting", "deleted"} and entry.get("intent") == intent
+                for entry in plan["entries"]), reason, 5)
+    return receipt_id
+
+
 def deletion_receipt(vault, entry, material, index, at):
     return vault.receipt("deletion-copy", deletion_payload(entry, material, index), at=at)
 
@@ -162,9 +283,16 @@ def shared_copy_reconciled(vault, entry, material, index, copy):
 
 
 def record_shared_deletion(vault, inventory, entry):
+    from .backups import check_portable_replica_inventory
+
     at = entry["intent"]["at"]
     changed = {}
-    for material, index, copy in verified_shared_slots(inventory, entry):
+    slots = verified_shared_slots(inventory, entry)
+    for material, _, _ in slots:
+        require_custody_inventory(material)
+        if material.get("format") == backup_snapshot.MANIFEST:
+            check_portable_replica_inventory(vault, material)
+    for material, index, copy in slots:
         if shared_copy_reconciled(vault, entry, material, index, copy):
             continue
         require(copy["status"] not in INACTIVE_COPIES, "Shared custody slot was disposed by another effect", 5)
@@ -187,7 +315,10 @@ def deletion_reconciled(vault, inventory, entry):
 
 def record_archive_deletion(vault, inventory, entry, at):
     changed = {}
-    for record, copy in verified_archive_slots(inventory, entry):
+    slots = verified_archive_slots(inventory, entry)
+    for record, _ in slots:
+        require_custody_inventory(record)
+    for record, copy in slots:
         sha = copy["sha256"]
         if copy["status"] != "deleted" or copy.get("verified_archive_sha256") != sha:
             copy.update(status="deleted", deleted_at=copy.get("deleted_at") or at, verified_archive_sha256=sha)
@@ -211,8 +342,12 @@ def pending_deletion_paths(vault, *, target=None, exclude=None):
                 continue
             copies = inventory.get(entry["material"], {}).get("copies", [])
             index = entry["copy_index"]
-            if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
-                    copy_identity(copies[index]) == copy_identity(entry["copy"]) and
+            copy = copies[index] if isinstance(copies, list) and 0 <= index < len(copies) else None
+            status = copy.get("status") if isinstance(copy, dict) else None
+            if status == "unavailable":
+                continue
+            if isinstance(status, str) and status in INACTIVE_COPIES and (
+                    copy_identity(copy) == copy_identity(entry["copy"]) and
                     deletion_reconciled(vault, inventory, entry)):
                 continue
             if target is None:
@@ -244,8 +379,21 @@ def has_active_checkpoints(record):
         copy["kind"] == "checkpoint" and copy["status"] not in INACTIVE_COPIES for copy in record["copies"])
 
 
+def unresolved_custody_copies(record):
+    for index, copy in enumerate(record.get("copies", [])):
+        reason = material_copy_error(copy)
+        if reason:
+            yield index, reason
+
+
+def require_custody_inventory(record):
+    for index, reason in unresolved_custody_copies(record):
+        raise Blocked(f"Custody copy {index} requires reconciliation: {reason}", 5)
+
+
 def material_guard(vault, record, now, policy):
     from .backups import check_writing_generation, signed_manifest, verify_replica_deletions, writing_generation
+    require_custody_inventory(record)
     require(not preserved(vault, record, policy), "Retention policy preserves material", 5)
     require_expired(record, now, policy)
     if record.get("classification") == "secret":
@@ -278,11 +426,23 @@ def material_guard(vault, record, now, policy):
 def authorized_target(vault, record, copy):
     from .backups import writing_generation
 
+    require(copy.get("status") != "unavailable", "Origin custody location is awaiting reconciliation", 5)
     roots = [Path(p).resolve() for p in vault.config.get("storage_roots", [])]
     roots.append((vault.state / "custody").resolve())
     if record.get("kind") == "export" and copy.get("kind") == "export":
         roots.append((vault.root / "inbox").resolve())
-    if record.get("kind") == "export" and copy.get("kind") == "archive":
+    if copy.get("recovery_receipt"):
+        from .lineage import sha256
+
+        receipt_id = copy["recovery_receipt"]
+        require(sha256(receipt_id), "Invalid backup copy recovery receipt", 5)
+        receipt = read_json(safe_path(vault.control, f"receipts/{receipt_id}.json"), {})
+        payload = receipt.get("payload", {})
+        require(digest(receipt) == receipt_id and receipt.get("kind") == "backup-copy-recovered" and
+                payload.get("material") == record["id"] and
+                all(payload.get(field) == copy[field] for field in ("path", "root", "sha256")),
+                "Backup copy recovery receipt does not match the local copy", 5)
+    elif record.get("kind") == "export" and copy.get("kind") == "archive":
         require(Path(copy["path"]).parts[:1] == (copy["sha256"],), "Archived custody path does not match its digest", 5)
         roots.append((vault.root / "archive").resolve())
     roots.extend(Path(p).resolve() for p in vault.config.get("backup_destinations", []))
@@ -370,6 +530,8 @@ def reconcile_inbox(vault, now):
     records = materials(vault)
     owners = {}
     for record in records.values():
+        if record.get("format") == backup_snapshot.MANIFEST:
+            continue
         for copy in record.get("copies", []):
             if copy["kind"] == "export" and vault.relocated_path(copy["root"]) == root and copy["status"] not in INACTIVE_COPIES:
                 owners.setdefault(copy["sha256"], set()).add(record["id"])
@@ -421,7 +583,9 @@ def reconcile_inbox(vault, now):
             save_material(vault, record)
 
 
-def plan(vault, now=None, *, exclude=(), skip_empty=False):
+def plan(vault, now=None, *, exclude=(), skip_empty=False, inventory_findings=None):
+    from .backups import check_portable_replica_inventory
+
     with vault.locked():
         open_tasks = reconcile_closures(vault, materials(vault).values())
         reconcile_inbox(vault, now)
@@ -429,8 +593,15 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False):
         pending = pending_archive_paths(vault)
         policy = storage_policy.effective(vault)
         excluded = set(exclude)
-        entries = []
-        for record in materials(vault).values():
+        entries, findings = [], []
+        for identifier, record in materials(vault).items():
+            if record.get("format") == backup_snapshot.MANIFEST:
+                try:
+                    require(record.get("id") == identifier, "Backup identity changed", 5)
+                    check_portable_replica_inventory(vault, record)
+                except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+                    findings.append({"material": identifier, "retention": "discovery", "reason": str(exc)})
+                    continue
             try:
                 status, deadline = storage_policy.deadline(record, policy)
                 if (deadline and utc(now) < deadline) or (status == "unknown" and record.get("task") in open_tasks):
@@ -440,6 +611,11 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False):
             except (Blocked, OSError, ValueError, KeyError, TypeError):
                 # The execution guard will diagnose unproven deadlines or decisions for this material.
                 pass
+            unresolved = list(unresolved_custody_copies(record))
+            if unresolved:
+                findings.extend({"material": identifier, "copy_index": index, "retention": "discovery", "reason": reason}
+                                for index, reason in unresolved)
+                continue
             for index, copy in enumerate(record.get("copies", [])):
                 if copy.get("status") in INACTIVE_COPIES:
                     continue
@@ -452,11 +628,15 @@ def plan(vault, now=None, *, exclude=(), skip_empty=False):
                 entry = {"material": record["id"], "copy_index": index, "copy": copy, "status": "planned"}
                 if slot(entry) not in excluded:
                     entries.append(entry)
+        if inventory_findings is not None:
+            inventory_findings.extend(findings)
         if skip_empty and not entries:
             return None
         result = {"id": str(uuid4()), "created_at": now, "entries": entries, "status": "planned"}
         result["digest"] = digest(result)
         atomic(vault.control / "deletions" / (result["id"] + ".json"), result)
+        if findings:
+            return {**result, "pending": findings}
         return result
 
 
@@ -471,11 +651,14 @@ def file_revision(path):
 
 
 def apply_entry(vault, path, plan, entry, now, policy_snapshot):
-    from .backups import interrupted_absence, writing_generation
+    from .backups import check_portable_replica_inventory, interrupted_absence, writing_generation
 
     inventory = materials(vault)
     material = inventory[entry["material"]]
     require(material["id"] == entry["material"], "Material identity changed", 5)
+    if material.get("format") == backup_snapshot.MANIFEST:
+        check_portable_replica_inventory(vault, material)
+    require_custody_inventory(material)
     copy = material["copies"][entry["copy_index"]]
     require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
     at = stamp(now)

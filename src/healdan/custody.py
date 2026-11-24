@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from . import storage_policy
 from .core import Blocked, atomic, canonical, canonical_storage_path, decode, digest, executable, file_digest, json_paths, lock, read_json, require, run, safe_path, stamp, sync_directory
+from .lineage import sha256
 from .signing import trusted_signers, verify
 
 INACTIVE_COPIES = {"deleted", "moved", "absent"}
@@ -94,8 +95,8 @@ def encrypt(vault, data):
 
 
 def decrypt(vault, cipher, identity=None):
-    key = Path(identity or vault.config.get("age_identity") or "")
-    require(key.is_absolute() and key.is_file() and not key.resolve().is_relative_to(vault.root),
+    key = Path(identity or (vault.config.get("age_identity") if vault else None) or "")
+    require(key.is_absolute() and key.is_file() and (vault is None or not key.resolve().is_relative_to(vault.root)),
             "External age identity is required", 5)
     return run([executable("age"), "--decrypt", "-i", key], data=cipher).stdout
 
@@ -141,6 +142,33 @@ def materials(vault):
     return read_json(vault.control / "materials.json", {})
 
 
+def material_copy_error(copy):
+    if isinstance(copy, dict) and copy.get("status") == "unavailable" and copy.get("kind") is None:
+        reason = copy.get("inventory_error")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
+def export_copy_hash(copy):
+    if not isinstance(copy, dict):
+        return None
+    if copy.get("kind") == "export":
+        value = copy.get("sha256")
+    elif material_copy_error(copy) and not ({"root", "path", "sha256"} & copy.keys()):
+        value = copy.get("export_sha256_evidence")
+    else:
+        return None
+    return value if sha256(value) else None
+
+
+def unresolved_material_copy(kind, copy, reason):
+    pending = {"status": "unavailable", "kind": None, "inventory_error": material_copy_error(copy) or reason}
+    if kind == "export" and (export_hash := export_copy_hash(copy)):
+        pending["export_sha256_evidence"] = export_hash
+    return pending
+
+
 def save_material(vault, record):
     with vault.locked():
         rows = materials(vault)
@@ -161,15 +189,16 @@ def integrity_findings(vault, *, records=None):
         try:
             require(isinstance(record, dict) and record.get("id") == identifier and record.get("kind"),
                     "Invalid custody material identity", 5)
-            live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
-            if not live and record["kind"] != "backup":
-                continue
             if record["kind"] == "backup":
                 if writing_generation(record):
                     inspect_writing_generation(vault, record)
                 else:
                     inspect_backup(vault, record, allow_retired=True)
-            elif record.get("decryption_verified"):
+                continue
+            live = [copy for copy in record.get("copies", []) if copy.get("status") not in INACTIVE_COPIES]
+            findings.extend((identifier, f"Custody copy {index}: {copy['inventory_error']}")
+                            for index, copy in enumerate(record.get("copies", [])) if copy.get("inventory_error"))
+            if live and record.get("decryption_verified"):
                 if any(copy.get("kind") == "ciphertext" for copy in live):
                     capture_ciphertexts(vault, record, read_bytes=False)
                 else:
@@ -189,6 +218,12 @@ def integrity_findings(vault, *, records=None):
                 findings.append((path.stem, journal.get("error") or "Restoration is awaiting reconciliation"))
         except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
             findings.append((path.stem, str(exc)))
+    try:
+        for identifier, path in origin_restorations(vault):
+            if identifier in records:
+                findings.append((path, "Origin restoration for " + identifier + " awaits custody reconciliation"))
+    except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+        findings.append(("origin-restorations", str(exc)))
     return findings
 
 
@@ -355,7 +390,19 @@ def native_guard(vault, material):
             proof.get("action") == session["action"] == receipt.get("action"), "Native resume is not proven", 5)
 
 
+def origin_restorations(vault):
+    from .backup_snapshot import historical_paths
+
+    for name in historical_paths(vault.control, folders=("restorations",)):
+        journal = read_json(safe_path(vault.control, name, exists=True))
+        status = journal.get("status")
+        if status in {"staging", "publishing"} or status == "preparing" and not journal.get("terminal"):
+            yield journal["material"], Path(name).stem
+
+
 def pending_restoration(vault, identifier=None, *, target=None):
+    if target is None and identifier is not None and any(material == identifier for material, _ in origin_restorations(vault)):
+        return True
     directory = safe_path(vault.control, "restorations")
     for path in json_paths(directory):
         journal = read_json(safe_path(directory, path.name, exists=True))
@@ -655,7 +702,7 @@ def finish_reconstruction(vault, destination, path, journal):
             candidate = {"root": str(destination), "path": name, "sha256": entry["sha256"],
                          "kind": "native" if record.get("session") else "checkpoint", "status": "present",
                          "restoration": restoration}
-            if not any(copy["path"] == name and (copy.get("restoration") == restoration or
+            if not any(copy.get("path") == name and (copy.get("restoration") == restoration or
                        copy["status"] not in INACTIVE_COPIES and copy["kind"] == candidate["kind"] and
                        copy["sha256"] == candidate["sha256"] and vault.relocated_path(copy["root"]) == destination)
                        for copy in copies):

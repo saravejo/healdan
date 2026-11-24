@@ -31,7 +31,7 @@ def execute_plan(vault, identifier, now=None, *, automatic=False, previous=None)
 def daily(vault, now=None, *, report_custody=False):
     from . import retention
     from .custody import integrity_findings
-    from .tasks import get_task, preserve_and_close, reconcile_clock, reconcile_expired, task_ids
+    from .tasks import get_task, preserve_and_close, reconcile_clock, reconcile_expired, require_reconciled, task_ids
 
     now = utc(now)
     notices, pending, results = [], [], []
@@ -47,6 +47,7 @@ def daily(vault, now=None, *, report_custody=False):
             try:
                 task = get_task(vault, identifier)
                 require(task["id"] == identifier, "Task identity does not match its record", 5)
+                require_reconciled(task)
                 if not task.get("capacity_held"):
                     continue
                 updates = reconcile_clock(vault, task, now)
@@ -67,7 +68,7 @@ def daily(vault, now=None, *, report_custody=False):
             pending.append({"retention": "inventory", "reason": str(exc)})
         else:
             try:
-                discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans))
+                discovered = retention.plan(vault, now, exclude=exclude, skip_empty=bool(plans), inventory_findings=pending)
                 if discovered is not None:
                     plans.append(discovered)
             except (Blocked, OSError, KeyError, ValueError, TypeError) as exc:
@@ -111,11 +112,12 @@ def backup_round(vault, now):
         if status != "configured":
             return {"status": "pending", "configuration": status, "reason": reason}
         interval = timedelta(hours=storage_policy.backup_interval(vault, policy))
-        for record in materials(vault).values():
+        for identifier, record in materials(vault).items():
             if (record.get("kind") == "backup" and record.get("generation") == "long" and record.get("verified_at") and
                     utc(record["verified_at"]) <= now < utc(record["verified_at"]) + interval):
                 try:
-                    backups.verify_backup(vault, record["id"])
+                    require(record["id"] == identifier, "Backup identity changed", 5)
+                    backups.inspect_backup(vault, record, decrypt_replicas=True)
                     return {"status": "not_due", "mode": mode, "last_generation": record["id"]}
                 except (Blocked, OSError):
                     continue

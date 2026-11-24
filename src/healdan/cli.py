@@ -85,6 +85,9 @@ def parser():
     close.add_argument("--reason", default="completed")
     reconcile = task.add_parser("reconcile")
     reconcile.add_argument("id")
+    reconcile_restored = task.add_parser("reconcile-restored", help="Close a restored task after verifying its recovered custody")
+    reconcile_restored.add_argument("id")
+    reconcile_restored.add_argument("--confirm", action="store_true")
     for operation in ("answer", "reopen"):
         response = task.add_parser(operation)
         response.add_argument("id")
@@ -190,9 +193,19 @@ def parser():
     create.add_argument("--members", nargs="*", default=[])
     verify = backup.add_parser("verify")
     verify.add_argument("id")
+    backup.add_parser("reconcile").add_argument("id")
     restore = commands.add_parser("restore")
     restore.add_argument("backup")
     restore.add_argument("destination", type=Path)
+    for portable in (verify, restore):
+        portable.add_argument("--manifest", type=Path)
+        portable.add_argument("--replica", type=Path)
+        portable.add_argument("--age-identity", type=Path)
+        portable.add_argument("--backup-allowed-signers", type=Path)
+        portable.add_argument("--allowed-signers", type=Path)
+        portable.add_argument("--state", dest="portable_state", type=Path)
+    restore.add_argument("--recovery-state", type=Path)
+    restore.add_argument("--remap", type=Path)
     migration = commands.add_parser("migration").add_subparsers(dest="action", required=True)
     migration.add_parser("inventory")
     migration.add_parser("preview")
@@ -213,6 +226,14 @@ def dispatch(args):
     if args.command == "state":
         change = binding.adopt if args.action == "adopt" else binding.rebind
         return change(args.vault, args.state, args.confirm)
+    if portable_backup(args):
+        trust = {"age_identity": args.age_identity, "backup_signers": args.backup_allowed_signers,
+                 "allowed_signers": args.allowed_signers, "expected_vault": args.vault_id}
+        if args.command == "restore":
+            return backups.restore_portable(args.backup, args.destination, args.manifest, args.replica,
+                                            state=args.portable_state or args.recovery_state or args.state,
+                                            remap=args.remap, **trust)
+        return backups.verify_portable(args.id, args.manifest, args.replica, **trust)
     if args.command == "build" and args.action == "prepare":
         from .installation import prepare
         if (Path(args.vault).resolve() / ".git").exists() or args.state is not None:
@@ -295,6 +316,8 @@ def dispatch(args):
             return tasks.preserve_and_close(vault, args.id, reason=args.reason)
         if args.action == "reconcile":
             return tasks.reconcile_expired(vault, args.id)
+        if args.action == "reconcile-restored":
+            return tasks.reconcile_restored(vault, args.id, confirmed=args.confirm)
         if args.action == "answer":
             return tasks.answer(vault, args.id, read_json(args.decision))
         if args.action == "reopen":
@@ -355,7 +378,8 @@ def dispatch(args):
         if args.action == "plan":
             from .retention import plan
             with vault.locked():
-                return plan(vault)
+                result = plan(vault)
+            return result, 5 if result.get("pending") else 0
         if args.action == "execute":
             result = maintenance.execute_plan(vault, args.plan)
             return result, 0 if result["status"] == "complete" else 5
@@ -397,9 +421,16 @@ def dispatch(args):
     if args.command == "backup":
         if args.action == "create":
             return backups.create(vault, args.kind, args.expires_at, args.members)
-        return backups.verify_backup(vault, args.id)
+        if args.action == "reconcile":
+            return backups.reconcile(vault, args.id)
+        report = backups.verify_backup(vault, args.id)
+        pending = report["pending_replicas"]
+        if any(row["status"] == "invalid" for row in pending):
+            return report, 5
+        return report, 4 if pending else 0
     if args.command == "restore":
-        return backups.restore(vault, args.backup, args.destination)
+        return backups.restore(vault, args.backup, args.destination,
+                               state=args.recovery_state or args.portable_state, remap=args.remap)
     if args.command == "migration":
         if args.action == "inventory":
             return migration.inventory(vault)
@@ -421,8 +452,12 @@ def dispatch(args):
     raise Blocked("Unsupported operation", 2)
 
 
+def portable_backup(args):
+    return any(getattr(args, key, None) for key in ("manifest", "replica", "backup_allowed_signers", "age_identity"))
+
+
 def redirect(args, argv):
-    if args.command in {"setup", "state"} or (args.command == "build" and args.action in {"prepare", "activate"}):
+    if args.command in {"setup", "state"} or portable_backup(args) or (args.command == "build" and args.action in {"prepare", "activate"}):
         return None
     from .binding import Repository, bound
     from .build import read_selection, selected_build
