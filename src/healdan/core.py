@@ -231,15 +231,20 @@ def run(argv, *, cwd=None, data=None, check=True, env=None, timeout=120):
     return result
 
 
-def git_bytes(root, *args, check=True, data=None):
+def git_process(root, *args, settings=None):
     # The explicit vault path selects the real worktree, refs, objects and index.
     overrides = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_GRAFT_FILE",
                  "GIT_PREFIX", "GIT_INTERNAL_SUPER_PREFIX", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
                  "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
     env = {key: value for key, value in os.environ.items() if key.upper() not in overrides}
-    return run([executable("git"), "-c", "core.quotepath=false", "-C", root, *args],
-               env=env, check=check, data=data).stdout
+    env.update(settings or {})
+    return [executable("git"), "-c", "core.quotepath=false", "-C", str(root), *args], env
+
+
+def git_bytes(root, *args, check=True, data=None, settings=None):
+    argv, env = git_process(root, *args, settings=settings)
+    return run(argv, env=env, check=check, data=data).stdout
 
 
 def git(root, *args, check=True):
@@ -416,7 +421,11 @@ class Vault:
         return identifier
 
     def no_transaction(self, *, allow_ingest=False):
-        pending = read_json(safe_path(self.control, "transaction.json"))
+        from .integration_journal import read
+        try:
+            pending = read(self.control)
+        except Blocked as exc:
+            raise Blocked("An integration needs recovery: " + str(exc), 5) from exc
         require(not pending or pending["status"] in {"complete", "aborted"},
                 "An integration needs recovery", 5)
         if not allow_ingest:

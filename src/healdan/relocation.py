@@ -246,7 +246,8 @@ def _validate_move(repository, old, new):
             historic_git = Path(location[name])
             require(not current_state.is_relative_to(historic_git) and not historic_git.is_relative_to(current_state),
                     "External state overlaps a historical vault path: " + str(historic_git), 5)
-    journal = read_json(safe_path(repository.control, "transaction.json"))
+    from .integration_journal import read
+    journal = read(repository.control)
     require(not journal or journal.get("status") == "complete", "Recover the integration before reassociation", 5)
     _validate_jobs(old, new)
 

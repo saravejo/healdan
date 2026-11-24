@@ -10,7 +10,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from support import VaultTest, controller_environment
+import test_transactions
 from healdan import admission, backup_recovery, backup_snapshot, backups, binding, compatibility, custody, inbox, maintenance, retention, storage_policy, tasks, trials
+from healdan import integration_journal, transactions
 from healdan.core import Blocked, Vault, atomic, canonical, decode, digest, git, read_json, run, stamp, utc
 from healdan.setup import initialize
 from healdan.signing import envelope, human_sign
@@ -86,6 +88,44 @@ class BackupPortable(VaultTest):
                 if os.name != "nt":
                     for path in (root / ".git/healdan/materials.json", state / "config.json"):
                         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_4_portable_integration_journal_history_stays_inactive(self):
+        self.configure()
+        journal_path = self.vault.control / integration_journal.JOURNAL
+        task, _, first = test_transactions.Transactions.prepare_identity_fixture(self)
+        transactions.approve(self.vault, first["id"])
+        transactions.apply(self.vault, first["id"])
+        prior = journal_path.read_bytes()
+        tasks.preserve_and_close(self.vault, task["id"])
+        _, _, second = test_transactions.Transactions.prepare_identity_fixture(self)
+        transactions.approve(self.vault, second["id"])
+        transactions.apply(self.vault, second["id"])
+        current = journal_path.read_bytes()
+        archived = "integration-history/" + digest(prior) + ".json"
+        self.assertEqual((self.vault.control / archived).read_bytes(), prior)
+        record = self.create()
+        root, state = self.base / "journal-restore", self.base / "journal-restore-state"
+        self.restore(record, root, state)
+        restored = Vault(root, state)
+        self.assertEqual((restored.control / "historical" / integration_journal.JOURNAL).read_bytes(), current)
+        self.assertEqual((restored.control / "historical" / archived).read_bytes(), prior)
+        with self.assertRaisesRegex(Blocked, "No pending transaction") as failure:
+            transactions.apply(restored, recover=True)
+        self.assertEqual(failure.exception.code, 2)
+        replica = self.base / "journal-recaptured-replica"
+        replica.mkdir()
+        restored.config.update({key: self.vault.config[key] for key in ("age_recipients", "offline_recipients",
+                                "backup_signing_key", "backup_signing_identity")})
+        restored.config["backup_destinations"] = [str(replica)]
+        atomic(restored.config_path, restored.config)
+        recaptured = backups.create(restored, "long", utc() + timedelta(days=2))
+        paths = tuple(replica / recaptured["copies"][0][name] for name in ("manifest", "path"))
+        second, second_state = self.base / "journal-recaptured", self.base / "journal-recaptured-state"
+        self.restore(recaptured, second, second_state, paths=paths)
+        recovered = Vault(second, second_state)
+        self.assertEqual((recovered.control / "historical" / archived).read_bytes(), prior)
+        self.assertEqual((recovered.control / "historical" / integration_journal.JOURNAL).read_bytes(), current)
+        self.assertFalse((recovered.control / integration_journal.JOURNAL).exists())
 
     def conversation(self, name, *, classification="common", closed_at=None):
         origin = self.state / name

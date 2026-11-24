@@ -573,7 +573,7 @@ class SourcePolicy(VaultTest):
                 self.assertEqual(target.exists(), mode == "reused")
                 self.assertEqual(encrypted.read_bytes(), saved)
 
-    def test_apply_rechecks_before_effects_and_withdraws_interrupted_writes(self):
+    def test_apply_rechecks_before_effects_and_keeps_prepublication_pending(self):
         first = b"first signed common capture"
         row = self.proposal(first)
         approval = self.approved()
@@ -588,18 +588,14 @@ class SourcePolicy(VaultTest):
         original_manifest = (self.root / originals.REGISTRY).read_bytes()
         base = self.vault.head()
 
-        def interrupted(path, body):
-            atomic(path, body)
-            if Path(path) == self.root / row["path"]:
-                raise OSError("interrupted after original and manifest write")
-
-        with patch("healdan.transactions.atomic", side_effect=interrupted), self.assertRaisesRegex(OSError, "interrupted"):
+        with patch("healdan.integration_git.publish", side_effect=OSError("interrupted before CAS")), \
+                self.assertRaisesRegex(OSError, "interrupted"):
             transactions.apply(self.vault, approval)
-        self.assertEqual((self.root / row["path"]).read_bytes(), second)
+        self.assertFalse((self.root / row["path"]).exists())
         _, purpose = self.triage("second.txt", second, "sensitive")
         with self.assertRaisesRegex(Blocked, "recorded classification is sensitive"):
             transactions.apply(self.vault, recover=True)
-        self.assertEqual(read_json(self.vault.control / "transaction.json")["status"], "aborted")
+        self.assertEqual(read_json(self.vault.control / "transaction.json")["phase"], "prepared")
         self.assertEqual(self.vault.head(), base)
         self.assertFalse((self.root / row["path"]).exists())
         self.assertEqual((self.root / originals.REGISTRY).read_bytes(), original_manifest)

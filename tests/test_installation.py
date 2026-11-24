@@ -16,6 +16,7 @@ import test_source_policy
 import test_transactions
 import healdan
 from healdan import binding, build, compatibility, installation, launchd, maintenance, tasks, transactions
+from healdan import integration_journal
 from healdan.core import TRANSACTION_V2, Blocked, Vault, atomic, decode, git, read_json, run
 from healdan.setup import initialize
 
@@ -261,7 +262,7 @@ class ImmutableInstallation(VaultTest):
         transactions.apply(self.vault, identifier)
         journal = self.vault.control / "transaction.json"
         ledger = self.root / transactions.LEDGER
-        self.assertEqual(read_json(journal)["format"], TRANSACTION_V2)
+        self.assertEqual(read_json(journal)["format"], integration_journal.FORMAT)
         before = {path: path.read_bytes() for path in (journal, ledger)}
         self.assertEqual(self.activate(prepared)["build"], prepared.identity)
         code, result = self.cli("migration", "preview")
@@ -273,8 +274,10 @@ class ImmutableInstallation(VaultTest):
         self.assertEqual(base64.b64decode(origin["row_base64"]), before[ledger])
         self.assertEqual({path: path.read_bytes() for path in before}, before)
 
-        previous = read_json(journal)
-        del previous["format"]
+        current = read_json(journal)
+        previous = {key: current[key] for key in ("status", "package_id", "base", "files", "before",
+                                                  "before_files", "commit", "completed_at")}
+        previous["written"] = list(current["written"])
         atomic(journal, previous)
         unversioned = journal.read_bytes()
         self.assertEqual(self.activate(prepared)["build"], prepared.identity)
@@ -294,22 +297,19 @@ class ImmutableInstallation(VaultTest):
         identifier = test_source_policy.SourcePolicy.approved(self)
         destination = self.root / source["path"]
 
-        def interrupt(path, data):
-            atomic(path, data)
-            if Path(path) == destination:
-                raise OSError("Interrupted after source publication")
-
-        with patch("healdan.transactions.atomic", side_effect=interrupt), self.assertRaisesRegex(OSError, "Interrupted"):
+        with patch("healdan.integration_git.publish", side_effect=OSError("Interrupted before CAS")), \
+                self.assertRaisesRegex(OSError, "Interrupted"):
             transactions.apply(self.vault, identifier)
         journal = self.vault.control / "transaction.json"
         self.assertEqual(read_json(journal)["status"], "writing")
         before = journal.read_bytes()
         self.assertEqual(self.activate(prepared)["build"], prepared.identity)
         self.assertEqual(journal.read_bytes(), before)
-        test_source_policy.SourcePolicy.triage(self, "restricted.txt", body, "sensitive")
-        with self.assertRaisesRegex(Blocked, "recorded classification is sensitive"):
-            transactions.apply(self.vault, recover=True)
-        self.assertEqual(read_json(journal)["status"], "aborted")
+        pending = read_json(journal)
+        withdrawn = {key: pending[key] for key in ("package_id", "base", "files", "before", "before_files")}
+        withdrawn.update(format=TRANSACTION_V2, status="aborted", written=[], reason="Prior withdrawal fixture",
+                         aborted_at=pending["git_identity"]["at"])
+        atomic(journal, withdrawn)
         self.assertFalse(destination.exists())
         after = journal.read_bytes()
         self.assertEqual(self.activate(prepared)["build"], prepared.identity)

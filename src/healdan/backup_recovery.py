@@ -409,7 +409,8 @@ def build_portable(staging, state, journal, verified, raw_manifest, remaps):
         if name in prior:
             continue
         is_task = name.startswith(("tasks/", "sessions/"))
-        history_only = (name in snapshot.HISTORICAL_STATE | {"materials.json"} or name.startswith("restorations/") or
+        history_only = (name in snapshot.HISTORICAL_STATE | {"materials.json"} or
+                        name.startswith(("restorations/", "integration-history/")) or
                         name in trials.RECEIPTS)
         if history_only or is_task:
             historical = "historical/" + name

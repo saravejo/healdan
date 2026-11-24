@@ -242,7 +242,7 @@ def dispatch(args):
         return {"build": prepared.identity, "controller": str(prepared.entry_point)}
     external_recovery = (args.command, getattr(args, "action", None)) in {
         ("restore", None), ("backup", "verify"), ("session", "restore"), ("session", "approve-recovery")
-    }
+    } or args.command == "apply" and args.recover
     vault = Vault(args.vault, args.state, operational=not external_recovery,
                   expected_binding=getattr(args, "vault_binding", None))
     if hasattr(args, "controller_selection"):
