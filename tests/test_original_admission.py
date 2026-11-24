@@ -145,6 +145,7 @@ class OriginalAdmission(VaultTest):
         pending = read_json(journal_path)
         legacy = pending[name]
         del legacy["payload"]["worktree"]
+        del legacy["payload"]["move_id"]
         atomic(journal_path, pending)
         inbox.archive_empty(self.vault, key)
         self.assertFalse((self.root / name).exists())
@@ -449,6 +450,123 @@ class OriginalAdmission(VaultTest):
         plan = retention.plan(self.vault, now)
         self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
         findings(expected)
+
+    def test_linked_inbox_lint_distinguishes_reused_path_by_content(self):
+        relative = "inbox/reused.txt"
+        deferred = self.defer_empty(relative)
+        empty = deferred["sha256"]
+        inbox.archive_empty(self.vault, empty)
+        linked = self.base / "linked vault"
+        git(self.root, "worktree", "add", "--detach", linked, "HEAD")
+        linked_vault = Vault(linked, self.state)
+        now = utc() + timedelta(days=8)
+
+        def findings():
+            run = linting.lint(self.vault, now)
+            self.assertEqual(run["status"], "complete", run["errors"])
+            state = read_json(self.vault.control / "followups.json")["inbox"]["state"]
+            return {key: row["message"] for key, row in run["findings"].items() if row["category"] == "inbox"}, state
+
+        changed = b"A different capture reusing the relative filename"
+        atomic(linked / relative, changed)
+        self.assertEqual(findings(), ({"inbox:" + relative: "File has no triage inventory"}, "open"))
+        inbox.inventory(linked_vault)
+        other = digest(changed)
+        self.assertEqual(findings(), ({f"inbox:{other}:{message}": message for message in
+                                      ("original_triage_overdue", "classification_pending")}, "open"))
+        inbox.decide(linked_vault, other, "resource", owner="human", classification="common", destination="fixture")
+        self.assertEqual(findings(), ({}, "resolved"))
+        self.assertEqual((self.root / f"archive/{empty}/reused.txt").read_bytes(), b"")
+        atomic(linked / relative, b"Another uninventoried capture")
+        self.assertEqual(findings(), ({"inbox:" + relative: "File has no triage inventory"}, "open"))
+        atomic(linked / relative, b"")
+        self.assertEqual(findings(), ({f"inbox:{empty}:{message}": message for message in
+                                      ("original_triage_overdue", "deferral_due")}, "open"))
+
+    def test_shared_archive_deletion_recovers_all_verified_custody_slots(self):
+        first, second = "inbox/a/shared.txt", "inbox/b/shared.txt"
+        deferred = self.defer_empty(first)
+        sha = deferred["sha256"]
+        self.expiring_export("archive-a", (self.root / "inbox", "a/shared.txt", "export"))
+        inbox.archive_empty(self.vault, sha)
+        now = utc() + timedelta(days=8)
+        plan = retention.plan(self.vault, now)
+        self.assertEqual(len(plan["entries"]), 1)
+        atomic(self.root / second, b"")
+        self.expiring_export("archive-b", (self.root / "inbox", "b/shared.txt", "export"))
+        inbox.inventory(self.vault)
+        inbox.archive_empty(self.vault, sha)
+        destination = self.root / f"archive/{sha}/shared.txt"
+        self.assertTrue(inbox.archive_complete(self.vault, read_json(self.vault.control / "inbox.json")[sha]))
+
+        hold = custody.hold(self.vault, "archive-b", "Keep this shared archive", "human")
+        blocked = retention.execute(self.vault, plan["id"], now)
+        self.assertIn("Active hold", blocked["entries"][0]["error"])
+        self.assertEqual(destination.read_bytes(), b"")
+        custody.release_hold(self.vault, "archive-b", hold["id"], [])
+        save = retention.save_material
+
+        def interrupt(vault, record):
+            if record["id"] == "archive-b":
+                raise OSError("Interrupted after updating only the first custody record")
+            return save(vault, record)
+
+        with patch("healdan.retention.save_material", side_effect=interrupt):
+            partial = retention.execute(self.vault, plan["id"], now)
+        entry = partial["entries"][0]
+        self.assertEqual(entry["status"], "deleting")
+        self.assertCountEqual([(g["material"], g["copy_index"]) for g in entry["verified_archive_generations"]],
+                              [("archive-a", 1), ("archive-b", 1)])
+        self.assertFalse(destination.exists())
+        copies = custody.materials(self.vault)
+        self.assertEqual(copies["archive-a"]["copies"][1]["status"], "deleted")
+        self.assertEqual(copies["archive-b"]["copies"][1]["status"], "present")
+        self.assertFalse(inbox.archive_complete(self.vault, read_json(self.vault.control / "inbox.json")[sha]))
+        atomic(self.root / first, b"")
+        with self.assertRaisesRegex(Blocked, "Resume retention first"):
+            inbox.archive_empty(self.vault, sha)
+        self.assertEqual((self.root / first).read_bytes(), b"")
+        (self.root / first).unlink()
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        before = (self.vault.control / "materials.json").read_bytes()
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertEqual((self.vault.control / "materials.json").read_bytes(), before)
+        for material in custody.materials(self.vault).values():
+            origin, archive = material["copies"]
+            self.assertEqual(origin["archive_copy_index"], 1)
+            self.assertEqual((archive["status"], archive["verified_archive_sha256"]), ("deleted", sha))
+        finished = linting.lint(self.vault, now)
+        self.assertEqual(finished["status"], "complete", finished["errors"])
+        self.assertFalse(any(row["category"] == "inbox" for row in finished["findings"].values()))
+
+    def test_lost_archive_generation_cannot_reuse_deletion_proof_after_clock_reversal(self):
+        relative = "inbox/repeated.txt"
+        deferred = self.defer_empty(relative)
+        sha = deferred["sha256"]
+        self.expiring_export("archive-repeat", (self.root / "inbox", "repeated.txt", "export"))
+        now = utc() + timedelta(days=8)
+        first = inbox.archive_empty(self.vault, sha)["archive_moves"][-1]
+        plan = retention.plan(self.vault, now)
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        self.assertTrue(inbox.archive_complete(self.vault, read_json(self.vault.control / "inbox.json")[sha]))
+
+        atomic(self.root / relative, b"")
+        self.track_empty_copy("archive-repeat", relative)
+        with patch("healdan.inbox.stamp", return_value=stamp(utc(first["at"]) - timedelta(hours=1))):
+            item = inbox.archive_empty(self.vault, sha)
+        second = item["archive_moves"][-1]
+        self.assertNotEqual(first["receipt"], second["receipt"])
+        copies = custody.materials(self.vault)["archive-repeat"]["copies"]
+        self.assertEqual([copy["archive_copy_index"] for copy in copies if copy["kind"] == "export"], [1, 3])
+        destination = self.root / f"archive/{sha}/repeated.txt"
+        destination.unlink()
+        self.assertFalse(inbox.archive_complete(self.vault, item))
+        plan = retention.plan(self.vault, now)
+        self.assertEqual(retention.execute(self.vault, plan["id"], now)["status"], "complete")
+        copies = custody.materials(self.vault)["archive-repeat"]["copies"]
+        self.assertEqual(copies[1]["verified_archive_sha256"], sha)
+        self.assertNotIn("verified_archive_sha256", copies[3])
+        self.assertFalse(inbox.archive_complete(self.vault, item))
 
     def test_legacy_archive_receipt_accepts_unique_verified_destination(self):
         relative = "inbox/legacy.txt"

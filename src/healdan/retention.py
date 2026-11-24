@@ -29,8 +29,50 @@ def copy_path(vault, copy):
 
 
 def copy_identity(copy):
-    state = {"status", "deleted_at", "moved_at", "move_receipt", "verified_archive_sha256"}
+    state = {"status", "deleted_at", "moved_at", "move_receipt", "archive_copy_index", "verified_archive_sha256"}
     return {key: value for key, value in copy.items() if key not in state}
+
+
+def active_archive_generations(vault, inventory, target, sha):
+    location = canonical_storage_path(target)
+    return [{"material": record["id"], "copy_index": index, "identity": digest(copy_identity(copy))}
+            for record in inventory.values() for index, copy in enumerate(record.get("copies", []))
+            if copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] not in INACTIVE_COPIES and
+            copy_path(vault, copy) == location]
+
+
+def verified_archive_slots(inventory, entry):
+    sha = entry["copy"]["sha256"]
+    slots = []
+    for generation in entry.get("verified_archive_generations", []):
+        record = inventory.get(generation["material"], {})
+        copies = record.get("copies", [])
+        index = generation["copy_index"]
+        require(0 <= index < len(copies), "Verified archive copy is missing from custody", 5)
+        copy = copies[index]
+        require(copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] != "moved" and
+                digest(copy_identity(copy)) == generation["identity"], "Verified archive copy changed in custody", 5)
+        slots.append((record, copy))
+    return slots
+
+
+def archive_verification_complete(inventory, entry):
+    try:
+        return all(copy["status"] == "deleted" and copy.get("verified_archive_sha256") == copy["sha256"]
+                   for _, copy in verified_archive_slots(inventory, entry))
+    except (Blocked, KeyError, TypeError):
+        return False
+
+
+def record_archive_deletion(vault, inventory, entry, at):
+    changed = {}
+    for record, copy in verified_archive_slots(inventory, entry):
+        sha = copy["sha256"]
+        if copy["status"] != "deleted" or copy.get("verified_archive_sha256") != sha:
+            copy.update(status="deleted", deleted_at=copy.get("deleted_at") or at, verified_archive_sha256=sha)
+            changed[record["id"]] = record
+    for record in changed.values():
+        save_material(vault, record)
 
 
 def pending_deletion_paths(vault):
@@ -45,7 +87,8 @@ def pending_deletion_paths(vault):
             copies = inventory.get(entry["material"], {}).get("copies", [])
             index = entry["copy_index"]
             if 0 <= index < len(copies) and copies[index]["status"] in INACTIVE_COPIES and (
-                    copy_identity(copies[index]) == copy_identity(entry["copy"])):
+                    copy_identity(copies[index]) == copy_identity(entry["copy"]) and
+                    archive_verification_complete(inventory, entry)):
                 continue
             paths.setdefault(copy_path(vault, entry["copy"]), set()).add(plan["id"])
     return paths
@@ -118,12 +161,16 @@ def execute(vault, identifier, now=None):
             if entry["status"] in INACTIVE_COPIES:
                 continue
             try:
-                material = materials(vault)[entry["material"]]
+                inventory = materials(vault)
+                material = inventory[entry["material"]]
                 copy = material["copies"][entry["copy_index"]]
                 require(copy_identity(copy) == copy_identity(entry["copy"]), "Copy inventory changed", 5)
+                at = stamp(now)
                 if copy["status"] in INACTIVE_COPIES:
+                    if entry["status"] == "deleting" and entry.get("verified_archive_generations"):
+                        record_archive_deletion(vault, inventory, entry, at)
                     status = copy["status"]
-                    entry.update(status=status, at=copy.get(f"{status}_at") or stamp(now))
+                    entry.update(status=status, at=copy.get(f"{status}_at") or at)
                     entry.pop("error", None)
                     atomic(path, record)
                     continue
@@ -132,19 +179,28 @@ def execute(vault, identifier, now=None):
                 if present:
                     require(digest(target.read_bytes()) == copy["sha256"], "Copy hash changed; deletion stopped", 5)
                     if copy["kind"] == "archive":
-                        entry["verified_archive_sha256"] = copy["sha256"]
+                        generations = active_archive_generations(vault, inventory, target, copy["sha256"])
+                        if "verified_archive_generations" in entry:
+                            require(all(generation in entry["verified_archive_generations"] for generation in generations),
+                                    "Archive custody changed after verifying deletion", 5)
+                        else:
+                            entry["verified_archive_generations"] = generations
+                        verified_archive_slots(inventory, entry)
                 # Reserve the path until custody records the deletion, even if the file is already absent.
                 entry["status"] = "deleting"
                 atomic(path, record)
                 if present:
                     target.unlink()
                 require(not target.exists(), "Copy still exists after deletion", 5)
-                copy["status"] = "deleted"
-                copy["deleted_at"] = stamp(now)
-                if entry.get("verified_archive_sha256") == copy["sha256"]:
-                    copy["verified_archive_sha256"] = copy["sha256"]
-                save_material(vault, material)
-                entry.update(status="deleted", at=stamp(now))
+                if entry.get("verified_archive_generations"):
+                    record_archive_deletion(vault, inventory, entry, at)
+                else:
+                    copy.update(status="deleted", deleted_at=at)
+                    # A pre-generation journal proved bytes for its own slot only.
+                    if entry.get("verified_archive_sha256") == copy["sha256"]:
+                        copy["verified_archive_sha256"] = copy["sha256"]
+                    save_material(vault, material)
+                entry.update(status="deleted", at=at)
                 entry.pop("error", None)
             except (Blocked, OSError, KeyError) as exc:
                 if entry["status"] != "deleting":

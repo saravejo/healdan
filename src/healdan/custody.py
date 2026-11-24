@@ -91,32 +91,44 @@ def record_archive_move(vault, origins, move, receipt):
     location = canonical_storage_path(archived)
     for record, tracked in origins:
         copies = record["copies"]
-        for copy in tracked:
-            if copy.get("move_receipt") != receipt:
-                copy.update(status="moved", moved_at=move["at"], move_receipt=receipt)
-        if not any(copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] == "present" and
-                   canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location for copy in copies):
+        index = next((index for index, copy in enumerate(copies) if copy["kind"] == "archive" and
+                      copy["sha256"] == sha and copy["status"] == "present" and
+                      canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location), len(copies))
+        if index == len(copies):
             copies.append({"root": str(vault.root / "archive"), "path": destination.removeprefix("archive/"),
                            "sha256": sha, "kind": "archive", "status": "present"})
+        for copy in tracked:
+            copy.update(status="moved", moved_at=move["at"], move_receipt=receipt, archive_copy_index=index)
         save_material(vault, record)
 
 
 def archived_origin_records(vault, records, source, sha, receipt):
     location = canonical_storage_path(source)
-    return [record for record in records if any(
-        copy["kind"] == "export" and copy["sha256"] == sha and copy["status"] == "moved" and
-        copy.get("move_receipt") == receipt and
-        canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location
-        for copy in record["copies"])]
+    origins = []
+    for record in records:
+        copies = [copy for copy in record["copies"] if copy["kind"] == "export" and copy["sha256"] == sha and
+                  copy["status"] == "moved" and copy.get("move_receipt") == receipt and
+                  canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location]
+        if copies:
+            origins.append((record, copies))
+    return origins
 
 
-def verified_archive_deletion(vault, records, target, sha, archived_at):
+def verified_archive_deletion(vault, origins, target, sha):
     location = canonical_storage_path(target)
-    return any(copy["kind"] == "archive" and copy["sha256"] == sha and copy["status"] == "deleted" and
-               copy.get("verified_archive_sha256") == sha and copy.get("deleted_at") and
-               utc(copy["deleted_at"]) >= utc(archived_at) and
-               canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location
-               for record in records for copy in record["copies"])
+    for record, sources in origins:
+        generations = {index: copy for index, copy in enumerate(record["copies"]) if copy["kind"] == "archive" and
+                       copy["sha256"] == sha and
+                       canonical_storage_path(vault.relocated_path(copy["root"]) / copy["path"]) == location}
+        for source in sources:
+            if "archive_copy_index" in source:
+                copy = generations.get(source["archive_copy_index"])
+            else:
+                # A legacy receipt carries no generation link. Accept only unambiguous history.
+                copy = next(iter(generations.values())) if len(generations) == 1 else None
+            if not copy or copy["status"] != "deleted" or copy.get("verified_archive_sha256") != sha:
+                return False
+    return bool(origins)
 
 
 def capture_tree(vault, root, *, task, classification, session=None, purpose=None):

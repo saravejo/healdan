@@ -3,6 +3,7 @@ from datetime import timedelta
 import os
 from pathlib import Path
 import stat
+from uuid import uuid4
 
 from . import admission, custody
 from .core import Blocked, atomic, canonical_storage_path, digest, read_json, require, safe_path, stamp, sync_directory, utc
@@ -15,17 +16,18 @@ def ordinary(path):
     return path.startswith("inbox/") and path not in EXCLUDED and not path.startswith("inbox/tasks/") and not path.endswith("/.gitkeep")
 
 
+def ordinary_files(root):
+    for path in sorted((root / "inbox").rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if ordinary(relative) and (path.is_file() or path.is_symlink()):
+            yield relative, safe_path(root, relative, exists=True).read_bytes()
+
+
 def inventory(vault):
     with vault.locked():
         journal_path = vault.control / "inbox.json"
         items = read_json(journal_path, {})
-        for path in sorted((vault.root / "inbox").rglob("*")):
-            if not path.is_file() and not path.is_symlink():
-                continue
-            relative = path.relative_to(vault.root).as_posix()
-            if not ordinary(relative):
-                continue
-            data = safe_path(vault.root, relative, exists=True).read_bytes()
+        for relative, data in ordinary_files(vault.root):
             key = digest(data)
             # Hash identifies copied/renamed bytes. New bytes link to earlier versions at this path.
             if key not in items:
@@ -115,32 +117,34 @@ def worktree_roots(vault):
     return {root for root in vault.repository.worktree_roots() if (root / ".git").exists()}
 
 
-def archive_destination_verified(vault, root, destination, records, sha, archived_at):
+def worktree_inbox_digests(vault):
+    return {(relative, digest(body)) for root in worktree_roots(vault) for relative, body in ordinary_files(root)}
+
+
+def archive_destination_verified(vault, root, destination, records, sha):
     target = safe_path(root, destination)
     try:
         info = target.lstat()
     except FileNotFoundError:
-        return custody.verified_archive_deletion(vault, records, target, sha, archived_at)
+        return custody.verified_archive_deletion(vault, records, target, sha)
     return stat.S_ISREG(info.st_mode) and info.st_size == 0 and digest(target.read_bytes()) == sha
 
 
-def archive_complete(vault, item):
+def archive_complete(vault, item, *, observed=None):
     sha = item["sha256"]
     paths = set(item["paths"])
     if not paths or sha != digest(b""):
         return False
     if paths & read_json(safe_path(vault.control, ARCHIVE_JOURNAL), {}).keys():
         return False
+    if observed is None:
+        try:
+            observed = worktree_inbox_digests(vault)
+        except (Blocked, OSError):
+            return False
+    if any(content == sha for _, content in observed):
+        return False
     roots = worktree_roots(vault)
-    for root in roots:
-        for path in paths:
-            try:
-                safe_path(root, path).lstat()
-                return False
-            except FileNotFoundError:
-                pass
-            except (Blocked, OSError):
-                return False
     records = custody.materials(vault).values()
     archived = set()
     for identifier in item.get("receipts", []):
@@ -166,7 +170,7 @@ def archive_complete(vault, item):
             if bound_root is None:
                 candidates = {root for root, links in owned.items() if links} or candidates
             proven = [root for root in candidates if archive_destination_verified(
-                vault, root, destination, owned[root], sha, value["at"])]
+                vault, root, destination, owned[root], sha)]
         except (Blocked, OSError, KeyError, TypeError, ValueError):
             return False
         if len(proven) != 1:
@@ -175,7 +179,7 @@ def archive_complete(vault, item):
     return archived == paths
 
 
-def findings(item, now=None, *, vault=None):
+def findings(item, now=None, *, vault=None, observed=None):
     now = utc(now)
     result = []
     if not item.get("entered_at"):
@@ -186,7 +190,7 @@ def findings(item, now=None, *, vault=None):
     if item.get("defer_until") and now >= utc(item["defer_until"]):
         result.append("deferral_due")
     overdue = {"original_triage_overdue", "deferral_due"}
-    if vault is not None and overdue.intersection(result) and archive_complete(vault, item):
+    if vault is not None and overdue.intersection(result) and archive_complete(vault, item, observed=observed):
         result = [finding for finding in result if finding not in overdue]
     if item.get("classification") == "unknown":
         result.append("classification_pending")
@@ -245,13 +249,15 @@ def archive_empty(vault, sha256):
             payload = {"source": relative, "destination": target_name, "sha256": sha256, "size": 0}
             move = pending.get(relative)
             if move is None:
-                move = {"at": stamp(), "payload": {**payload, "worktree": str(vault.root)}, "worktree": str(vault.root)}
+                move = {"at": stamp(), "payload": {**payload, "worktree": str(vault.root), "move_id": str(uuid4())},
+                        "worktree": str(vault.root)}
                 pending[relative] = move
                 atomic(journal_path, pending)
             # A legacy journal may already have recorded the receipt using this exact payload.
             frozen = move["payload"]
-            require(frozen == payload or ("worktree" in frozen and frozen == {**payload, "worktree": frozen["worktree"]} and
-                    vault.relocated_path(frozen["worktree"]) == vault.root),
+            require(frozen.keys() - payload.keys() <= {"worktree", "move_id"} and
+                    all(frozen.get(key) == value for key, value in payload.items()) and
+                    ("worktree" not in frozen or vault.relocated_path(frozen["worktree"]) == vault.root),
                     "Archive journal differs from the requested move", 5)
             payload = frozen
             receipt_fields = {"at": move["at"], "payload": payload}
