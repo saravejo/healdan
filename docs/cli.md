@@ -48,7 +48,9 @@ JSON. `--help` lists exact arguments.
 | `preview` | Pure complete-page comparison at 6,000/12,000/20,000 UTF-8 bytes |
 | `lint` | Observational checks, receipts and deduplicated follow-up tasks |
 | `maintenance plan`, `maintenance execute PLAN` | Durable retention plan and per-copy guarded execution |
-| `maintenance daily` | Reconcile clocks, retention, then verified backup |
+| `maintenance daily` | Resume all retention plans, discover new expirations, and run any backup due by policy |
+| `maintenance policy show`, `maintenance policy sign INPUT.json --output SIGNED.json`, `maintenance policy apply SIGNED.json` | Inspect or apply a storage policy with signed scope and version |
+| `maintenance preserve-backup sign ID --reason REASON --output SIGNED.json`, `maintenance preserve-backup apply ID SIGNED.json` | Preserve a finite generation under a decision tied to its signed digest |
 | `maintenance hold`, `maintenance release-hold` | Recorded suspension and dependency resolution |
 | `maintenance incident MATERIAL rotation|deletion DECISION.json` | Separate signed incident decisions |
 | `maintenance trial-environment TRIAL [--profile PATH]` | Record the measured environment for a native trial |
@@ -56,11 +58,36 @@ JSON. `--help` lists exact arguments.
 | `maintenance schedule [--activate]` | Generate/activate local-calendar launchd jobs after readiness |
 | `maintenance prepare-launchd-trial DIRECTORY` | Create a disposable vault and state for the launchd trial with the target build |
 | `maintenance schedule --trial [--activate]` | Generate/activate isolated launchd jobs from a prepared disposable trial vault |
-| `backup create --kind long --expires-at UTC` | Encrypted generation to all configured destinations |
+| `backup create --kind long --expires-at UTC` | Encrypted generation to all configured destinations. Use `permanent` for explicit permanent expiry |
 | `backup verify ID`, `restore ID DESTINATION` | Verify every copy and restore to a fresh directory |
 | `migration inventory`, `migration purge-check` | Read-only legacy/width inventory and purge prerequisites |
 | `migration preview` | Verify signed cases and inspection records, then report compatible projections and pending fields |
 | `migration sign-alias INPUT.json --output SIGNED.json` | Same-identity alias with a human signed decision |
+
+To set an independent backup and retention policy, supply a reason and both
+modes in the policy request. For example, an installation without scheduled or
+manual backups can use:
+
+```json
+{"backup":{"mode":"off"},"retention":{"mode":"keep_forever"},"reason":"Maintain the local custody archive"}
+```
+
+Backup modes are `off`, `manual`, and `scheduled`. For `by_class` retention,
+set `retention.days` to a map containing `common`, `personal`, `sensitive`,
+`mixed`, `unknown`, `secret`, and `export`. Use days or `null` for permanent
+retention. Existing installations start with 30 days for common conversations,
+seven for other conversations and exports, and the daily backup cadence if the
+legacy configuration supplies a generation lifetime without an interval.
+The signed policy identifies the vault, current materials, and whether it
+applies to future materials. `keep_forever` protects the copies of an expired
+signed generation while maintenance reports that its individual preservation
+decision is pending. The decision leaves the signed expiry intact and remains
+effective when the vault returns to `by_class`.
+
+Repeat `session restore MATERIAL DESTINATION` with the same external destination
+after an interruption. The controller verifies the published files against the
+original inventory before returning its existing reconstruction receipt.
+On Windows, local restoration staging requires Python 3.12.4 or newer.
 
 Task agents receive only their session's proposal directory, source snapshot,
 measured context, and temporary/native directory. Authenticate each required

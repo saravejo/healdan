@@ -3,8 +3,9 @@ from datetime import timedelta
 from uuid import uuid4
 import re
 
+from . import storage_policy
 from .core import Blocked, atomic, digest, read_json, require, stamp, utc
-from .custody import INACTIVE_COPIES, materials, retention_deadline, validate_purpose
+from .custody import INACTIVE_COPIES, integrity_findings, materials, validate_purpose
 from .ids import inventory as id_inventory
 from .inbox import findings as inbox_findings, worktree_inbox_digests
 from .knowledge import Knowledge
@@ -56,17 +57,36 @@ def collect(vault, now=None):
             add("tasks", task["id"], "Closure awaits preservation/reconciliation")
         if task.get("presented_at") and not task.get("answered_at") and utc(now) - utc(task["presented_at"]) >= timedelta(days=7):
             add("tasks", task["id"] + ":human", "Human waiting deadline reached")
-    records = materials(vault)
+    try:
+        records = materials(vault)
+        require(isinstance(records, dict), "Invalid custody inventory", 5)
+    except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+        records = {}
+        errors.append({"category": "custody", "error": str(exc)})
+    try:
+        policy = storage_policy.effective(vault)
+    except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+        policy = None
+        add("retention", "policy", str(exc))
+    for identifier, problem in integrity_findings(vault, records=records):
+        add("custody", identifier, problem)
     for material in records.values():
         if material["kind"] != "backup":
             try:
                 validate_purpose(material)
             except Blocked as exc:
                 add("retention", material["id"] + ":purpose", str(exc))
-        deadline = retention_deadline(material)
-        if not deadline or utc(now) >= deadline:
-            if any(c.get("status") not in INACTIVE_COPIES for c in material.get("copies", [])):
-                add("retention", material["id"], "No proven deadline" if not deadline else "Deletion overdue or held")
+        if policy:
+            from .retention import PRESERVATION_AUTHORIZATION_PENDING, preserved
+            try:
+                state, deadline = storage_policy.deadline(material, policy)
+                live = any(c.get("status") not in INACTIVE_COPIES for c in material.get("copies", []))
+                if live and storage_policy.preservation_authorization_pending(vault, material, policy, now):
+                    add("retention", material["id"], PRESERVATION_AUTHORIZATION_PENDING)
+                elif live and (state == "unknown" or deadline and utc(now) >= deadline) and not preserved(vault, material, policy):
+                    add("retention", material["id"], "No proven deadline" if state == "unknown" else "Deletion overdue or held")
+            except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+                add("retention", material["id"], str(exc))
         for h in material.get("holds", []):
             if not h.get("ended_at"):
                 add("holds", h["id"], h["reason"])
@@ -74,12 +94,17 @@ def collect(vault, now=None):
             add("dependencies", material["id"], "Preserved evidence dependencies")
         if material.get("classification") == "secret" and not material.get("rotation_receipt"):
             add("security", material["id"], "Rotation/revocation confirmation missing")
-    interval = vault.config.get("backup_interval_hours")
-    complete = [r["verified_at"] for r in records.values() if r["kind"] == "backup" and r.get("status") == "complete"]
-    if not interval:
-        add("backup", "policy", "Backup interval not configured")
-    elif not complete or (utc(now) - utc(max(complete))).total_seconds() > interval * 3600:
-        add("backup", "freshness", "No recent complete verified backup")
+    if policy:
+        status, detail = storage_policy.backup_status(vault, policy, scheduled=True)
+        if status in {"missing", "invalid"}:
+            add("backup", "policy", detail)
+        elif status == "configured" and policy["backup"]["mode"] == "scheduled":
+            complete = [utc(r["verified_at"]) for r in records.values() if r["kind"] == "backup" and
+                        r.get("generation") == "long" and r.get("status") == "complete" and any(
+                            c.get("status") == "present" for c in r["copies"])]
+            interval = timedelta(hours=storage_policy.backup_interval(vault, policy))
+            if not any(t <= utc(now) < t + interval for t in complete):
+                add("backup", "freshness", "No recent complete verified backup")
     for path in (vault.control / "deletions").glob("*.json"):
         if read_json(path)["status"] != "complete":
             add("retention", path.stem, "Incomplete deletion plan")
@@ -119,6 +144,12 @@ def lint(vault, now=None, *, checks=None):
         atomic(tasks_path, tasks)
         record.update(status="partial" if errors else "complete", completed_at=stamp(now), findings=found,
                       errors=errors, delta=delta, categories=sorted(categories))
+        try:
+            policy = storage_policy.effective(vault)
+            status, detail = storage_policy.backup_status(vault, policy, scheduled=True)
+            record["backup_policy"] = {"status": status, "mode": policy["backup"]["mode"], "detail": detail}
+        except (Blocked, OSError, ValueError, KeyError, TypeError) as exc:
+            record["backup_policy"] = {"status": "invalid", "detail": str(exc)}
         atomic(receipt_path, record)
         if not errors:
             atomic(state_path, {"last_complete_lint_at": stamp(now), "findings": found, "run": identifier})

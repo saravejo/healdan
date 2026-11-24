@@ -50,6 +50,11 @@ def digest(value):
     return hashlib.sha256(value if isinstance(value, bytes) else canonical(value)).hexdigest()
 
 
+def file_digest(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def _pairs(pairs):
     result = {}
     for key, value in pairs:
@@ -69,6 +74,15 @@ def decode(data):
 
 def read_json(path, default=None):
     return decode(Path(path).read_bytes()) if Path(path).exists() else default
+
+
+def json_paths(directory):
+    try:
+        scan = os.scandir(directory)
+    except FileNotFoundError:
+        return []
+    with scan as entries:
+        return sorted(Path(entry.path) for entry in entries if os.path.normcase(entry.name).endswith(".json"))
 
 
 def parse_jsonl(data, path, *, include_bytes=False):

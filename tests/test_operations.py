@@ -291,14 +291,6 @@ class Retention(VaultTest):
         generation = {"kind": "backup", "expires_at": stamp(deadline), "holds": [{"reason": "Hold"}]}
         self.assertEqual(custody.retention_deadline(generation), deadline)
 
-    def test_maintenance_failure_prevents_backup(self):
-        record, target = self.material()
-        custody.hold(self.vault, record["id"], "Still needed", "human")
-        result = maintenance.daily(self.vault, "2026-02-01T00:00:00Z")
-        self.assertEqual(result["status"], "pending")
-        self.assertIsNone(result["backup"])
-
-
 class Installation(VaultTest):
     def test_zip_repeat_and_distribution_remote_only(self):
         original = b"keep me\n"
