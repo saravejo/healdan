@@ -244,6 +244,34 @@ class StorageLifecycle(VaultTest):
         self.assertEqual(retention.execute(self.vault, plan["id"], expiry)["status"], "complete")
         self.assertNotIn(f"custody:{identifier}", linting.lint(self.vault)["findings"])
 
+    def test_damaged_backup_inventory_requires_new_scheduled_generation_and_blocks_retention(self):
+        first = self.configure_age(backup_interval_hours=24)
+        second = self.base / "backup-secondary"
+        second.mkdir()
+        self.vault.config["backup_destinations"].append(str(second))
+        atomic(self.vault.config_path, self.vault.config)
+        self.change_policy(backup="scheduled")
+        now = utc()
+        expiry = now + timedelta(days=2)
+        record = backups.create(self.vault, "long", expiry, now=now)
+        identifier = record["id"]
+        with patch("healdan.backups.decrypt", wraps=backups.decrypt) as decrypt:
+            valid = maintenance.backup_round(self.vault, now + timedelta(minutes=1))
+        self.assertEqual((valid["status"], valid["last_generation"]), ("not_due", identifier))
+        self.assertTrue(decrypt.called)
+        plan = retention.plan(self.vault, expiry)
+        record["copies"][0]["manifest_sha256"] = "0" * 64
+        custody.save_material(self.vault, record)
+
+        scheduled = maintenance.backup_round(self.vault, now + timedelta(minutes=1))
+        self.assertEqual(scheduled["status"], "complete", scheduled)
+        self.assertNotEqual(scheduled["id"], identifier)
+        result = retention.execute(self.vault, plan["id"], expiry)
+        self.assertEqual(result["status"], "pending", result)
+        self.assertIn("Portable replica inventory changed", {row["reason"] for row in result["pending"]})
+        for root in (first, second):
+            self.assertTrue((root / (identifier + ".age")).is_file())
+
     def test_legacy_replica_deletion_verifies_plan_and_round_before_restore(self):
         first = self.configure_age()
         second = self.base / "legacy secondary"

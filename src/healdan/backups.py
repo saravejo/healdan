@@ -194,6 +194,7 @@ def reconcile(vault, identifier):
     with vault.locked():
         known = materials(vault)
         record = known[identifier]
+        require(record["id"] == identifier, "Backup identity changed", 5)
         if record["status"] == "complete":
             result, _ = _inspect(vault, record, decrypt_replicas=True)
             vault.receipt("backup", {"id": identifier, "status": "complete", "expires_at": record["expires_at"]},
@@ -211,7 +212,9 @@ def reconcile(vault, identifier):
                 "Retired backup publication cannot be resumed", 5)
         signers = vault.config.get("backup_allowed_signers") or ""
         manifest = verify_portable_manifest(identifier, record["publication"], signers)
-        check_portable_record(vault, record, manifest)
+        check_portable_generation(record, manifest)
+        for index, copy in enumerate(record["copies"]):
+            check_replica_record(vault, record, manifest, index, copy)
         expiry = manifest["expires_at"] or "permanent"
         members = generation_members(known, manifest["generation"], expiry, manifest["members"], utc(), policy)
         for copy in record["copies"]:
@@ -236,29 +239,46 @@ def verify_backup(vault, identifier, *, allow_retired=False):
         return _verify_backup(vault, identifier, allow_retired=allow_retired)
 
 
-def check_portable_record(vault, record, manifest, *, check_publications=True):
-    require(all(record.get(key) == value for key, value in manifest.items()) and
-            {key for key in record if key in {"expiry"}} == {key for key in manifest if key in {"expiry"}} and
+def check_portable_generation(record, manifest):
+    require(all(key in record and record[key] == value for key, value in manifest.items()) and
+            not ({"expiry", "origin_binding_sha256"} & (record.keys() - manifest.keys())) and
             record.get("holds") == [] and record.get("dependencies") == [], "Signed backup manifest changed", 5)
-    copies = record["copies"]
-    approval = record.get("approval") or record.get("publication")
-    raw_digest = digest(canonical(approval) + b"\n")
-    require(isinstance(copies, list) and copies and all(
-        copy["kind"] == "ciphertext" and copy["path"] == record["id"] + ".age" and
-        copy["sha256"] == manifest["cipher_sha256"] and copy.get("manifest") == record["id"] + ".manifest.json" and
-        copy.get("manifest_sha256") == raw_digest and isinstance(copy.get("root"), str) and
-        copy["status"] in {"planned", "present", "deleted", "absent", "unavailable"} for copy in copies),
-        "Portable replica inventory changed", 5)
-    if check_publications:
-        for index, copy in enumerate(copies):
-            check_replica_publication(vault, record, index, copy)
+    require(isinstance(record.get("copies"), list) and record["copies"], "Portable replica inventory changed", 5)
+
+
+def valid_replica_root(value):
+    if not isinstance(value, str) or any(ord(char) < 32 for char in value):
+        return False
+    return any(path.is_absolute() and ".." not in path.parts for path in (PurePosixPath(value), PureWindowsPath(value)))
+
+
+def check_replica_record(vault, record, manifest, index, copy):
+    portable = record.get("format") == snapshot.MANIFEST
+    error = "Portable replica inventory changed" if portable else "Signed backup manifest changed"
+    require(isinstance(copy, dict) and valid_replica_root(copy.get("root")) and
+            copy.get("kind") == "ciphertext" and copy.get("sha256") == manifest["cipher_sha256"], error, 5)
+    if portable:
+        approval = record.get("approval") or record["publication"]
+        require(copy.get("path") == record["id"] + ".age" and copy.get("manifest") == record["id"] + ".manifest.json" and
+                copy.get("manifest_sha256") == digest(canonical(approval) + b"\n") and
+                copy.get("status") in ("planned", "present", "deleted", "absent", "unavailable"), error, 5)
+        check_replica_publication(vault, record, index, copy)
+    else:
+        from .retention import copy_identity
+
+        require(copy_identity(copy) == copy_identity(manifest["copies"][index]), error, 5)
+        require(copy.get("status") in ("present", "deleted", "unavailable") and
+                not ({"absent_at", "absence_receipt"} & copy.keys()), "Invalid backup replica state", 5)
+        snapshot.portable_path(copy.get("path"), historical=True)
+        if copy.get("manifest"):
+            snapshot.portable_path(copy["manifest"], historical=True)
 
 
 def check_replica_publication(vault, record, index, copy):
     if copy["status"] not in {"present", "deleted"}:
         return
     receipt = copy.get("publication_receipt")
-    require(sha256(receipt), "Backup replica lacks a publication receipt", 5)
+    require(sha256(receipt) and isinstance(copy.get("published_at"), str), "Backup replica lacks a publication receipt", 5)
     proof = read_json(safe_path(vault.control, f"receipts/{receipt}.json"), {})
     expected = published_copy(record, index, copy, copy.get("published_at"))
     require(isinstance(proof, dict) and digest(proof) == receipt and proof.get("kind") == "backup-replica-published" and
@@ -266,23 +286,27 @@ def check_replica_publication(vault, record, index, copy):
             "Backup replica publication receipt changed", 5)
 
 
-def signed_manifest(vault, record, *, check_publications=True):
+def authenticate_generation(vault, record):
     require(record["kind"] == "backup", "Not a backup", 2)
     signers = vault.config.get("backup_allowed_signers") or ""
     if record.get("format") == snapshot.MANIFEST:
         require(record.get("status") == "complete", "Backup publication is incomplete", 5)
         signed = verify_portable_manifest(record["id"], record.get("approval"), signers)
-        check_portable_record(vault, record, signed, check_publications=check_publications)
+        check_portable_generation(record, signed)
         return signed
     signed = verify(record.get("approval"), "backup", signers)
-    from .retention import copy_identity
-    require({k: v for k, v in record.items() if k not in {"approval", "copies"}} ==
+    require(isinstance(signed, dict) and {k: v for k, v in record.items() if k not in {"approval", "copies"}} ==
             {k: v for k, v in signed.items() if k != "copies"} and
-            [copy_identity(c) for c in record["copies"]] == [copy_identity(c) for c in signed["copies"]],
+            isinstance(record.get("copies"), list) and isinstance(signed.get("copies"), list) and
+            len(record["copies"]) == len(signed["copies"]) and all(isinstance(copy, dict) for copy in signed["copies"]),
             "Signed backup manifest changed", 5)
-    require(all(c.get("status") in {"present", "deleted", "unavailable"} and not ({"absent_at", "absence_receipt"} & c.keys())
-                for c in record["copies"]),
-            "Invalid backup replica state", 5)
+    return signed
+
+
+def signed_manifest(vault, record):
+    signed = authenticate_generation(vault, record)
+    for index, copy in enumerate(record["copies"]):
+        check_replica_record(vault, record, signed, index, copy)
     return signed
 
 
@@ -299,9 +323,10 @@ def check_writing_generation(vault, record):
             (isinstance(record.get("expires_at"), str) and utc(record["created_at"]) < utc(record["expires_at"]) or
              record.get("format") == snapshot.MANIFEST and record.get("expiry") == "permanent" and record["expires_at"] is None),
             "Interrupted backup generation has an unproven identity or expiry", 5)
-    copies = record["copies"]
-    require(copies and all(copy.get("kind") == "ciphertext" and copy.get("path") == identifier + ".age" and
-            copy.get("sha256") == record["cipher_sha256"] and copy.get("status") in {"planned", "present", "deleted", "absent"}
+    copies = record.get("copies")
+    require(isinstance(copies, list) and copies and all(isinstance(copy, dict) and valid_replica_root(copy.get("root")) and
+            copy.get("kind") == "ciphertext" and copy.get("path") == identifier + ".age" and
+            copy.get("sha256") == record["cipher_sha256"] and copy.get("status") in ("planned", "present", "deleted", "absent")
             for copy in copies), "Interrupted backup copy does not match its generation", 5)
     receipts = safe_path(vault.control, "receipts")
     for path in json_paths(receipts):
@@ -360,12 +385,18 @@ def inspect_writing_generation(vault, record):
     require(not unresolved, "Interrupted backup generation has unresolved replicas", 5)
 
 
-def replica_path(vault, copy):
+def replica_root(vault, copy):
     root = vault.relocated_path(copy["root"])
-    require(not root.is_junction(), "Unsafe backup replica root", 5)
+    require(root.is_absolute(), "Unsafe backup replica root", 5)
     if root != Path(copy["root"]):
         require(root in map(Path, vault.config.get("backup_destinations", [])),
                 "Relocated backup destination is not authorized", 5)
+    require(not root.is_junction(), "Unsafe backup replica root", 5)
+    return root
+
+
+def replica_path(vault, copy):
+    root = replica_root(vault, copy)
     return safe_path(root, copy["path"], exists=True)
 
 
@@ -516,7 +547,7 @@ def load_replica(vault, record, copy, *, decrypt_replica):
 def replica_availability(vault, copy):
     if copy["status"] != "present":
         return "unavailable"
-    root = vault.relocated_path(copy["root"])
+    root = replica_root(vault, copy)
     if not root.is_dir():
         return "unavailable"
     path = safe_path(root, copy["path"])
@@ -525,15 +556,17 @@ def replica_availability(vault, copy):
     return "available"
 
 
-def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allow_partial=True):
-    manifest = signed_manifest(vault, record, check_publications=not allow_partial)
+def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allow_partial=False):
+    manifest = authenticate_generation(vault, record)
     checks, replicas, retired, selected = [], [], [], None
     for index, copy in enumerate(record["copies"]):
-        root = str(vault.relocated_path(copy["root"]))
-        entry = {"copy_index": index, "root": root, "path": copy["path"]}
+        entry = {"copy_index": index}
+        if isinstance(copy, dict):
+            entry.update({key: copy[key] for key in ("root", "path") if isinstance(copy.get(key), str)})
         try:
-            if allow_partial and record.get("format") == snapshot.MANIFEST:
-                check_replica_publication(vault, record, index, copy)
+            check_replica_record(vault, record, manifest, index, copy)
+            root = str(vault.relocated_path(copy["root"]))
+            entry["root"] = root
             if copy["status"] == "deleted":
                 retired.append(verify_replica_deletion(vault, record, index, copy))
                 entry["status"] = "deleted"
@@ -551,9 +584,9 @@ def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allo
                     selected = (path, raw_manifest, plain, manifest, verified)
                 entry["status"] = "verified"
                 checks.append({"root": root, "verified": True})
-        except (Blocked, OSError, KeyError, TypeError, ValueError) as exc:
-            if not allow_partial and copy["status"] == "deleted":
-                raise
+        except (Blocked, OSError, KeyError, TypeError, ValueError, IndexError, AttributeError, OverflowError) as exc:
+            if not allow_partial:
+                raise Blocked(str(exc), 5) from exc
             entry.update(status="invalid", reason=str(exc))
         replicas.append(entry)
     pending = [entry for entry in replicas if entry["status"] in {"unavailable", "invalid"}]
@@ -569,15 +602,14 @@ def _inspect(vault, record, *, allow_retired=False, decrypt_replicas=False, allo
 
 
 def inspect_backup(vault, record, *, allow_retired=False, decrypt_replicas=False):
-    report, _ = _inspect(vault, record, allow_retired=allow_retired, decrypt_replicas=decrypt_replicas,
-                         allow_partial=decrypt_replicas)
+    report, _ = _inspect(vault, record, allow_retired=allow_retired, decrypt_replicas=decrypt_replicas)
     return report
 
 
 def _verify_backup(vault, identifier, *, allow_retired=False):
     record = materials(vault)[identifier]
     require(record["id"] == identifier, "Backup identity changed", 5)
-    report, _ = _inspect(vault, record, allow_retired=allow_retired, decrypt_replicas=True)
+    report, _ = _inspect(vault, record, allow_retired=allow_retired, decrypt_replicas=True, allow_partial=True)
     return report
 
 
@@ -631,7 +663,7 @@ def restore(vault, identifier, destination, *, state=None, remap=None):
     with vault.locked():
         record = materials(vault)[identifier]
         require(record["id"] == identifier, "Backup identity changed", 5)
-        report, verified = _inspect(vault, record, decrypt_replicas=True)
+        report, verified = _inspect(vault, record, decrypt_replicas=True, allow_partial=True)
         return recover(verified, destination, state, report, allowed_signers=vault.config.get("allowed_signers"),
                        backup_signers=vault.config.get("backup_allowed_signers"), remap=remap, legacy_source=vault.identity,
                        source_root=vault.root, source_state=vault.state)

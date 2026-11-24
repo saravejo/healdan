@@ -247,6 +247,46 @@ class BackupPortable(VaultTest):
             backups.restore(self.vault, record["id"], unavailable)
         self.assertFalse(unavailable.exists())
 
+    def test_1_invalid_replica_inventory_does_not_block_fallback(self):
+        self.configure(2)
+        record = self.create()
+        identifier = record["id"]
+        first, second = record["copies"]
+        for label, copy, error in (
+            ("manifest-digest", {**first, "manifest_sha256": "0" * 64}, "Portable replica inventory changed"),
+            ("malformed-copy", None, "Portable replica inventory changed"),
+            ("other-slot", second, "Backup replica publication receipt changed"),
+            ("unavailable-copy", {**first, "status": "unavailable"}, None),
+        ):
+            with self.subTest(label=label):
+                damaged = {**record, "copies": [copy, second]}
+                custody.save_material(self.vault, damaged)
+                with patch.object(self.vault, "relocated_path", wraps=self.vault.relocated_path) as relocated:
+                    report = backups.verify_backup(self.vault, identifier)
+                if error:
+                    self.assertNotIn(first["root"], [call.args[0] for call in relocated.call_args_list])
+                    self.assertIn(error, report["replicas"][0]["reason"])
+                    with self.assertRaisesRegex(Blocked, error):
+                        backups.inspect_backup(self.vault, damaged, allow_retired=True)
+                    with self.assertRaisesRegex(Blocked, error):
+                        backups.reconcile(self.vault, identifier)
+                destination = self.base / label
+                restored = backups.restore(self.vault, identifier, destination)
+                for result in (report, restored):
+                    self.assertEqual(result["replica"], str(self.paths(record, 1)[1]))
+                    self.assertEqual([row["status"] for row in result["replicas"]],
+                                     ["invalid" if error else "unavailable", "verified"])
+                    self.assertEqual(result["pending_replicas"], result["replicas"][:1])
+                self.assertEqual((destination / "wiki/claims.jsonl").read_bytes(), b"")
+
+        custody.save_material(self.vault, {**record, "plain_sha256": "0" * 64})
+        with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
+            backups.verify_backup(self.vault, identifier)
+        destination = self.base / "unauthenticated-generation"
+        with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
+            backups.restore(self.vault, identifier, destination)
+        self.assertFalse(destination.exists())
+
     def test_1_custody_retention_and_authorized_remap(self):
         self.configure()
         decision = self.policy()
@@ -422,6 +462,17 @@ class BackupPortable(VaultTest):
         self.assertEqual(custody.materials(self.vault)[identifier]["expires_at"], expiry)
         with self.assertRaisesRegex(Blocked, "both a trusted manifest"):
             backups.verify_portable(identifier, None, replica, **self.trust)
+
+        first, second = record["copies"]
+        damaged = {**record, "copies": [first, {**second, "root": first["root"]}]}
+        custody.save_material(self.vault, damaged)
+        report = backups.verify_backup(self.vault, identifier)
+        self.assertEqual([entry["status"] for entry in report["replicas"]], ["verified", "invalid"])
+        with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
+            backups.inspect_backup(self.vault, damaged)
+        custody.save_material(self.vault, {**record, "copies": [first]})
+        with self.assertRaisesRegex(Blocked, "Signed backup manifest changed"):
+            backups.verify_backup(self.vault, identifier)
 
     def test_1_destination_retry_and_verified_bytes(self):
         self.configure()

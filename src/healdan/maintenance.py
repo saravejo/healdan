@@ -111,11 +111,12 @@ def backup_round(vault, now):
         if status != "configured":
             return {"status": "pending", "configuration": status, "reason": reason}
         interval = timedelta(hours=storage_policy.backup_interval(vault, policy))
-        for record in materials(vault).values():
+        for identifier, record in materials(vault).items():
             if (record.get("kind") == "backup" and record.get("generation") == "long" and record.get("verified_at") and
                     utc(record["verified_at"]) <= now < utc(record["verified_at"]) + interval):
                 try:
-                    backups.verify_backup(vault, record["id"])
+                    require(record["id"] == identifier, "Backup identity changed", 5)
+                    backups.inspect_backup(vault, record, decrypt_replicas=True)
                     return {"status": "not_due", "mode": mode, "last_generation": record["id"]}
                 except (Blocked, OSError):
                     continue
